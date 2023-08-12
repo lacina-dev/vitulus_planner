@@ -1,0 +1,206 @@
+#!/usr/bin/env python
+import rospy
+import time
+from std_msgs.msg import Bool, String
+import sys
+import signal
+import shapely
+from shapely import geometry
+from shapely import affinity
+from shapely import ops
+import random
+from geometry_msgs.msg import Pose, Point, Quaternion, PoseStamped, PoseArray, PoseWithCovarianceStamped
+from std_msgs.msg import Int16, String, Bool
+import numpy as np
+import cv2
+from nav_msgs.msg import OccupancyGrid
+import time
+import PyKDL as kdl
+import sys
+from nav_msgs.msg import Odometry, Path
+from geometry_msgs.msg import PolygonStamped, Polygon, Point32
+from vitulus_msgs.msg import MapEditPolygon, MapEditPolygonList, MapEditZone, MapEditZoneList
+from visualization_msgs.msg import Marker, MarkerArray
+import math
+import pickle
+import resource
+import sys
+import geopandas as gpd
+import matplotlib.pyplot as plt
+
+np.set_printoptions(threshold=sys.maxsize)
+
+
+class MapSpec:
+    ROBOT_RADIUS = 0.3
+    COVERAGE_DIAMETER = 0.25
+    OBSTACLE_RESERVE = 0.1
+    FILL_HOLE = 2
+
+    UNKNOWN = -1
+    FREE = 0
+    OBSTACLE = 100
+    BORDER_PATH = 120
+    NOTHING = -120
+
+
+    BORDER_PATH_POINT = 130
+    BORDER_PATH2 = 121  # 121
+    BORDER_PATH2_POINT = 131
+    BORDER_PATH3 = 122
+    BORDER_PATH3_POINT = 132
+    BORDER_PATH_INFILL = 125
+    COVERAGE_PATH = 190
+    BORDER_PATH_DONE = 249
+    BORDER_PATH_BEGIN = 40
+
+    LAYER_ORIGINAL = 0
+    LAYER_FREE = 1
+    LAYER_OBSTACLES = 2
+    LAYER_FREE_POLY = 3
+    LAYER_OBSTACLES_POLY = 4
+    LAYER_ASSEMBLED_LIGHT = 5
+    LAYER_INFLATION = 6
+    LAYER_ASSEMBLED = 7
+    LAYER_ZONE = 8
+    LAYER_BORDER_PATH = 9
+    LAYER_COVERAGE_PATH = 10
+
+    PATH_TYPE_BORDER = 0
+    PATH_TYPE_OBSTACLE = 1
+    PATH_TYPE_COVERAGE = 2
+    PATH_TYPE_UNAVAILABLE = 3
+
+
+class MapData:
+    def __init__(self, np_map, map_msg=OccupancyGrid()):
+        self.initial_map = map_msg
+        self.resolution = self.initial_map.info.resolution
+        self.origin_x = self.initial_map.info.origin.position.x
+        self.origin_y = self.initial_map.info.origin.position.y
+        self.position_rc = [self.initial_map.info.width / 2, self.initial_map.info.height / 2]
+        self.x_origin = -1 * int(self.initial_map.info.origin.position.x / self.resolution)
+        self.y_origin = -1 * int(self.initial_map.info.origin.position.y / self.resolution)
+        self.width, self.height = np.shape(np_map)
+        self.coverage_distance_px = round(((MapSpec.COVERAGE_DIAMETER / 2.0) + MapSpec.OBSTACLE_RESERVE) / self.resolution)
+        self.obstacle_margin_px = round(MapSpec.ROBOT_RADIUS / self.resolution)
+        self.fill_hole_px = MapSpec.FILL_HOLE
+        self.np_original = np.copy(np_map)
+        self.np_unk = np.full_like(np_map, fill_value=MapSpec.NOTHING, dtype=np.int8)
+        self.np_free = np.full_like(np_map, fill_value=MapSpec.NOTHING, dtype=np.int8)
+        self.np_occupied = np.full_like(np_map, fill_value=MapSpec.NOTHING, dtype=np.int8)
+        self.np_unk_cleaned = np.full_like(np_map, fill_value=MapSpec.NOTHING, dtype=np.int8)
+        self.np_obstacle_margin = np.full_like(np_map, fill_value=MapSpec.NOTHING, dtype=np.int8)
+        self.np_assembled = np.full_like(np_map, fill_value=MapSpec.NOTHING, dtype=np.int8)
+        self.np_poly_obstacle = np.full_like(np_map, fill_value=MapSpec.NOTHING, dtype=np.int8)
+        self.np_poly_free = np.full_like(np_map, fill_value=MapSpec.NOTHING, dtype=np.int8)
+
+
+class Node:
+
+    def __init__(self):
+        self.map_data = None
+        self.np_show = None
+
+        self.map_sub = rospy.Subscriber("/map", OccupancyGrid, self.callback_map)
+        self.map_show_pub = rospy.Publisher("map_show", OccupancyGrid, queue_size=1)
+        # self.map_assemble_sub = rospy.Subscriber("assemble_map", Int16, self.callback_map_assemble)
+        # self.map_show_map_layer_sub = rospy.Subscriber("show_map_layer", String, self.callback_show_map_layer)
+        # self.map_publish_polygon_sub = rospy.Subscriber("publish_polygon", PolygonStamped, self.callback_map_publish_polygon)
+        # self.map_save_poly_sub = rospy.Subscriber("save_polygon", MapEditPolygon, self.callback_map_save_poly)
+
+
+    def callback_map(self, msg):
+        self.map_sub.unregister()
+        rospy.loginfo("[{}] Map received".format(rospy.get_caller_id()))
+        arr = np.array(msg.data, dtype=np.int8)
+        arr = arr.reshape((msg.info.height, msg.info.width))
+        self.map_data = MapData(np_map=arr, map_msg=msg)
+        # self.np_show = self.map_data.np_original
+        self.np_show = self.map_data.np_unk
+        # self.cv_show(self.map_data.np_unk)
+        self.assemble_map()
+
+    def cv_show(self, np_arr):
+        plt.imshow(np_arr)
+        plt.show()
+        np_result_window = 'RESULT'
+        # cv2.namedWindow(np_result_window, cv2.WINDOW_NORMAL)
+        cv2.namedWindow(np_result_window, cv2.WINDOW_AUTOSIZE)
+        # cv2.resizeWindow(np_result_window, self.map_data.height, self.map_data.width)
+        image = np_arr.view(np.uint8)
+        cv2.imshow(np_result_window, image)
+        cv2.waitKey()
+
+    def map_show_publisher(self):
+        if self.map_data is not None:
+            map_msg = OccupancyGrid()
+            map_msg.header.stamp = rospy.Time.now()
+            map_msg.header.frame_id = "map"
+            map_msg.info = self.map_data.initial_map.info
+            map_msg.info.width = self.np_show.shape[1]
+            map_msg.info.height = self.np_show.shape[0]
+            np_arr = self.np_show.reshape((self.np_show.size,))
+            map_msg.data = np_arr.tolist()
+            self.map_show_pub.publish(map_msg)
+
+    def assemble_map(self):
+        self.map_data.np_unk = np.where(self.map_data.np_original == -1, 100, self.map_data.np_unk)
+        self.map_data.np_occupied = np.where(self.map_data.np_original == 100, 0, self.map_data.np_occupied)
+        self.map_data.np_free = np.where(self.map_data.np_original == 0, 100, self.map_data.np_free)
+
+        # Remove unknown noise
+        shape_size = 2
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                           (2 * shape_size + 1, 2 * shape_size + 1),
+                                           (shape_size, shape_size))
+        self.map_data.np_unk_cleaned = cv2.dilate(self.map_data.np_unk.view(np.uint8), kernel, iterations=1)
+        self.map_data.np_unk_cleaned = self.map_data.np_unk_cleaned.view(np.int8)
+
+
+        # Unknown as obstacle
+        self.map_data.np_occupied = np.where(self.map_data.np_unk_cleaned == MapSpec.OBSTACLE, self.map_data.np_unk_cleaned, self.map_data.np_occupied)
+
+        # Obstacle margin
+        shape_size = 6
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                           (2 * shape_size + 1, 2 * shape_size + 1),
+                                           (shape_size, shape_size))
+
+        self.map_data.np_obstacle_margin = cv2.erode(self.map_data.np_occupied.view(np.uint8), kernel, iterations=1)
+        self.map_data.np_obstacle_margin = self.map_data.np_obstacle_margin.view(np.int8)
+        # print(self.map_data.np_obstacle_margin)
+        self.map_data.np_obstacle_margin = np.where(self.map_data.np_obstacle_margin == 0, 100, self.map_data.np_obstacle_margin)
+
+
+        # # Fill holes in free
+        # shape_size = 3
+        # kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+        #                                    (2 * shape_size + 1, 2 * shape_size + 1),
+        #                                    (shape_size, shape_size))
+        # np_free_filled = cv2.erode(np_free, kernel, iterations=1)
+
+        # self.map_data.np_unk_cleaned = self.map_data.np_unk_cleaned.view(np.int8)
+        # self.map_data.np_obstacle_margin = self.map_data.np_obstacle_margin.view(np.int8)
+        self.np_show = self.map_data.np_obstacle_margin
+        # self.cv_show(self.map_data.np_obstacle_margin)
+
+
+if __name__ == '__main__':
+    try:
+        rospy.init_node('vitulus_planner_node')
+        rospy.loginfo("[{}] Initialising...".format(rospy.get_caller_id()))
+        node = Node()
+        r = rospy.Rate(1)  # Hz
+
+        def signal_handler():
+            rospy.signal_shutdown("end")
+            sys.exit(0)
+        signal.signal(signal.SIGINT, signal_handler)
+
+        while not rospy.is_shutdown():
+            node.map_show_publisher()
+            r.sleep()
+
+    except rospy.ROSInterruptException:
+        rospy.logerr("[{}] error.".format(rospy.get_caller_id()))
