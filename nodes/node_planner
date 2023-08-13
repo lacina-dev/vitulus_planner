@@ -19,7 +19,7 @@ import PyKDL as kdl
 import sys
 from nav_msgs.msg import Odometry, Path
 from geometry_msgs.msg import PolygonStamped, Polygon, Point32
-from vitulus_msgs.msg import MapEditPolygon, MapEditPolygonList, MapEditZone, MapEditZoneList
+from vitulus_msgs.msg import MapEditPolygon, MapEditPolygonList, MapEditZone, MapEditZoneList, MapEditMap
 from visualization_msgs.msg import Marker, MarkerArray
 import math
 import pickle
@@ -42,7 +42,6 @@ class MapSpec:
     OBSTACLE = 100
     BORDER_PATH = 120
     NOTHING = -120
-
 
     BORDER_PATH_POINT = 130
     BORDER_PATH2 = 121  # 121
@@ -72,10 +71,20 @@ class MapSpec:
     PATH_TYPE_UNAVAILABLE = 3
 
 
+class Zone:
+    def __init__(self, np_zone, np_zone_navi, msg=MapEditZone()):
+        self.msg = msg
+        self.np_zone = np.copy(np_zone)
+        self.np_zone_navi = np.copy(np_zone_navi)
+
+
+
 class MapData:
     def __init__(self, np_map, map_msg=OccupancyGrid()):
+        self.name = "map"
         self.initial_map = map_msg
         self.polygon_msgs = []
+        self.zones = []
         self.resolution = self.initial_map.info.resolution
         self.origin_x = self.initial_map.info.origin.position.x
         self.origin_y = self.initial_map.info.origin.position.y
@@ -84,8 +93,11 @@ class MapData:
         self.y_origin = -1 * int(self.initial_map.info.origin.position.y / self.resolution)
         self.width, self.height = np.shape(np_map)
         self.coverage_distance_px = int(round(((MapSpec.COVERAGE_DIAMETER / 2.0) + MapSpec.OBSTACLE_RESERVE) / self.resolution))
+        self.obstacle_margin = MapSpec.ROBOT_RADIUS
         self.obstacle_margin_px = int(round(MapSpec.ROBOT_RADIUS / self.resolution))
         self.fill_hole_px = MapSpec.FILL_HOLE
+        self.fill_shape = 'ellipse'
+        self.fill_shape_cv = cv2.MORPH_ELLIPSE
         self.np_original = np.copy(np_map)
         self.np_unk = np.full_like(np_map, fill_value=MapSpec.NOTHING, dtype=np.int8)
         self.np_free = np.full_like(np_map, fill_value=MapSpec.NOTHING, dtype=np.int8)
@@ -98,22 +110,51 @@ class MapData:
         self.np_poly_obstacle = np.full_like(np_map, fill_value=MapSpec.NOTHING, dtype=np.int8)
         self.np_poly_free = np.full_like(np_map, fill_value=MapSpec.NOTHING, dtype=np.int8)
 
+    def clear_layers(self):
+        self.np_unk = np.full_like(self.np_original, fill_value=MapSpec.NOTHING, dtype=np.int8)
+        self.np_free = np.full_like(self.np_original, fill_value=MapSpec.NOTHING, dtype=np.int8)
+        self.np_free_filled = np.full_like(self.np_original, fill_value=MapSpec.NOTHING, dtype=np.int8)
+        self.np_occupied = np.full_like(self.np_original, fill_value=MapSpec.NOTHING, dtype=np.int8)
+        self.np_unk_cleaned = np.full_like(self.np_original, fill_value=MapSpec.NOTHING, dtype=np.int8)
+        self.np_obstacle_margin = np.full_like(self.np_original, fill_value=MapSpec.NOTHING, dtype=np.int8)
+        self.np_assembled = np.full_like(self.np_original, fill_value=MapSpec.FREE, dtype=np.int8)
+        self.np_semi_assembled = np.full_like(self.np_original, fill_value=MapSpec.FREE, dtype=np.int8)
+        self.np_poly_obstacle = np.full_like(self.np_original, fill_value=MapSpec.NOTHING, dtype=np.int8)
+        self.np_poly_free = np.full_like(self.np_original, fill_value=MapSpec.NOTHING, dtype=np.int8)
+
 
 class Node:
 
     def __init__(self):
         self.map_data = None
         self.np_show = None
+        self.current_zone = None
 
+        self.log_pub = rospy.Publisher("log", String, queue_size=1)
+        self.reload_sub = rospy.Subscriber("reload", Bool, self.callback_map_reload)
         self.map_sub = rospy.Subscriber("/map", OccupancyGrid, self.callback_map)
         self.map_show_pub = rospy.Publisher("map_show", OccupancyGrid, queue_size=1)
-        # self.map_assemble_sub = rospy.Subscriber("assemble_map", Int16, self.callback_map_assemble)
+        self.map_assemble_sub = rospy.Subscriber("assemble_map", MapEditMap, self.callback_map_assemble)
+        self.map_data_pub = rospy.Publisher("map_data", MapEditMap, queue_size=1)
         self.map_show_map_layer_sub = rospy.Subscriber("show_map_layer", String, self.callback_show_map_layer)
-        # self.map_publish_polygon_sub = rospy.Subscriber("publish_polygon", PolygonStamped, self.callback_map_publish_polygon)
         self.map_save_poly_sub = rospy.Subscriber("save_polygon", MapEditPolygon, self.callback_map_save_poly)
+        self.map_remove_poly_sub = rospy.Subscriber("remove_polygon", String, self.callback_map_remove_poly)
         self.map_poly_list_pub = rospy.Publisher("polygon_list", MapEditPolygonList, queue_size=1)
-        self.log_pub = rospy.Publisher("log", String, queue_size=1)
+        self.zone_save_sub = rospy.Subscriber("save_zone", MapEditZone, self.callback_map_save_zone)
+        self.zone_remove_sub = rospy.Subscriber("remove_zone", String, self.callback_zone_remove)
+        self.zone_selected_sub = rospy.Subscriber("selected_zone", String, self.callback_zone_selected)
+        self.zone_list_pub = rospy.Publisher("zone_list", MapEditZoneList, queue_size=1)
 
+    def cv_show(self, np_arr):
+        # plt.imshow(np_arr)
+        # plt.show()
+        np_result_window = 'RESULT'
+        # cv2.namedWindow(np_result_window, cv2.WINDOW_NORMAL)
+        cv2.namedWindow(np_result_window, cv2.WINDOW_AUTOSIZE)
+        # cv2.resizeWindow(np_result_window, self.map_data.height, self.map_data.width)
+        image = np_arr.view(np.uint8)
+        cv2.imshow(np_result_window, image)
+        cv2.waitKey()
 
     def callback_map(self, msg):
         self.map_sub.unregister()
@@ -122,18 +163,9 @@ class Node:
         arr = arr.reshape((msg.info.height, msg.info.width))
         self.map_data = MapData(np_map=arr, map_msg=msg)
         self.np_show = self.map_data.np_unk
+        self.map_data_publisher()
+        self.map_poly_list_publisher()
         self.assemble_map()
-
-    def cv_show(self, np_arr):
-        plt.imshow(np_arr)
-        plt.show()
-        np_result_window = 'RESULT'
-        # cv2.namedWindow(np_result_window, cv2.WINDOW_NORMAL)
-        cv2.namedWindow(np_result_window, cv2.WINDOW_AUTOSIZE)
-        # cv2.resizeWindow(np_result_window, self.map_data.height, self.map_data.width)
-        image = np_arr.view(np.uint8)
-        cv2.imshow(np_result_window, image)
-        cv2.waitKey()
 
     def map_show_publisher(self):
         if self.map_data is not None:
@@ -148,20 +180,21 @@ class Node:
             self.map_show_pub.publish(map_msg)
 
     def assemble_map(self):
-
+        self.map_data.clear_layers()
+        self.draw_map_polygons()
         # Create basic map layers (unk, free, occupied)
-        self.map_data.np_unk = np.where(self.map_data.np_original == -1, 100, self.map_data.np_unk)
-        self.map_data.np_occupied = np.where(self.map_data.np_original == 100, 100, self.map_data.np_occupied)
-        self.map_data.np_free = np.where(self.map_data.np_original == 0, 0, self.map_data.np_free)
+        self.map_data.np_unk = np.where(self.map_data.np_original == MapSpec.UNKNOWN, MapSpec.OBSTACLE, self.map_data.np_unk)
+        self.map_data.np_occupied = np.where(self.map_data.np_original == MapSpec.OBSTACLE, MapSpec.OBSTACLE, self.map_data.np_occupied)
+        self.map_data.np_free = np.where(self.map_data.np_original == MapSpec.FREE, MapSpec.FREE, self.map_data.np_free)
 
         # Remove unknown noise
         shape_size = self.map_data.fill_hole_px
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+        kernel = cv2.getStructuringElement(self.map_data.fill_shape_cv,
                                            (2 * shape_size + 1, 2 * shape_size + 1),
                                            (shape_size, shape_size))
         self.map_data.np_unk_cleaned = cv2.dilate(self.map_data.np_unk.view(np.uint8), kernel, iterations=1)
         shape_size = self.map_data.fill_hole_px + 2
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+        kernel = cv2.getStructuringElement(self.map_data.fill_shape_cv,
                                            (2 * shape_size + 1, 2 * shape_size + 1),
                                            (shape_size, shape_size))
         self.map_data.np_unk_cleaned = cv2.erode(self.map_data.np_unk_cleaned, kernel, iterations=1)
@@ -173,39 +206,55 @@ class Node:
 
         # Fill holes in free
         shape_size = self.map_data.fill_hole_px
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+        kernel = cv2.getStructuringElement(self.map_data.fill_shape_cv,
                                            (2 * shape_size + 1, 2 * shape_size + 1),
                                            (shape_size, shape_size))
-        self.map_data.np_free_filled = cv2.erode(self.map_data.np_free.view(np.uint8), kernel,
-                                                 iterations=1)
+        self.map_data.np_free_filled = cv2.erode(self.map_data.np_free.view(np.uint8), kernel, iterations=1)
         self.map_data.np_free_filled = self.map_data.np_free_filled.view(np.int8)
 
         # Semi assembled map
-        self.map_data.np_semi_assembled = np.where(self.map_data.np_free_filled == 0, 0, self.map_data.np_semi_assembled)
-        self.map_data.np_semi_assembled = np.where(self.map_data.np_occupied == 100, 100, self.map_data.np_semi_assembled)
-        self.map_data.np_semi_assembled = np.where(self.map_data.np_poly_free == 0, 0, self.map_data.np_semi_assembled)
-        self.map_data.np_semi_assembled = np.where(self.map_data.np_poly_obstacle == 100, 100, self.map_data.np_semi_assembled)
+        self.map_data.np_semi_assembled = np.where(self.map_data.np_free_filled == MapSpec.FREE, MapSpec.FREE, self.map_data.np_semi_assembled)
+        self.map_data.np_semi_assembled = np.where(self.map_data.np_occupied == MapSpec.OBSTACLE, MapSpec.OBSTACLE, self.map_data.np_semi_assembled)
+        self.map_data.np_semi_assembled = np.where(self.map_data.np_poly_free == MapSpec.FREE, MapSpec.FREE, self.map_data.np_semi_assembled)
+        self.map_data.np_semi_assembled = np.where(self.map_data.np_poly_obstacle == MapSpec.OBSTACLE, MapSpec.OBSTACLE, self.map_data.np_semi_assembled)
 
         # Obstacle margin
         shape_size = self.map_data.obstacle_margin_px
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+        kernel = cv2.getStructuringElement(self.map_data.fill_shape_cv,
                                            (2 * shape_size + 1, 2 * shape_size + 1),
                                            (shape_size, shape_size))
         self.map_data.np_obstacle_margin = cv2.dilate(self.map_data.np_semi_assembled.view(np.uint8), kernel, iterations=1)
         self.map_data.np_obstacle_margin = self.map_data.np_obstacle_margin.view(np.int8)
-        # print(self.map_data.np_obstacle_margin)
-        # self.map_data.np_obstacle_margin = np.where(self.map_data.np_obstacle_margin == 0, 100, self.map_data.np_obstacle_margin)
-
-
 
         # Assemble map
-        # self.map_data.np_assembled = np.where(self.map_data.np_free_filled == 0, 0, self.map_data.np_assembled)
-        self.map_data.np_assembled = np.where(self.map_data.np_obstacle_margin == 100, 100, self.map_data.np_semi_assembled)
+        self.map_data.np_assembled = np.where(self.map_data.np_obstacle_margin == MapSpec.OBSTACLE, MapSpec.OBSTACLE, self.map_data.np_semi_assembled)
 
         # Show map
         self.np_show = self.map_data.np_assembled
         # self.cv_show(self.map_data.np_assembled)
         self.log_publisher("Map Assembled.")
+
+    def callback_map_assemble(self, msg):
+        self.map_data.obstacle_margin = msg.margin
+        self.map_data.obstacle_margin_px = int(round(msg.margin / self.map_data.resolution))
+        self.map_data.fill_hole_px = msg.fill
+        self.map_data.fill_shape = msg.shape
+        if msg.shape == 'ellipse':
+            self.map_data.fill_shape_cv = cv2.MORPH_ELLIPSE
+        if msg.shape == 'square':
+            self.map_data.fill_shape_cv = cv2.MORPH_RECT
+        self.assemble_map()
+        self.map_data_publisher()
+        self.map_zone_list_publisher()
+
+    def map_data_publisher(self):
+        msg = MapEditMap()
+        msg.header.stamp = rospy.Time.now()
+        msg.name = self.map_data.name
+        msg.fill = self.map_data.fill_hole_px
+        msg.margin = self.map_data.obstacle_margin
+        msg.shape = self.map_data.fill_shape
+        self.map_data_pub.publish(msg)
 
     def callback_show_map_layer(self, msg):
         rospy.loginfo("[{}] Show map layer: {}".format(rospy.get_caller_id(), msg.data))
@@ -219,18 +268,16 @@ class Node:
             self.np_show = self.map_data.np_poly_free
         elif msg.data == "assembled_lite":
             self.np_show = self.map_data.np_semi_assembled
-        # elif msg.data == "border_path":
-        #     self.np_show = self.np_border_path
         elif msg.data == "original":
             self.np_show = self.map_data.np_original
         elif msg.data == "assembled":
             self.np_show = self.map_data.np_assembled
-        # elif msg.data == "zone_map":
-        #     if self.current_zone is not None:
-        #         self.np_show = self.current_zone.np_zone
-        # elif msg.data == "zone_border_path":
-        #     if self.current_zone is not None:
-        #         self.np_show = self.current_zone.np_border
+        elif msg.data == "zone_map":
+            if self.current_zone is not None:
+                self.np_show = self.current_zone.np_zone
+        elif msg.data == "zone_border_path":
+            if self.current_zone is not None:
+                self.np_show = self.current_zone.np_zone_navi
 
     def callback_map_save_poly(self, msg):
         # Add or overwrite polygon
@@ -246,6 +293,13 @@ class Node:
             self.map_data.polygon_msgs.append(msg)
         else:
             self.map_data.polygon_msgs[poly_exist_id] = msg
+        self.map_poly_list_publisher()
+        self.assemble_map()
+        self.log_publisher("Polygon {} {} saved.".format(msg.type, msg.name))  # Show map
+        self.np_show = self.map_data.np_semi_assembled
+        # self.cv_show(self.map_data.np_assembled)
+
+    def draw_map_polygons(self):
         # Draw polygons to layers
         for p_msg in self.map_data.polygon_msgs:
             polygon = []
@@ -255,12 +309,18 @@ class Node:
                 polygon.append([self.map_data.x_origin + x_point, self.map_data.y_origin + y_point])
             np_polygon = np.array(polygon)
             if p_msg.type == 'obstacle':
-                cv2.fillPoly(self.map_data.np_poly_obstacle, pts=[np_polygon], color=100)
+                cv2.fillPoly(self.map_data.np_poly_obstacle, pts=[np_polygon], color=MapSpec.OBSTACLE)
             if p_msg.type == 'free':
-                cv2.fillPoly(self.map_data.np_poly_free, pts=[np_polygon], color=0)
+                cv2.fillPoly(self.map_data.np_poly_free, pts=[np_polygon], color=MapSpec.FREE)
+
+    def callback_map_remove_poly(self, msg):
+        # Remove polygon
+        for p_msg in self.map_data.polygon_msgs:
+            if p_msg.name == msg.data:
+                self.map_data.polygon_msgs.remove(p_msg)
         self.map_poly_list_publisher()
         self.assemble_map()
-        self.log_publisher("Polygon {} {} saved.".format(msg.type, msg.name))# Show map
+        self.log_publisher("Polygon {} removed.".format(msg.data))  # Show map
         self.np_show = self.map_data.np_semi_assembled
         # self.cv_show(self.map_data.np_assembled)
 
@@ -273,10 +333,164 @@ class Node:
             msg.polygon_list.append(poly_msg)
         self.map_poly_list_pub.publish(msg)
 
+    def callback_map_save_zone(self, msg):
+        polygon = []
+        for point in msg.polygon.polygon.points:
+            x_point = int(point.x / self.map_data.resolution)
+            y_point = int(point.y / self.map_data.resolution)
+            polygon.append([self.map_data.x_origin + x_point, self.map_data.y_origin + y_point])
+        np_polygon = np.array(polygon)
+
+        # make zone polygon smaller by cut coverage radius
+        shape_poly = geometry.Polygon(np_polygon)
+        cut_margin_dist = int(round((MapSpec.COVERAGE_DIAMETER / 2) / self.map_data.resolution))
+        shape_poly = shape_poly.buffer(-cut_margin_dist)
+        pointarray = []
+        for point in shape_poly.exterior.coords:
+            pointarray.append([int(point[0]), int(point[1])])
+        np_polygon_mow = np.array(pointarray)
+        # draw polygon on zone layer
+        np_zone = np.zeros_like(self.map_data.np_assembled)
+        cv2.fillPoly(np_zone, pts=[np_polygon_mow], color=MapSpec.OBSTACLE)
+        np_zone = np.where(np_zone == MapSpec.OBSTACLE, self.map_data.np_assembled, MapSpec.OBSTACLE)
+
+        # make zone polygon bigger by obstacle margin and draw zone map for navi
+        shape_poly = geometry.Polygon(np_polygon)
+        shape_poly = shape_poly.buffer(self.map_data.obstacle_margin_px, cap_style='flat', join_style='mitre')
+        pointarray = []
+        for point in shape_poly.exterior.coords:
+            pointarray.append([int(point[0]), int(point[1])])
+        np_polygon_navi = np.array(pointarray)
+        # draw polygon on navi zone layer
+        np_zone_navi = np.zeros_like(self.map_data.np_assembled)
+        cv2.fillPoly(np_zone_navi, pts=[np_polygon_navi], color=MapSpec.OBSTACLE)
+        np_zone_navi = np.where(np_zone_navi == MapSpec.OBSTACLE, self.map_data.np_semi_assembled, MapSpec.OBSTACLE)
+
+
+        zone = Zone(np_zone, np_zone_navi, msg)
+
+        # Save or update zone
+        zone_exist = False
+        zone_exist_id = -1
+        i = 0
+        for z in self.map_data.zones:
+            if z.msg.name == msg.name:
+                zone_exist = True
+                zone_exist_id = i
+            i += 1
+        if not zone_exist:
+            self.map_data.zones.append(zone)
+        else:
+            self.map_data.zones[zone_exist_id] = zone
+
+        self.map_zone_list_publisher()
+        # Show zone map
+        self.np_show = zone.np_zone_navi
+
+        self.create_paths_around(zone.np_zone)
+
+
+    def callback_zone_remove(self, msg):
+        # Remove zone
+        for zone in self.map_data.zones:
+            if zone.msg.name == msg.data:
+                self.map_data.zones.remove(zone)
+        self.map_zone_list_publisher()
+        # Show map
+        self.np_show = self.map_data.np_assembled
+        self.log_publisher("Zone {} removed.".format(msg.data))
+
+    def callback_zone_selected(self, msg):
+        if msg.data == "cancel**cancel**":
+            self.np_show = self.map_data.np_assembled
+            self.current_zone = None
+        else:
+            for zone in self.map_data.zones:
+                if zone.msg.name == msg.data:
+                    self.current_zone = zone
+                    self.np_show = zone.np_zone
+                    self.log_publisher("Zone {} selected.".format(msg.data))
+                    break
+
+
+    def map_zone_list_publisher(self):
+        msg = MapEditZoneList()
+        msg.header.stamp = rospy.Time.now()
+        msg.header.frame_id = "map"
+        msg.zone_list = []
+        for zone in self.map_data.zones:
+            msg.zone_list.append(zone.msg)
+        self.zone_list_pub.publish(msg)
+
+    def get_shapely_poly(self, polygons, contours, hierarchy, poly_id, external, internals):
+        while poly_id != -1:
+            contour = contours[poly_id].squeeze(axis=1)
+            if len(contour) >= 3:
+                first_child_id = hierarchy[poly_id][2]
+                children = [] if external else None
+                self.get_shapely_poly(polygons, contours, hierarchy, first_child_id, not external, children)
+
+                if external:
+                    polygon = geometry.Polygon(contour, holes=children)
+                    polygons.append(polygon)
+                else:
+                    internals.append(contour)
+
+            poly_id = hierarchy[poly_id][0]
+
+    def create_paths_around(self, np_zone):
+        image_copy = np_zone.copy()
+        plt.imshow(image_copy)
+        plt.show()
+        for i in range(0, 25):
+            contours, hierarchy = cv2.findContours(np_zone.view(np.uint8), cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
+            if hierarchy is None:
+                break
+
+            polygons = []
+            hierarchy = hierarchy[0]
+            self.get_shapely_poly(polygons, contours, hierarchy, 0, True, [])
+            simplify_limit = 3
+            for poly in polygons:
+                poly = poly.simplify(simplify_limit, preserve_topology=True)
+                print(poly.area)
+                points = [[x, y] for x, y in zip(*poly.exterior.coords.xy)]
+                image_copy = cv2.polylines(image_copy, pts=np.array([points]).astype(np.int32),
+                                           isClosed=True, color=80, thickness=1)
+
+                for inner in poly.interiors:
+                    inner = inner.simplify(simplify_limit, preserve_topology=True)
+                    print(inner.area)
+                    points = [[x, y] for x, y in zip(*inner.coords.xy)]
+                    image_copy = cv2.polylines(image_copy, pts=np.array([points]).astype(np.int32),
+                                               isClosed=True, color=90, thickness=1)
+
+                # plt.imshow(image_copy)
+                # plt.show()
+            # np_result_window = "result"
+            # cv2.namedWindow(np_result_window, cv2.WINDOW_NORMAL)
+            # cv2.resizeWindow(np_result_window, height, width)
+            # cv2.imshow(np_result_window, image_copy)
+            # cv2.waitKey()
+            self.cv_show(image_copy)
+
+            # Obstacle margin
+            shape_size = 4
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                               (2 * shape_size + 1, 2 * shape_size + 1),
+                                               (shape_size, shape_size))
+            np_zone = cv2.dilate(np_zone.view(np.uint8), kernel, iterations=1)
+            np_zone = np_zone.view(np.int8)
+
     def log_publisher(self, log_txt):
         msg = String()
         msg.data = log_txt
         self.log_pub.publish(msg)
+
+    def callback_map_reload(self, msg):
+        self.map_data_publisher()
+        self.map_poly_list_publisher()
+        self.map_zone_list_publisher()
 
 if __name__ == '__main__':
     try:
