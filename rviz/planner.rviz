@@ -6,6 +6,8 @@ Panels:
       Expanded:
         - /Global Options1
         - /Status1
+        - /Marker1
+        - /Marker1/Status1
       Splitter Ratio: 0.5058823823928833
     Tree Height: 679
   - Class: rviz/Selection
@@ -84,6 +86,14 @@ Visualization Manager:
       Unreliable: false
       Use Timestamp: false
       Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /zone_outline_polygons
+      Name: Marker
+      Namespaces:
+        zone_outline_polys: true
+      Queue Size: 100
+      Value: true
   Enabled: true
   Global Options:
     Background Color: 48; 48; 48
@@ -121,10 +131,10 @@ Visualization Manager:
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Scale: 17.623416900634766
+      Scale: 33.8884162902832
       Target Frame: <Fixed Frame>
-      X: -0.1357027292251587
-      Y: -12.933087348937988
+      X: 4.666453838348389
+      Y: -9.010807991027832
     Saved: ~
 Window Geometry:
   Displays:
@@ -142,5 +152,5 @@ Window Geometry:
   Views:
     collapsed: true
   Width: 1280
-  X: 2080
-  Y: 118
+  X: 604
+  Y: 67

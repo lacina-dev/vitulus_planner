@@ -43,32 +43,11 @@ class MapSpec:
     BORDER_PATH = 120
     NOTHING = -120
 
-    BORDER_PATH_POINT = 130
-    BORDER_PATH2 = 121  # 121
-    BORDER_PATH2_POINT = 131
-    BORDER_PATH3 = 122
-    BORDER_PATH3_POINT = 132
-    BORDER_PATH_INFILL = 125
-    COVERAGE_PATH = 190
-    BORDER_PATH_DONE = 249
-    BORDER_PATH_BEGIN = 40
 
-    LAYER_ORIGINAL = 0
-    LAYER_FREE = 1
-    LAYER_OBSTACLES = 2
-    LAYER_FREE_POLY = 3
-    LAYER_OBSTACLES_POLY = 4
-    LAYER_ASSEMBLED_LIGHT = 5
-    LAYER_INFLATION = 6
-    LAYER_ASSEMBLED = 7
-    LAYER_ZONE = 8
-    LAYER_BORDER_PATH = 9
-    LAYER_COVERAGE_PATH = 10
-
-    PATH_TYPE_BORDER = 0
-    PATH_TYPE_OBSTACLE = 1
-    PATH_TYPE_COVERAGE = 2
-    PATH_TYPE_UNAVAILABLE = 3
+class PathPolygon:
+    def __init__(self, polygon, path_level):
+        self.polygon = polygon
+        self.path_level = path_level
 
 
 class Zone:
@@ -76,7 +55,8 @@ class Zone:
         self.msg = msg
         self.np_zone = np.copy(np_zone)
         self.np_zone_navi = np.copy(np_zone_navi)
-
+        self.np_zone_paths = np.copy(np_zone)
+        self.path_polygons = []
 
 
 class MapData:
@@ -144,6 +124,7 @@ class Node:
         self.zone_remove_sub = rospy.Subscriber("remove_zone", String, self.callback_zone_remove)
         self.zone_selected_sub = rospy.Subscriber("selected_zone", String, self.callback_zone_selected)
         self.zone_list_pub = rospy.Publisher("zone_list", MapEditZoneList, queue_size=1)
+        self.marker_pub = rospy.Publisher("/zone_outline_polygons", Marker, queue_size=2)
 
     def cv_show(self, np_arr):
         # plt.imshow(np_arr)
@@ -231,8 +212,8 @@ class Node:
 
         # Show map
         self.np_show = self.map_data.np_assembled
-        # self.cv_show(self.map_data.np_assembled)
         self.log_publisher("Map Assembled.")
+        rospy.loginfo("[{}] Map assembled.".format(rospy.get_caller_id()))
 
     def callback_map_assemble(self, msg):
         self.map_data.obstacle_margin = msg.margin
@@ -276,6 +257,9 @@ class Node:
             if self.current_zone is not None:
                 self.np_show = self.current_zone.np_zone
         elif msg.data == "zone_border_path":
+            if self.current_zone is not None:
+                self.np_show = self.current_zone.np_zone_paths
+        elif msg.data == "zone_navi":
             if self.current_zone is not None:
                 self.np_show = self.current_zone.np_zone_navi
 
@@ -322,7 +306,6 @@ class Node:
         self.assemble_map()
         self.log_publisher("Polygon {} removed.".format(msg.data))  # Show map
         self.np_show = self.map_data.np_semi_assembled
-        # self.cv_show(self.map_data.np_assembled)
 
     def map_poly_list_publisher(self):
         msg = MapEditPolygonList()
@@ -349,6 +332,7 @@ class Node:
         for point in shape_poly.exterior.coords:
             pointarray.append([int(point[0]), int(point[1])])
         np_polygon_mow = np.array(pointarray)
+
         # draw polygon on zone layer
         np_zone = np.zeros_like(self.map_data.np_assembled)
         cv2.fillPoly(np_zone, pts=[np_polygon_mow], color=MapSpec.OBSTACLE)
@@ -361,15 +345,19 @@ class Node:
         for point in shape_poly.exterior.coords:
             pointarray.append([int(point[0]), int(point[1])])
         np_polygon_navi = np.array(pointarray)
+
         # draw polygon on navi zone layer
         np_zone_navi = np.zeros_like(self.map_data.np_assembled)
         cv2.fillPoly(np_zone_navi, pts=[np_polygon_navi], color=MapSpec.OBSTACLE)
         np_zone_navi = np.where(np_zone_navi == MapSpec.OBSTACLE, self.map_data.np_semi_assembled, MapSpec.OBSTACLE)
-
-
         zone = Zone(np_zone, np_zone_navi, msg)
 
-        # Save or update zone
+        # Create paths around zone and coverage paths
+        self.current_zone = zone
+        self.create_paths_around()
+        self.create_coverage_paths()
+
+        # Save or update current zone
         zone_exist = False
         zone_exist_id = -1
         i = 0
@@ -379,16 +367,13 @@ class Node:
                 zone_exist_id = i
             i += 1
         if not zone_exist:
-            self.map_data.zones.append(zone)
+            self.map_data.zones.append(self.current_zone)
         else:
-            self.map_data.zones[zone_exist_id] = zone
+            self.map_data.zones[zone_exist_id] = self.current_zone
 
         self.map_zone_list_publisher()
         # Show zone map
-        self.np_show = zone.np_zone_navi
-
-        self.create_paths_around(zone.np_zone)
-
+        self.np_show = self.current_zone.np_zone_paths
 
     def callback_zone_remove(self, msg):
         # Remove zone
@@ -412,7 +397,6 @@ class Node:
                     self.log_publisher("Zone {} selected.".format(msg.data))
                     break
 
-
     def map_zone_list_publisher(self):
         msg = MapEditZoneList()
         msg.header.stamp = rospy.Time.now()
@@ -429,58 +413,442 @@ class Node:
                 first_child_id = hierarchy[poly_id][2]
                 children = [] if external else None
                 self.get_shapely_poly(polygons, contours, hierarchy, first_child_id, not external, children)
-
                 if external:
                     polygon = geometry.Polygon(contour, holes=children)
                     polygons.append(polygon)
                 else:
                     internals.append(contour)
 
+
             poly_id = hierarchy[poly_id][0]
 
-    def create_paths_around(self, np_zone):
-        image_copy = np_zone.copy()
-        plt.imshow(image_copy)
-        plt.show()
-        for i in range(0, 25):
-            contours, hierarchy = cv2.findContours(np_zone.view(np.uint8), cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
+    def create_paths_around(self):
+        self.log_publisher("Creating outline paths...")
+        image_copy = self.current_zone.np_zone_navi.copy()
+        area_sum = 0
+        for i in range(0, self.current_zone.msg.border_paths):
+            print("i: {}".format(i))
+            inverted = cv2.bitwise_not(self.current_zone.np_zone_paths.view(np.uint8))
+            inverted = np.where(inverted == 255, inverted, 0)
+            contours, hierarchy = cv2.findContours(inverted, cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
             if hierarchy is None:
                 break
-
             polygons = []
             hierarchy = hierarchy[0]
             self.get_shapely_poly(polygons, contours, hierarchy, 0, True, [])
-            simplify_limit = 3
             for poly in polygons:
-                poly = poly.simplify(simplify_limit, preserve_topology=True)
-                print(poly.area)
+                ros_poly = self.convert_poly_to_ros_coord(poly)
+                self.current_zone.path_polygons.append(PathPolygon(ros_poly, i))
+
+                # Save area of the first path greater of 1/2 of the coverage diameter
+                if i == 0:
+                    mow_radius = MapSpec.COVERAGE_DIAMETER / 2
+                    poly_b = ros_poly.buffer(mow_radius,
+                                       join_style='round',
+                                       mitre_limit=5.0,
+                                       cap_style='flat',
+                                       quad_segs=16)
+                    area_sum += poly_b.area
+
+                # Draw exterior to map
                 points = [[x, y] for x, y in zip(*poly.exterior.coords.xy)]
                 image_copy = cv2.polylines(image_copy, pts=np.array([points]).astype(np.int32),
-                                           isClosed=True, color=80, thickness=1)
+                                           isClosed=True, color=90, thickness=1)
 
                 for inner in poly.interiors:
-                    inner = inner.simplify(simplify_limit, preserve_topology=True)
-                    print(inner.area)
+                    # Draw interior holes to map
                     points = [[x, y] for x, y in zip(*inner.coords.xy)]
                     image_copy = cv2.polylines(image_copy, pts=np.array([points]).astype(np.int32),
-                                               isClosed=True, color=90, thickness=1)
-
-                # plt.imshow(image_copy)
-                # plt.show()
-            # np_result_window = "result"
-            # cv2.namedWindow(np_result_window, cv2.WINDOW_NORMAL)
-            # cv2.resizeWindow(np_result_window, height, width)
-            # cv2.imshow(np_result_window, image_copy)
-            # cv2.waitKey()
-            self.cv_show(image_copy)
+                                               isClosed=True, color=120, thickness=1)
 
             # Obstacle margin
-            shape_size = 4
+            shape_size = int(round(self.current_zone.msg.paths_distance / self.map_data.resolution))
             kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
                                                (2 * shape_size + 1, 2 * shape_size + 1),
                                                (shape_size, shape_size))
-            np_zone = cv2.dilate(np_zone.view(np.uint8), kernel, iterations=1)
-            np_zone = np_zone.view(np.int8)
+            self.current_zone.np_zone_paths = cv2.dilate(self.current_zone.np_zone_paths.view(np.uint8), kernel, iterations=1)
+            self.current_zone.np_zone_paths = self.current_zone.np_zone_paths.view(np.int8)
+        self.current_zone.np_zone_paths = image_copy
+        self.current_zone.msg.area = round(area_sum)
+
+    def map_coord_to_ros_coord(self, points):
+        output = []
+        for point in points:
+            point[0] = point[0] * self.map_data.resolution + self.map_data.origin_x
+            point[1] = point[1] * self.map_data.resolution + self.map_data.origin_y
+            output.append(point)
+        return output
+
+
+    def convert_poly_to_ros_coord(self, poly):
+        points = [[x, y] for x, y in zip(*poly.exterior.coords.xy)]
+        ext_coords = self.map_coord_to_ros_coord(points)
+        holes = []
+        for inner in poly.interiors:
+            points2 = [[x, y] for x, y in zip(*inner.coords.xy)]
+            in_coords = self.map_coord_to_ros_coord(points2)
+            holes.append(in_coords)
+        return geometry.Polygon(ext_coords, holes=holes)
+
+    def zone_outline_poly_publisher(self):
+        points = []
+        zone = self.current_zone
+        if zone is not None:
+            for poly in zone.path_polygons:
+                poly = poly.polygon.simplify(self.current_zone.msg.simplify, preserve_topology=True)
+                line_start = None
+                for point in shapely.get_coordinates(poly.exterior):
+                    if line_start == None:
+                        line_start = Point32(point[0], point[1], 0)
+                    else:
+                        points.append(line_start)
+                        points.append(Point32(point[0], point[1], 0))
+                        line_start = Point32(point[0], point[1], 0)
+                for inner in poly.interiors:
+                    line_start = None
+                    for point in shapely.get_coordinates(inner):
+                        if line_start == None:
+                            line_start = Point32(point[0], point[1], 0)
+                        else:
+                            points.append(line_start)
+                            points.append(Point32(point[0], point[1], 0))
+                            line_start = Point32(point[0], point[1], 0)
+
+        marker = Marker()
+        marker.header.frame_id = "map"
+        marker.header.stamp = rospy.Time.now()
+        marker.ns = "zone_outline_polys"
+        marker.type = Marker.LINE_LIST
+        marker.id = 0
+        marker.scale.x = 0.03
+        marker.scale.y = 0.03
+        marker.scale.z = 0.03
+        marker.color.r = 0.0
+        marker.color.g = 0.0
+        marker.color.b = 1.0
+        marker.color.a = 1.0
+        marker.pose.position.x = 0
+        marker.pose.position.y = 0
+        marker.pose.position.z = 0
+        marker.pose.orientation.x = 0.0
+        marker.pose.orientation.y = 0.0
+        marker.pose.orientation.z = 0.0
+        marker.pose.orientation.w = 1.0
+        marker.points = points
+        self.marker_pub.publish(marker)
+
+    def get_top_level_outline_poly(self):
+        polygons = []
+        for poly in self.current_zone.path_polygons:
+            if poly.path_level == self.current_zone.msg.border_paths - 1:
+                polygons.append(poly.polygon)
+        return polygons
+
+    def filter_polygons(self, min_length=0.8, min_area=0.3):
+        polygons = []
+        for poly in self.current_zone.path_polygons:
+            if poly.polygon.length > min_length and poly.polygon.area > min_area:
+                polygons.append(poly.polygon)
+        return polygons
+
+    def filter_list_of_polygons(self, polygons_in, min_length=0.8, min_area=0.3):
+        polygons = []
+        for poly in polygons_in:
+            # print("poly.length: {}".format(poly.length))
+            # print("poly.area: {}".format(poly.area))
+            if poly.length > min_length and poly.area > min_area:
+                polygons.append(poly)
+        return polygons
+
+    def create_coverage_paths(self):
+        self.log_publisher("Creating coverage paths...")
+        # Prepare outline polygons
+        top_level_polygons = self.get_top_level_outline_poly()
+        top_level_polygons = self.filter_list_of_polygons(top_level_polygons)
+
+        multilines = []
+        angle = self.current_zone.msg.coverage_angle
+        paths_distance = self.current_zone.msg.paths_distance
+        for polygon in top_level_polygons:
+            max_length = 0.5 + shapely.distance(geometry.Point(polygon.bounds[0], polygon.bounds[1]),
+                                                geometry.Point(polygon.bounds[2], polygon.bounds[3]))
+
+            # Create lines for coverage
+            start = geometry.Point(polygon.bounds[0], polygon.bounds[1], 0.0)
+            end = geometry.Point(start.x + max_length, start.y, 0.0)
+            line_list = []
+            line_count = int(max_length / paths_distance)
+            for n in range(0, line_count):
+                line = geometry.LineString([start, end])
+                line_list.append(line)
+                start = geometry.Point(start.x, start.y + paths_distance, 0.0)
+                end = geometry.Point(end.x, end.y + paths_distance, 0.0)
+            multiline = geometry.MultiLineString(line_list)
+
+            # center with border polygon
+            move_x = polygon.centroid.x - multiline.centroid.x
+            move_y = polygon.centroid.y - multiline.centroid.y
+            multiline = affinity.translate(multiline, xoff=move_x, yoff=move_y, zoff=0)
+
+            # rotate lines
+            multiline = affinity.rotate(multiline, angle, origin="center", use_radians=False)
+
+            # cut lines to fit the polygon outer border
+            multiline = shapely.ops.split(multiline, polygon.buffer(-0.1))
+
+            # remove lines out of the zone
+            line_list = []
+            for line in multiline.geoms:
+                if shapely.contains_properly(polygon, line):
+                    line_list.append(line)
+            multiline = geometry.MultiLineString(line_list)
+
+            # Remove short lines
+            line_list = []
+            for line in multiline.geoms:
+                if line.length > 0.15:
+                    line_list.append(line)
+            multiline = geometry.MultiLineString(line_list)
+
+            # connect lines by nearest point of other lines
+            line_list = []
+            for line in multiline.geoms:
+                line_list.append([[line.coords[0][0], line.coords[0][1]],
+                                  [line.coords[1][0], line.coords[1][1]]])
+            np_lines = np.array(line_list)
+            line_list = []
+            x = polygon.bounds[0]
+            y = polygon.bounds[3]
+            point = geometry.Point(x, y)
+            i_all = 0
+            # multilines = []
+            direction = True  # True: forward, False: backward
+            dir_last = None  # True: forward, False: backward
+            while True:
+                nearest_line = None
+                distance = 9999999
+                ni = 0
+                i_line = 0
+                # Find the nearest line from point
+                for line in np_lines:
+                    begin_point = geometry.Point([line[0][0], line[0][1]])
+                    end_point = geometry.Point([line[1][0], line[1][1]])
+                    if begin_point.distance(point) < distance:
+                        distance = begin_point.distance(point)
+                        nearest_line = line
+                        direction = True
+                        i_line = ni
+                    if end_point.distance(point) < distance:
+                        distance = end_point.distance(point)
+                        nearest_line = [line[1], line[0]]  # reverse line
+                        direction = False
+                        i_line = ni
+                    ni = ni + 1
+
+                # print("*****************************************************")
+                if nearest_line is not None:  # if any nearest line available
+                    conn_line = geometry.LineString(
+                        [[point.x, point.y], [nearest_line[0][0], nearest_line[0][1]]])
+                    print("conn_line length: {}".format(conn_line.length))
+                    is_cross = self.is_crossing_check(conn_line, polygon)
+                    if not is_cross:  # if the line is not crossing, connect
+                        line_list.append(conn_line)
+                        line_list.append(geometry.LineString(nearest_line))
+                    else:  # if the line is crossing, close cell
+                        multilines.append(geometry.MultiLineString(line_list))
+                        line_list = []
+                        line_list.append(geometry.LineString(nearest_line))
+
+                    point = geometry.Point([nearest_line[1][0], nearest_line[1][1]])
+                    np_lines = np.delete(np_lines, [i_line], 0)
+                    dir_last = direction
+                    i_all = i_all + 1
+
+                else:
+                    break
+                # multilines.append(geometry.MultiLineString(line_list))
+            multilines.append(geometry.MultiLineString(line_list))
+            multilines += multilines
+
+            # self.current_zone.np_zone_paths = self.draw_multilines(multiline, self.current_zone.np_zone_paths)
+        for multiline in multilines:
+            self.current_zone.np_zone_paths = self.draw_multilines(multiline, self.current_zone.np_zone_paths)
+
+    def draw_multilines(self, multilines, np_coverage):
+        # Draw multilines to map
+        for line in multilines.geoms:
+            points = [[self.map_data.x_origin + int(x / self.map_data.resolution),
+                       self.map_data.y_origin + int(y / self.map_data.resolution)] for x, y in zip(*line.coords.xy)]
+            np_coverage = cv2.polylines(np_coverage, pts=np.array([points]).astype(np.int32),
+                                        isClosed=True, color=180, thickness=1)
+        return np_coverage
+
+    def is_crossing_check(self, geom, polygon):
+        result = False
+        if not polygon.contains(geom):  # Zone border polygon
+            result = True
+            print("Line cross border polygon.")
+            # self.marker_test(line=geom, polygon=polygon)
+            return result
+        return result
+
+    def make_coverage_lines(self, angle, line_distance, margin=0.10):
+        self.log_publisher("Create coverage paths...")
+        max_length = 0.5 + shapely.distance(geometry.Point(self.bounds[0], self.bounds[1]), geometry.Point(self.bounds[2], self.bounds[3]))
+        # print("max_length: {}".format(max_length))
+
+        self.multilines = []
+        line_distance = line_distance / 100  # cm to m
+        # For every border polygon
+        print("border_path_poly_list: {}".format(self.border_path_poly_list))
+        print("border_path_poly_list len: {}".format(len(self.border_path_poly_list)))
+        for i in range(0, len(self.border_path_poly_list)):
+            print("i = {}".format(i))
+
+
+            # Create lines for coverage
+            length = max_length
+
+            start = geometry.Point(self.bounds[0], self.bounds[1], 0.0)
+            end = geometry.Point(start.x + length, start.y, 0.0)
+            line_list = []
+            line_count = int(length / line_distance)
+            print("line_distance: {}".format(line_distance))
+            print("length: {}".format(length))
+            print("line_count: {}".format(line_count))
+            for n in range(0, line_count):
+                line = geometry.LineString([start, end])
+                line_list.append(line)
+                start = geometry.Point(start.x, start.y + line_distance, 0.0)
+                end = geometry.Point(end.x, end.y + line_distance, 0.0)
+            multiline = geometry.MultiLineString(line_list)
+
+            # center with border polygon
+            # move_x = self.zone_path_poly_list[i].centroid.x - multiline.centroid.x
+            # move_y = self.zone_path_poly_list[i].centroid.y - multiline.centroid.y
+            move_x = self.poly_of_border_zone.centroid.x - multiline.centroid.x
+            move_y = self.poly_of_border_zone.centroid.y - multiline.centroid.y
+            multiline = affinity.translate(multiline, xoff=move_x, yoff=move_y, zoff=0)
+
+            # rotate lines
+            multiline = affinity.rotate(multiline, angle, origin="center", use_radians=False)
+
+
+            print("multiline: {}".format(len(multiline.geoms)))
+
+            # cut lines to fit the polygon outer border
+            multiline = shapely.ops.split(multiline, self.zone_path_poly_cut_list[i])
+            print("multiline - cut lines to fit the polygon outer border: {}".format(len(multiline.geoms)))
+            self.show_poly_image(self.zone_path_poly_cut_list[i])
+            multi_list = []
+            for line in multiline.geoms:
+                # print("line: {}".format(line))
+                # print("line coords: {}".format(line.coords))
+                # print("line: {}".format(line.coords[0][0]))
+                xy_line = geometry.LineString([(line.coords[0][0], line.coords[0][1]), (line.coords[1][0], line.coords[1][1])] )
+                multi_list.append(xy_line)
+            # gdf = gpd.GeoDataFrame(geometry=multi_list)
+            # gdf.head()
+            # gdf.plot("sssss")
+            p = gpd.GeoSeries(multi_list + [self.zone_path_poly_cut_list[i]])
+            p.plot()
+            plt.show()
+
+            # remove lines out of the zone
+            line_list = []
+            for line in multiline.geoms:
+                if shapely.contains_properly(self.border_path_poly_list[i], line):
+                    line_list.append(line)
+            multiline = geometry.MultiLineString(line_list)
+            print("multiline: {}".format(len(multiline.geoms)))
+            self.show_poly_image(self.border_path_poly_list[i])
+
+            # Remove lines in obstacle polygons
+            line_list = []
+            for line in multiline.geoms:
+                hit = False
+                for poly in self.obstacle_polygons_obj:
+                    if shapely.intersects(poly.buffer(margin - 0.00001), line):
+                        hit = True
+                if not hit:
+                    line_list.append(line)
+            multiline = geometry.MultiLineString(line_list)
+            print("multiline: {}".format(len(multiline.geoms)))
+
+            # Remove short lines
+            line_list = []
+            for line in multiline.geoms:
+                # print("line: {}".format(line))
+                # print("line.length: {}".format(line.length))
+                if line.length > 0.15:
+                    line_list.append(line)
+            multiline = geometry.MultiLineString(line_list)
+            print("multiline: {}".format(len(multiline.geoms)))
+
+            self.show_poly_image(self.border_path_poly_list[i])
+            # connect lines by nearest point of lines around /////////////////////////////////////////////////
+            line_list = []
+            for line in multiline.geoms:
+                line_list.append([[line.coords[0][0], line.coords[0][1]], [line.coords[1][0], line.coords[1][1]]])
+            np_lines = np.array(line_list)
+
+            line_list = []
+            x = self.bounds[0]
+            y = self.bounds[3]
+            point = geometry.Point(x, y)
+            i_all = 0
+            multilines = []
+            direction = True  # True: forward, False: backward
+            dir_last = None  # True: forward, False: backward
+            while True:
+                nearest_line = None
+                distance = 9999999
+                ni = 0
+                i_line = 0
+                # Find the nearest line from point
+                for line in np_lines:
+                    begin_point = geometry.Point([line[0][0], line[0][1]])
+                    end_point = geometry.Point([line[1][0], line[1][1]])
+                    if begin_point.distance(point) < distance:
+                        distance = begin_point.distance(point)
+                        nearest_line = line
+                        direction = True
+                        i_line = ni
+                    if end_point.distance(point) < distance:
+                        distance = end_point.distance(point)
+                        nearest_line = [line[1], line[0]]  # reverse line
+                        direction = False
+                        i_line = ni
+                    ni = ni + 1
+
+                # print("*****************************************************")
+                if nearest_line is not None:  # if any nearest line available
+                    conn_line = geometry.LineString([[point.x, point.y], [nearest_line[0][0], nearest_line[0][1]]])
+                    print("conn_line length: {}".format(conn_line.length))
+                    # is_cross = self.is_crossing_multiline(multilines, conn_line, obstacle_polygons_obj, border_path_poly)
+                    is_cross = self.is_crossing_check(conn_line, self.obstacle_polygons_obj, self.border_path_poly_list[i])
+                    # print("is_cross: {}".format(is_cross))
+                    # if 0.0 < conn_line.length and not is_cross and dir_last is not None and dir_last != direction:  # if the line is not crossing, connect
+                    if not is_cross:  # if the line is not crossing, connect
+                        # print("if the line is not crossing, connect")
+                        line_list.append(conn_line)
+                        line_list.append(geometry.LineString(nearest_line))
+                    else:  # if the line is crossing, close cell
+                        # print("if the line is crossing, close cell")
+                        multilines.append(geometry.MultiLineString(line_list))
+                        line_list = []
+                        line_list.append(geometry.LineString(nearest_line))
+
+                    point = geometry.Point([nearest_line[1][0], nearest_line[1][1]])
+                    np_lines = np.delete(np_lines, [i_line], 0)
+                    dir_last = direction
+                    i_all = i_all + 1
+
+                else:
+                    break
+                # multilines.append(geometry.MultiLineString(line_list))
+            multilines.append(geometry.MultiLineString(line_list))
+            self.multilines += multilines
 
     def log_publisher(self, log_txt):
         msg = String()
@@ -506,6 +874,7 @@ if __name__ == '__main__':
 
         while not rospy.is_shutdown():
             node.map_show_publisher()
+            node.zone_outline_poly_publisher()
             r.sleep()
 
     except rospy.ROSInterruptException:
