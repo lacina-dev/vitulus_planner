@@ -801,75 +801,183 @@ class Node:
         self.current_zone.multilines = multilines
         self.current_zone.multilines = self.interconnect_multilines()
 
+
         # Draw multilines to map
         for multiline in multilines:
             self.current_zone.np_zone_paths = self.draw_multilines(multiline, self.current_zone.np_zone_paths)
 
+    def get_nearest_multiline(self, multiline_in, buff):
+
+        top_level_polygons = self.get_top_level_outline_poly()
+        top_level_polygons = self.filter_list_of_polygons(top_level_polygons)
+
+        def check_cross(start_point, end_point):
+            is_cross = False
+            connection_line = geometry.LineString(
+                            [[start_point.x, start_point.y],
+                             [end_point.x, end_point.y]])
+            for polygon in top_level_polygons:
+                if not is_cross:
+                    is_cross = self.is_crossing_polygon(connection_line, polygon)
+            if not is_cross:
+                is_cross = self.is_crossing_other_multilines(connection_line, self.current_zone.multilines.copy())
+            return is_cross
+
+        print("multiline_in: {}".format(multiline_in))
+        multiline_in_start_point = geometry.Point(multiline_in.geoms[0].coords[0][0], multiline_in.geoms[0].coords[0][1])
+        multiline_in_end_point = geometry.Point(multiline_in.geoms[-1].coords[1][0], multiline_in.geoms[-1].coords[1][1])
+        d = 0
+        d_id = 0
+        distance = 9999999
+        nearest_multiline = None
+        connect_to_begin = None
+        if len(buff) > 0:
+            for multilin in buff:
+                if len(multilin.geoms) > 0:
+                    start_point = geometry.Point(multilin.geoms[0].coords[0][0], multilin.geoms[0].coords[0][1])
+                    end_point = geometry.Point(multilin.geoms[-1].coords[1][0], multilin.geoms[-1].coords[1][1])
+
+                    # Find the nearest multiline end or start from buff's multilines starts or ends
+                    if multiline_in_start_point.distance(end_point) < distance:
+                        if not check_cross(multiline_in_start_point, end_point):
+                            distance = multiline_in_start_point.distance(end_point)
+                            d_id = d
+                            nearest_multiline = multilin
+                            connect_to_begin = True
+
+                    if multiline_in_start_point.distance(start_point) < distance:
+                        if not check_cross(multiline_in_start_point, start_point):
+                            distance = multiline_in_start_point.distance(start_point)
+                            d_id = d
+                            nearest_multiline = self.reverse_multiline(multilin)
+                            connect_to_begin = True
+
+                    if multiline_in_end_point.distance(end_point) < distance:
+                        if not check_cross(multiline_in_end_point, end_point):
+                            distance = multiline_in_end_point.distance(end_point)
+                            d_id = d
+                            nearest_multiline = self.reverse_multiline(multilin)
+                            connect_to_begin = False
+
+                    if multiline_in_end_point.distance(start_point) < distance:
+                        if not check_cross(multiline_in_end_point, start_point):
+                            distance = multiline_in_end_point.distance(start_point)
+                            d_id = d
+                            nearest_multiline = multilin
+                            connect_to_begin = False
+                d += 1
+        return nearest_multiline, connect_to_begin, d_id
+
     def interconnect_multilines(self):
         print("Interconnecting multilines...")
-        i = 0
         buffer = self.current_zone.multilines.copy()
         connected_multilines = []
-        if len(buffer) > 1:
-            previous_multiline = buffer.pop(0)
-            new_multiline = []
-            for line in previous_multiline.geoms:
-                new_multiline.append(line)
-            while True:
-                d = 0
-                d_id = 0
-                distance = 9999999
-                nearest_multiline = None
-                # start_point = geometry.Point(previous_multiline.geoms[0].coords[0][0], previous_multiline.geoms[0].coords[0][1])
-                last_point = geometry.Point(previous_multiline.geoms[-1].coords[1][0], previous_multiline.geoms[-1].coords[1][1])
-                if len(buffer) > 0:
-                    for multiline in buffer:
-                        if len(multiline.geoms) > 0:
-                            start_point = geometry.Point(multiline.geoms[0].coords[0][0], multiline.geoms[0].coords[0][1])
-                            end_point = geometry.Point(multiline.geoms[-1].coords[1][0], multiline.geoms[-1].coords[1][1])
-                            if last_point.distance(end_point) < distance:
-                                distance = last_point.distance(end_point)
-                                d_id = d
-                                nearest_multiline = multiline
-                            if last_point.distance(start_point) < distance:
-                                distance = last_point.distance(start_point)
-                                d_id = d
-                                # print("multiline {}".format(multiline))
-                                nearest_multiline = self.reverse_multiline(multiline)
-                                # print("reversed multiline {}".format(nearest_multiline))
-                        d += 1
-                    if nearest_multiline is not None:
-                        # Pripojit pokud spojovaci cara nekrizuje jine cary a polygony
-                        conn_line = geometry.LineString([[last_point.x, last_point.y], [nearest_multiline.geoms[0].coords[0][0], nearest_multiline.geoms[0].coords[0][1]]])
-                        # print("conn_line: {}".format(conn_line))
-                        # print("conn_line.type: {}".format(conn_line.geom_type))
-                        top_level_polygons = self.get_top_level_outline_poly()
-                        top_level_polygons = self.filter_list_of_polygons(top_level_polygons)
-                        for polygon in top_level_polygons:
-                            is_cross = self.is_crossing_polygon(conn_line, polygon)
-                            if not is_cross:
-                                # print("Q conn_line: {}".format(conn_line))
-                                is_cross = self.is_crossing_other_multilines(conn_line, self.current_zone.multilines.copy())
-                            if not is_cross:
-                                new_multiline.append(conn_line)
-                                for line in nearest_multiline.geoms:
-                                    new_multiline.append(line)
-                                previous_multiline = nearest_multiline
-                                buffer.pop(d_id)
-                            else:
-                                connected_multilines.append(geometry.MultiLineString(new_multiline))
-                                new_multiline = []
-                                for line in nearest_multiline.geoms:
-                                    new_multiline.append(line)
-                                previous_multiline = nearest_multiline
-                                buffer.pop(d_id)
+        new_multiline = []
+        is_any_connectable = False
+        while True:
+            print("Buffer len: {}".format(len(buffer)))
+            if len(buffer) > 0:
+                multiline = buffer.pop(0)
+                nearest_multiline, connect_to_begin, d_id = self.get_nearest_multiline(multiline, buffer)
+                if nearest_multiline is not None:
+                    is_any_connectable = True
+                    if connect_to_begin:
+                        for line in nearest_multiline.geoms:
+                            new_multiline.append(line)
+                        new_multiline.append(geometry.LineString(
+                                            [[nearest_multiline.geoms[-1].coords[1][0], nearest_multiline.geoms[-1].coords[1][1]],
+                                             [multiline.geoms[0].coords[0][0], multiline.geoms[0].coords[0][1]]]))
+                        for line in multiline.geoms:
+                            new_multiline.append(line)
                     else:
-                        break
+                        for line in multiline.geoms:
+                            new_multiline.append(line)
+                        new_multiline.append(geometry.LineString(
+                                            [[multiline.geoms[-1].coords[1][0], multiline.geoms[-1].coords[1][1]],
+                                             [nearest_multiline.geoms[0].coords[0][0], nearest_multiline.geoms[0].coords[0][1]]]))
+                        for line in nearest_multiline.geoms:
+                            new_multiline.append(line)
                 else:
                     connected_multilines.append(geometry.MultiLineString(new_multiline))
+                    new_multiline = []
+
+
+
+            else:
+                connected_multilines.append(geometry.MultiLineString(new_multiline))
+                new_multiline = []
+                if is_any_connectable:
+                    buffer = connected_multilines.copy()
+                    print("Recreated buffer!!!!!!!!!!!!!!!")
+                    connected_multilines = []
+                    is_any_connectable = False
+                else:
                     break
-                i += 1
         return connected_multilines
+
+        # i = 0
+        # buffer = self.current_zone.multilines.copy()
+        # connected_multilines = []
+        # if len(buffer) > 1:
+        #     previous_multiline = buffer.pop(0)
+        #     new_multiline = []
+        #     for line in previous_multiline.geoms:
+        #         new_multiline.append(line)
+        #     while True:
+        #         d = 0
+        #         d_id = 0
+        #         distance = 9999999
+        #         nearest_multiline = None
+        #         # start_point = geometry.Point(previous_multiline.geoms[0].coords[0][0], previous_multiline.geoms[0].coords[0][1])
+        #         last_point = geometry.Point(previous_multiline.geoms[-1].coords[1][0], previous_multiline.geoms[-1].coords[1][1])
+        #         if len(buffer) > 0:
+        #             for multiline in buffer:
+        #                 if len(multiline.geoms) > 0:
+        #                     start_point = geometry.Point(multiline.geoms[0].coords[0][0], multiline.geoms[0].coords[0][1])
+        #                     end_point = geometry.Point(multiline.geoms[-1].coords[1][0], multiline.geoms[-1].coords[1][1])
+        #                     if last_point.distance(end_point) < distance:
+        #                         distance = last_point.distance(end_point)
+        #                         d_id = d
+        #                         nearest_multiline = multiline
+        #                     if last_point.distance(start_point) < distance:
+        #                         distance = last_point.distance(start_point)
+        #                         d_id = d
+        #                         # print("multiline {}".format(multiline))
+        #                         nearest_multiline = self.reverse_multiline(multiline)
+        #                         # print("reversed multiline {}".format(nearest_multiline))
+        #                 d += 1
+        #             if nearest_multiline is not None:
+        #                 # Pripojit pokud spojovaci cara nekrizuje jine cary a polygony
+        #                 conn_line = geometry.LineString([[last_point.x, last_point.y], [nearest_multiline.geoms[0].coords[0][0], nearest_multiline.geoms[0].coords[0][1]]])
+        #                 print("conn_line length: {}".format(conn_line.length))
+        #                 # print("conn_line.type: {}".format(conn_line.geom_type))
+        #                 top_level_polygons = self.get_top_level_outline_poly()
+        #                 top_level_polygons = self.filter_list_of_polygons(top_level_polygons)
+        #                 for polygon in top_level_polygons:
+        #                     is_cross = self.is_crossing_polygon(conn_line, polygon)
+        #                     if not is_cross:
+        #                         # print("Q conn_line: {}".format(conn_line))
+        #                         is_cross = self.is_crossing_other_multilines(conn_line, self.current_zone.multilines.copy())
+        #                     if not is_cross:
+        #                         new_multiline.append(conn_line)
+        #                         for line in nearest_multiline.geoms:
+        #                             new_multiline.append(line)
+        #                         previous_multiline = nearest_multiline
+        #                         buffer.pop(d_id)
+        #                     else:
+        #                         connected_multilines.append(geometry.MultiLineString(new_multiline))
+        #                         new_multiline = []
+        #                         for line in nearest_multiline.geoms:
+        #                             new_multiline.append(line)
+        #                         previous_multiline = nearest_multiline
+        #                         buffer.pop(d_id)
+        #             else:
+        #                 break
+        #         else:
+        #             connected_multilines.append(geometry.MultiLineString(new_multiline))
+        #             break
+        #         i += 1
+        # return connected_multilines
 
     def reverse_multiline(self, multiline):
         line_list = []
@@ -885,6 +993,23 @@ class Node:
                        self.map_data.y_origin + int(y / self.map_data.resolution)] for x, y in zip(*line.coords.xy)]
             np_coverage = cv2.polylines(np_coverage, pts=np.array([points]).astype(np.int32),
                                         isClosed=True, color=180, thickness=1)
+        return np_coverage
+
+    def draw_multilines_and_line(self, multilines, line_in,  np_coverage=None):
+        if np_coverage is None:
+            np_coverage = np.zeros_like(self.map_data.np_original)
+        # Draw multilines to map
+        for multiline in multilines:
+            for line in multiline.geoms:
+                points = [[self.map_data.x_origin + int(x / self.map_data.resolution),
+                           self.map_data.y_origin + int(y / self.map_data.resolution)] for x, y in zip(*line.coords.xy)]
+                np_coverage = cv2.polylines(np_coverage, pts=np.array([points]).astype(np.int32),
+                                             isClosed=True, color=180, thickness=1)
+            points = [[self.map_data.x_origin + int(x / self.map_data.resolution),
+                       self.map_data.y_origin + int(y / self.map_data.resolution)] for x, y in
+                      zip(*line_in.coords.xy)]
+            np_coverage = cv2.polylines(np_coverage, pts=np.array([points]).astype(np.int32),
+                                        isClosed=True, color=110, thickness=2)
         return np_coverage
 
     def save_running_data(self):
@@ -943,11 +1068,14 @@ class Node:
         result = False
         print("multilines: {}".format(len(multilines)))
         for multiline in multilines:
-            print("conn_line: {}".format(conn_line))
+            # print("conn_line: {}".format(conn_line))
             sub_conn_line = shapely.ops.substring(conn_line, start_dist=0.00002, end_dist=-0.00001)
-            print("sub_conn_line: {}".format(sub_conn_line))
+            # print("sub_conn_line: {}".format(sub_conn_line))
             if multiline.intersects(sub_conn_line):
                 print("Line cross other multiline.")
+
+                np_drw = self.draw_multilines_and_line(self.current_zone.multilines, conn_line)
+                self.cv_show(np_drw)
                 result = True
                 return result
             # for line in multiline.geoms:
