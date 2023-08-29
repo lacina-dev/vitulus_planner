@@ -11,7 +11,7 @@
     <remap from="map" to="/map_grid"/>
   </node>
 
-  <node pkg="tf" type="static_transform_publisher" name="basemap" args="0 0 0 0 0 0 /map /base_link 100"/>
+<!--   <node pkg="tf" type="static_transform_publisher" name="basemap" args="0 0 0 0 0 0 /map /base_link 100"/> -->
 
 
 

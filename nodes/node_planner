@@ -19,7 +19,7 @@ import time
 import PyKDL as kdl
 from nav_msgs.msg import Odometry, Path
 from geometry_msgs.msg import PolygonStamped, Polygon, Point32
-from vitulus_msgs.msg import MapEditPolygon, MapEditPolygonList, MapEditZone, MapEditZoneList, MapEditMap
+from vitulus_msgs.msg import MapEditPolygon, MapEditPolygonList, MapEditZone, MapEditZoneList, MapEditMap, PlannerProgramList, PlannerProgram
 from visualization_msgs.msg import Marker, MarkerArray
 import math
 import pickle
@@ -71,6 +71,7 @@ class MapData:
         self.initial_map = map_msg
         self.polygon_msgs = []
         self.zones = []
+        self.planner_program_list_msg = None
         self.resolution = self.initial_map.info.resolution
         self.origin_x = self.initial_map.info.origin.position.x
         self.origin_y = self.initial_map.info.origin.position.y
@@ -116,6 +117,7 @@ class Node:
         self.np_show = None
         self.current_zone = None
         self.data_loaded = False
+        self.program_active = None
 
         self.log_pub = rospy.Publisher("log", String, queue_size=1)
         self.reload_sub = rospy.Subscriber("reload", Bool, self.callback_map_reload)
@@ -131,10 +133,14 @@ class Node:
         self.zone_remove_sub = rospy.Subscriber("remove_zone", String, self.callback_zone_remove)
         self.zone_selected_sub = rospy.Subscriber("selected_zone", String, self.callback_zone_selected)
         self.zone_list_pub = rospy.Publisher("zone_list", MapEditZoneList, queue_size=1)
-        self.marker_pub = rospy.Publisher("/zone_outline_polygons", Marker, queue_size=1)
+        self.marker_pub = rospy.Publisher("zone_outline_polygons", Marker, queue_size=1)
         self.marker_zone_path_lines_pub = rospy.Publisher("/zone_path_lines", MarkerArray, queue_size=0)
         self.coverage_path_pub = rospy.Publisher("coverage_path", Path, queue_size=1)
         self.outline_path_pub = rospy.Publisher("outline_path", Path, queue_size=1)
+        self.map_assembled_pub = rospy.Publisher("map_assembled", OccupancyGrid, queue_size=1)
+        self.program_list_pub = rospy.Publisher("program_list", PlannerProgramList, queue_size=1)
+        self.program_active_pub = rospy.Publisher("program_active", PlannerProgram, queue_size=1)
+        self.program_select_sub = rospy.Subscriber("program_select", String, self.callback_program_select)
 
     def cv_show(self, np_arr):
         # plt.imshow(np_arr)
@@ -171,6 +177,18 @@ class Node:
             np_arr = self.np_show.reshape((self.np_show.size,))
             map_msg.data = np_arr.tolist()
             self.map_show_pub.publish(map_msg)
+
+    def map_assembled_publisher(self):
+        if self.map_data is not None:
+            map_msg = OccupancyGrid()
+            map_msg.header.stamp = rospy.Time.now()
+            map_msg.header.frame_id = "map"
+            map_msg.info = self.map_data.initial_map.info
+            map_msg.info.width = self.map_data.np_assembled.shape[1]
+            map_msg.info.height = self.map_data.np_assembled.shape[0]
+            np_arr = self.map_data.np_assembled.reshape((self.np_show.size,))
+            map_msg.data = np_arr.tolist()
+            self.map_assembled_pub.publish(map_msg)
 
     def assemble_map(self):
         self.map_data.clear_layers()
@@ -239,6 +257,7 @@ class Node:
         self.assemble_map()
         self.map_data_publisher()
         self.map_zone_list_publisher()
+        self.program_list_publisher()
         self.save_running_data()
 
     def map_data_publisher(self):
@@ -370,8 +389,11 @@ class Node:
         # Create paths around zone and coverage paths
         self.current_zone = zone
         self.create_paths_around()
-        self.create_coverage_paths()
+        self.current_zone.msg.paths = []
         self.create_outline_path_msg()
+        self.create_coverage_paths()
+
+
 
         # Save or update current zone
         zone_exist = False
@@ -388,6 +410,8 @@ class Node:
             self.map_data.zones[zone_exist_id] = self.current_zone
 
         self.map_zone_list_publisher()
+        self.create_program()  # Need add program creating in webui
+        self.program_list_publisher()
         # Show zone map
         self.np_show = self.current_zone.np_zone_paths
         self.create_zone_path_marker_array()
@@ -400,9 +424,12 @@ class Node:
             if zone.msg.name == msg.data:
                 self.map_data.zones.remove(zone)
         self.map_zone_list_publisher()
+        self.create_program()
+        self.program_list_publisher()
         # Show map
         self.np_show = self.map_data.np_assembled
         self.log_publisher("Zone {} removed.".format(msg.data))
+        self.save_running_data()
 
     def callback_zone_selected(self, msg):
         if msg.data == "cancel**cancel**":
@@ -869,13 +896,17 @@ class Node:
 
     def create_coverage_path_msg(self):
         # Create path from coverage lines
-        path = Path()
-        path.header.frame_id = "map"
-        path.header.stamp = rospy.Time.now()
+        path_all = Path()
+        path_all.header.frame_id = "map"
+        path_all.header.stamp = rospy.Time.now()
 
         for multiline in self.current_zone.multilines:
+            path = Path()
+            path.header.frame_id = "map"
+            path.header.stamp = rospy.Time.now()
             for line in multiline.geoms:
                 angle = self.direction(line.coords)
+                # line = line.segmentize(0.01)
                 for point in line.coords:
                     pose = PoseStamped()
                     pose.header.frame_id = "map"
@@ -886,18 +917,23 @@ class Node:
                     pose.pose.orientation = Quaternion(
                         *(kdl.Rotation.RPY(0, 0, angle).GetQuaternion()))
                     path.poses.append(pose)
-        self.current_zone.path_msg_coverage = path
+                    path_all.poses.append(pose)
+            self.current_zone.msg.paths.append(path)
+        self.current_zone.path_msg_coverage = path_all
 
     def create_outline_path_msg(self):
         # Create path from coverage lines
-        path = Path()
-        path.header.frame_id = "map"
-        path.header.stamp = rospy.Time.now()
+        path_all = Path()
+        path_all.header.frame_id = "map"
+        path_all.header.stamp = rospy.Time.now()
         begin = True
         last_point = []
         for polygon in self.get_polygons_ordered_by_start():
+            path = Path()
+            path.header.frame_id = "map"
+            path.header.stamp = rospy.Time.now()
             polygon = polygon.simplify(self.current_zone.msg.simplify)
-            # polygon = polygon.segmentize(0.05)
+            # polygon = polygon.segmentize(0.01)
             n = 0
             if not begin:
                 line = geometry.LineString([[last_point[0], last_point[1]], [polygon.coords[n][0], polygon.coords[n][1]]])
@@ -925,9 +961,11 @@ class Node:
                     pose.pose.orientation = Quaternion(
                         *(kdl.Rotation.RPY(0, 0, angle).GetQuaternion()))
                     path.poses.append(pose)
+                    path_all.poses.append(pose)
+            self.current_zone.msg.paths.append(path)
             begin = False
             last_point = [polygon.coords[n+1][0], polygon.coords[n+1][1]]
-        self.current_zone.path_msg_outline = path
+        self.current_zone.path_msg_outline = path_all
 
     def direction(self, line):
         # point_2.x - point_1.x, point_2.y - point_1.y)
@@ -1119,6 +1157,7 @@ class Node:
                 self.map_data_publisher()
                 self.map_poly_list_publisher()
                 self.map_zone_list_publisher()
+                self.program_list_publisher()
                 self.log_publisher("Planner data loaded")
                 rospy.loginfo("[{}] Planner data loaded.".format(rospy.get_caller_id()))
                 self.map_sub.unregister()
@@ -1157,6 +1196,35 @@ class Node:
                 return result
         return result
 
+    def create_program(self):
+        self.map_data.planner_program_list_msg = PlannerProgramList()
+        self.map_data.planner_program_list_msg.header.frame_id = "map"
+        self.map_data.planner_program_list_msg.header.stamp = rospy.Time.now()
+        program = PlannerProgram()
+        program.name = "Auto created"
+        area = 0
+        for zone in self.map_data.zones:
+            program.zone_list.append(zone.msg)
+            area += zone.msg.area
+        program.area = area
+        self.map_data.planner_program_list_msg.program_list.append(program)
+
+
+    def callback_program_select(self, msg):
+        if self.map_data.planner_program_list_msg is not None:
+            for program_msg in self.map_data.planner_program_list_msg.program_list:
+                if program_msg.name == msg.data:
+                    self.program_active = program_msg
+                    self.log_publisher("Program selected to run: {}".format(msg.data))
+                    rospy.loginfo("[{}] Program selected to run: {}".format(rospy.get_caller_id(), msg.data))
+                    self.program_active_pub.publish(self.program_active)
+                    break
+
+    def program_list_publisher(self):
+        if self.map_data.planner_program_list_msg is not None:
+            self.program_list_pub.publish(self.map_data.planner_program_list_msg)
+
+
     def log_publisher(self, log_txt):
         msg = String()
         msg.data = log_txt
@@ -1166,6 +1234,7 @@ class Node:
         self.map_data_publisher()
         self.map_poly_list_publisher()
         self.map_zone_list_publisher()
+        self.program_list_publisher()
 
 if __name__ == '__main__':
     try:
@@ -1182,6 +1251,7 @@ if __name__ == '__main__':
 
         while not rospy.is_shutdown():
             node.map_show_publisher()
+            node.map_assembled_publisher()
             node.zone_outline_poly_publisher()
             node.zone_path_lines_publisher()
             node.zone_coverage_path_msg_publisher()
