@@ -116,7 +116,7 @@ class Node:
         self.map_data = None
         self.np_show = None
         self.current_zone = None
-        self.data_loaded = False
+        self.data_loaded = None
         self.program_active = None
 
         self.log_pub = rospy.Publisher("log", String, queue_size=1)
@@ -138,6 +138,7 @@ class Node:
         self.coverage_path_pub = rospy.Publisher("coverage_path", Path, queue_size=1)
         self.outline_path_pub = rospy.Publisher("outline_path", Path, queue_size=1)
         self.map_assembled_pub = rospy.Publisher("map_assembled", OccupancyGrid, queue_size=1)
+        self.map_edited_pub = rospy.Publisher("map_edited", OccupancyGrid, queue_size=1)
         self.program_list_pub = rospy.Publisher("program_list", PlannerProgramList, queue_size=1)
         self.program_active_pub = rospy.Publisher("program_active", PlannerProgram, queue_size=1)
         self.program_select_sub = rospy.Subscriber("program_select", String, self.callback_program_select)
@@ -155,16 +156,17 @@ class Node:
 
     def callback_map(self, msg):
         print("callback_map")
-        if not self.data_loaded:
-            rospy.loginfo("[{}] Map received".format(rospy.get_caller_id()))
-            arr = np.array(msg.data, dtype=np.int8)
-            arr = arr.reshape((msg.info.height, msg.info.width))
-            self.map_data = MapData(np_map=arr, map_msg=msg)
+        if self.data_loaded is not None:
+            if not self.data_loaded:
+                rospy.loginfo("[{}] Map received".format(rospy.get_caller_id()))
+                arr = np.array(msg.data, dtype=np.int8)
+                arr = arr.reshape((msg.info.height, msg.info.width))
+                self.map_data = MapData(np_map=arr, map_msg=msg)
 
-            self.np_show = self.map_data.np_unk
-            self.map_data_publisher()
-            self.map_poly_list_publisher()
-            self.assemble_map()
+                self.np_show = self.map_data.np_unk
+                self.map_data_publisher()
+                self.map_poly_list_publisher()
+                self.assemble_map()
 
     def map_show_publisher(self):
         if self.map_data is not None:
@@ -189,6 +191,20 @@ class Node:
             np_arr = self.map_data.np_assembled.reshape((self.np_show.size,))
             map_msg.data = np_arr.tolist()
             self.map_assembled_pub.publish(map_msg)
+
+    def map_edited_publisher(self):
+        if self.map_data is not None:
+            map_msg = OccupancyGrid()
+            map_msg.header.stamp = rospy.Time.now()
+            map_msg.header.frame_id = "map"
+            map_msg.info = self.map_data.initial_map.info
+            map_msg.info.width = self.map_data.np_assembled.shape[1]
+            map_msg.info.height = self.map_data.np_assembled.shape[0]
+            np_arr = self.map_data.np_semi_assembled.reshape((self.np_show.size,))
+            map_msg.data = np_arr.tolist()
+            self.map_edited_pub.publish(map_msg)
+
+
 
     def assemble_map(self):
         self.map_data.clear_layers()
@@ -390,8 +406,9 @@ class Node:
         self.current_zone = zone
         self.create_paths_around()
         self.current_zone.msg.paths = []
-        self.create_outline_path_msg()
+        # self.create_outline_path_msg()
         self.create_coverage_paths()
+        self.create_coverage_path_msg()
 
 
 
@@ -587,7 +604,6 @@ class Node:
         marker.pose.orientation.w = 1.0
         marker.points = points
         return marker
-
 
     def zone_path_lines_publisher(self):
         if self.current_zone is not None:
@@ -833,9 +849,12 @@ class Node:
                                   [line.coords[1][0], line.coords[1][1]]])
             np_lines = np.array(line_list)
             line_list = []
-            x = polygon.bounds[0]
-            y = polygon.bounds[3]
+            # x = polygon.bounds[0]
+            print("polygon.bounds: {}".format(polygon.bounds))
+            x = polygon.bounds[0] - 1000
+            y = polygon.bounds[3] + 1000
             point = geometry.Point(x, y)
+            print("point: {}".format(point))
             i_all = 0
             # multilines = []
             direction = True  # True: forward, False: backward
@@ -863,6 +882,7 @@ class Node:
                 if nearest_line is not None:  # if any nearest line available
                     conn_line = geometry.LineString(
                         [[point.x, point.y], [nearest_line[0][0], nearest_line[0][1]]])
+                    print(conn_line)
                     is_cross = self.is_crossing_polygon(conn_line, polygon)
                     if not is_cross:  # if the line is not crossing polygon check other lines
                         is_cross = self.is_crossing_other_lines(conn_line, multilines.copy(), geometry.MultiLineString(line_list))
@@ -887,26 +907,89 @@ class Node:
             # multilines += multilines
         self.current_zone.multilines = multilines
         # self.current_zone.multilines = self.interconnect_multilines()
-        self.create_coverage_path_msg()
-        self.create_outline_path_msg()
+        # self.create_coverage_path_msg()
+        # self.create_outline_path_msg()
 
         # Draw multilines to map
         for multiline in multilines:
             self.current_zone.np_zone_paths = self.draw_multilines(multiline, self.current_zone.np_zone_paths)
 
+    def connect_near_multilines(self):
+        multilines = self.current_zone.multilines.copy()
+        multilines_new = []
+        multiline_new = []
+        print("Begin connect near multilines")
+        print("Multilines: {}".format(len(multilines)))
+        for multiline in multilines:
+            print("Multiline: {}".format(len(multiline.geoms)))
+            previous_line = None
+            last_line_to_connect = None
+            last_line_to_start = None
+            for line in multiline.geoms:
+                if previous_line is not None:
+                    line_begin = line.coords[0]
+                    angle = round(self.direction(line.coords), 4)
+                    previous_angle = round(self.direction(previous_line.coords), 4)
+                    previous_line_end = geometry.Point(previous_line.coords[-1][0], previous_line.coords[-1][1])
+                    distance = previous_line_end.distance(geometry.Point(line_begin[0], line_begin[1]))
+                    print("#################")
+                    print("Distance: {}".format(distance))
+                    print("Angle: {}".format(angle))
+                    print("End angle: {}".format(previous_angle))
+                    if distance == 0 and previous_angle == angle:
+                        print("Connect lines")
+                        last_line_to_connect = line
+                        if last_line_to_start is None:
+                            last_line_to_start = previous_line
+                        previous_line = line
+                    else:
+                        print("Not connect lines")
+                        if last_line_to_connect is not None:
+                            connected_line = geometry.LineString([[last_line_to_start.coords[0][0], last_line_to_start.coords[0][1]],
+                                                                  [last_line_to_connect.coords[-1][0], last_line_to_connect.coords[-1][1]]])
+                            last_line_to_connect = None
+                            last_line_to_start = None
+                            multiline_new.append(connected_line)
+                        else:
+                            multiline_new.append(previous_line)
+                        previous_line = line
+                else:
+                    print("Previous_line is None")
+                    previous_line = line
+            if last_line_to_connect is not None:
+                connected_line = geometry.LineString([[last_line_to_start.coords[0][0], last_line_to_start.coords[0][1]],
+                                                      [last_line_to_connect.coords[-1][0], last_line_to_connect.coords[-1][1]]])
+                multiline_new.append(connected_line)
+            else:
+                multiline_new.append(previous_line)
+
+            multiline_new = [linec for linec in multiline_new]
+            multilines_new.append(geometry.MultiLineString(multiline_new))
+            multiline_new = []
+
+
+        return multilines_new
+
     def create_coverage_path_msg(self):
+
+
         # Create path from coverage lines
         path_all = Path()
         path_all.header.frame_id = "map"
         path_all.header.stamp = rospy.Time.now()
 
-        for multiline in self.current_zone.multilines:
+        # for multiline in self.current_zone.multilines:
+        for multiline in self.connect_near_multilines():
             path = Path()
             path.header.frame_id = "map"
             path.header.stamp = rospy.Time.now()
+            end_point = None
             for line in multiline.geoms:
+                # path = Path()
+                # path.header.frame_id = "map"
+                # path.header.stamp = rospy.Time.now()
                 angle = self.direction(line.coords)
-                # line = line.segmentize(0.01)
+                line = line.segmentize(0.05)
                 for point in line.coords:
                     pose = PoseStamped()
                     pose.header.frame_id = "map"
@@ -918,6 +1001,8 @@ class Node:
                         *(kdl.Rotation.RPY(0, 0, angle).GetQuaternion()))
                     path.poses.append(pose)
                     path_all.poses.append(pose)
+                    end_point = point
+                # self.current_zone.msg.paths.append(path)
             self.current_zone.msg.paths.append(path)
         self.current_zone.path_msg_coverage = path_all
 
@@ -933,11 +1018,12 @@ class Node:
             path.header.frame_id = "map"
             path.header.stamp = rospy.Time.now()
             polygon = polygon.simplify(self.current_zone.msg.simplify)
-            # polygon = polygon.segmentize(0.01)
+            polygon = polygon.segmentize(0.05)
             n = 0
             if not begin:
                 line = geometry.LineString([[last_point[0], last_point[1]], [polygon.coords[n][0], polygon.coords[n][1]]])
                 angle = self.direction(line.coords)
+
                 for point in line.coords:
                     pose = PoseStamped()
                     pose.header.frame_id = "map"
@@ -948,9 +1034,19 @@ class Node:
                     pose.pose.orientation = Quaternion(
                         *(kdl.Rotation.RPY(0, 0, angle).GetQuaternion()))
                     path.poses.append(pose)
-            for n in range(0, len(polygon.coords) - 1):
-                line = geometry.LineString([[polygon.coords[n][0], polygon.coords[n][1]], [polygon.coords[n+1][0], polygon.coords[n+1][1]]])
+            for n in range(0, len(polygon.coords) -1):
+                # if n == len(polygon.coords):
+                #     line = geometry.LineString([[polygon.coords[n][0], polygon.coords[n][1]], [polygon.coords[-1][0], polygon.coords[-1][1]]])
+                # else:
+                #     line = geometry.LineString([[polygon.coords[n][0], polygon.coords[n][1]], [polygon.coords[n + 1][0], polygon.coords[n + 1][1]]])
+
+                # path = Path()
+                # path.header.frame_id = "map"
+                # path.header.stamp = rospy.Time.now()
+
+                line = geometry.LineString([[polygon.coords[n][0], polygon.coords[n][1]], [polygon.coords[n + 1][0], polygon.coords[n + 1][1]]])
                 angle = self.direction(line.coords)
+                # line = line.segmentize(0.3)
                 for point in line.coords:
                     pose = PoseStamped()
                     pose.header.frame_id = "map"
@@ -962,8 +1058,9 @@ class Node:
                         *(kdl.Rotation.RPY(0, 0, angle).GetQuaternion()))
                     path.poses.append(pose)
                     path_all.poses.append(pose)
+                # self.current_zone.msg.paths.append(path)
             self.current_zone.msg.paths.append(path)
-            begin = False
+            begin = True
             last_point = [polygon.coords[n+1][0], polygon.coords[n+1][1]]
         self.current_zone.path_msg_outline = path_all
 
@@ -1252,6 +1349,7 @@ if __name__ == '__main__':
         while not rospy.is_shutdown():
             node.map_show_publisher()
             node.map_assembled_publisher()
+            node.map_edited_publisher()
             node.zone_outline_poly_publisher()
             node.zone_path_lines_publisher()
             node.zone_coverage_path_msg_publisher()
