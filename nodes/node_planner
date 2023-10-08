@@ -406,9 +406,12 @@ class Node:
         self.current_zone = zone
         self.create_paths_around()
         self.current_zone.msg.paths = []
-        # self.create_outline_path_msg()
+        self.current_zone.msg.length = 0
+        self.create_outline_path_msg()
         self.create_coverage_paths()
         self.create_coverage_path_msg()
+        self.current_zone.msg.length = int(round(self.current_zone.msg.length))
+        print("Zone path length: {}".format(self.current_zone.msg.length))
 
 
 
@@ -725,7 +728,15 @@ class Node:
                 polygons.append(poly.polygon)
         return polygons
 
-    def filter_polygons(self, min_length=0.6, min_area=0.16):
+    def get_first_level_outline_poly(self):
+        polygons = []
+        for poly in self.current_zone.path_polygons:
+            if poly.path_level == 0:
+                polygons.append(poly.polygon)
+        return polygons
+
+    # def filter_polygons(self, min_length=0.6, min_area=0.16):
+    def filter_polygons(self, min_length=0.8, min_area=0.3):
         polygons = []
         for poly in self.current_zone.path_polygons:
             if poly.polygon.length > min_length and poly.polygon.area > min_area:
@@ -798,112 +809,144 @@ class Node:
         top_level_polygons = self.get_top_level_outline_poly()
         top_level_polygons = self.filter_list_of_polygons(top_level_polygons)
 
+        first_level_polygons = self.get_first_level_outline_poly()
+        first_level_polygons = self.filter_list_of_polygons(first_level_polygons)
+
         multilines = []
         angle = self.current_zone.msg.coverage_angle
         paths_distance = self.current_zone.msg.paths_distance
         for polygon in top_level_polygons:
             max_length = 0.5 + shapely.distance(geometry.Point(polygon.bounds[0], polygon.bounds[1]),
                                                 geometry.Point(polygon.bounds[2], polygon.bounds[3]))
-
-            # Create lines for coverage
-            start = geometry.Point(polygon.bounds[0], polygon.bounds[1], 0.0)
-            end = geometry.Point(start.x + max_length, start.y, 0.0)
-            line_list = []
-            line_count = int(max_length / paths_distance)
-            for n in range(0, line_count):
-                line = geometry.LineString([start, end])
-                line_list.append(line)
-                start = geometry.Point(start.x, start.y + paths_distance, 0.0)
-                end = geometry.Point(end.x, end.y + paths_distance, 0.0)
-            multiline = geometry.MultiLineString(line_list)
-
-            # center with border polygon
-            move_x = polygon.centroid.x - multiline.centroid.x
-            move_y = polygon.centroid.y - multiline.centroid.y
-            multiline = affinity.translate(multiline, xoff=move_x, yoff=move_y, zoff=0)
-
-            # rotate lines
-            multiline = affinity.rotate(multiline, angle, origin="center", use_radians=False)
-
-            # cut lines to fit the polygon outer border
-            multiline = shapely.ops.split(multiline, polygon.buffer(-0.1))
-
-            # remove lines out of the zone
-            line_list = []
-            for line in multiline.geoms:
-                if shapely.contains_properly(polygon, line):
+            paths_offset = int(round((0.6 / paths_distance)))
+            print("Paths offset: {}".format(paths_offset))
+            for i_line_offset in range(0, paths_offset):
+            # for i_line_offset in range(2, 3):
+                paths_distance_offset = paths_distance * paths_offset
+                # Create lines for coverage
+                offset = i_line_offset * paths_distance
+                start = geometry.Point(polygon.bounds[0], polygon.bounds[1], 0.0)
+                end = geometry.Point(start.x + max_length, start.y, 0.0)
+                # end = geometry.Point(start.x + max_length, start.y + offset, 0.0)
+                print("start: {}".format(start))
+                print("end: {}".format(end))
+                line_list = []
+                # line_count = int(max_length / paths_distance)
+                line_count = int(max_length / paths_distance_offset)
+                for n in range(0, line_count):
+                    line = geometry.LineString([start, end])
                     line_list.append(line)
-            multiline = geometry.MultiLineString(line_list)
+                    # start = geometry.Point(start.x, start.y + paths_distance, 0.0)
+                    # end = geometry.Point(end.x, end.y + paths_distance, 0.0)
+                    # start = geometry.Point(start.x, start.y + paths_distance_offset, 0.0)
+                    # end = geometry.Point(end.x, end.y + paths_distance_offset, 0.0)
+                    start = geometry.Point(start.x, start.y + paths_distance_offset, 0.0)
+                    end = geometry.Point(end.x, end.y + paths_distance_offset, 0.0)
+                multiline = geometry.MultiLineString(line_list)
 
-            # Remove short lines
-            line_list = []
-            for line in multiline.geoms:
-                if line.length > 0.15:
-                    line_list.append(line)
-            multiline = geometry.MultiLineString(line_list)
+                # center with border polygon
+                move_x = polygon.centroid.x - multiline.centroid.x
+                move_y = polygon.centroid.y - multiline.centroid.y
+                # move_x = move_x + (i_line_offset * paths_distance)
+                # move_y = move_y + (i_line_offset * paths_distance)
+                # print("move_x: {}".format(move_x))
+                # print("move_y: {}".format(move_y))
+                multiline = affinity.translate(multiline, xoff=move_x, yoff=move_y, zoff=0)
+                print("multiline centroid: {}".format(multiline.centroid))
 
-            # connect lines by nearest point of other lines
-            line_list = []
-            for line in multiline.geoms:
-                line_list.append([[line.coords[0][0], line.coords[0][1]],
-                                  [line.coords[1][0], line.coords[1][1]]])
-            np_lines = np.array(line_list)
-            line_list = []
-            # x = polygon.bounds[0]
-            print("polygon.bounds: {}".format(polygon.bounds))
-            x = polygon.bounds[0] - 1000
-            y = polygon.bounds[3] + 1000
-            point = geometry.Point(x, y)
-            print("point: {}".format(point))
-            i_all = 0
-            # multilines = []
-            direction = True  # True: forward, False: backward
-            dir_last = None  # True: forward, False: backward
-            while True:
-                nearest_line = None
-                distance = 9999999
-                ni = 0
-                i_line = 0
-                # Find the nearest line from point
-                for line in np_lines:
-                    begin_point = geometry.Point([line[0][0], line[0][1]])
-                    end_point = geometry.Point([line[1][0], line[1][1]])
-                    if begin_point.distance(point) < distance:
-                        distance = begin_point.distance(point)
-                        nearest_line = line
-                        direction = True
-                        i_line = ni
-                    if end_point.distance(point) < distance:
-                        distance = end_point.distance(point)
-                        nearest_line = [line[1], line[0]]  # reverse line
-                        direction = False
-                        i_line = ni
-                    ni = ni + 1
-                if nearest_line is not None:  # if any nearest line available
-                    conn_line = geometry.LineString(
-                        [[point.x, point.y], [nearest_line[0][0], nearest_line[0][1]]])
-                    print(conn_line)
-                    is_cross = self.is_crossing_polygon(conn_line, polygon)
-                    if not is_cross:  # if the line is not crossing polygon check other lines
-                        is_cross = self.is_crossing_other_lines(conn_line, multilines.copy(), geometry.MultiLineString(line_list))
-                    if not is_cross:  # if the line is not crossing, connect
-                        line_list.append(conn_line)
-                        line_list.append(geometry.LineString(nearest_line))
-                    else:  # if the line is crossing, close cell
-                        if len(line_list) != 0:
-                            # print("Error: line_list is empty.")
-                            multilines.append(geometry.MultiLineString(line_list))
-                        line_list = []
-                        line_list.append(geometry.LineString(nearest_line))
+                # rotate lines
+                multiline = affinity.rotate(multiline, angle, origin="center", use_radians=False)
+                # multiline = affinity.rotate(multiline, angle, origin="centroid", use_radians=False)
 
-                    point = geometry.Point([nearest_line[1][0], nearest_line[1][1]])
-                    np_lines = np.delete(np_lines, [i_line], 0)
-                    dir_last = direction
-                    i_all = i_all + 1
+                # offset curve of multilines
+                offset_multiline = []
+                for line in multiline.geoms:
+                    line_new = geometry.LineString(line.coords)
+                    line_new = line_new.offset_curve(offset, quad_segs=16, join_style=1, mitre_limit=5.0)
+                    offset_multiline.append(line_new)
+                multiline = geometry.MultiLineString(offset_multiline)
 
-                else:
-                    break
-            multilines.append(geometry.MultiLineString(line_list))
+                # cut lines to fit the polygon outer border
+                multiline = shapely.ops.split(multiline, polygon.buffer(-0.1))
+
+                # remove lines out of the zone
+                line_list = []
+                for line in multiline.geoms:
+                    if shapely.contains_properly(polygon, line):
+                        line_list.append(line)
+                multiline = geometry.MultiLineString(line_list)
+
+                # Remove short lines
+                line_list = []
+                for line in multiline.geoms:
+                    if line.length > 0.15:
+                        line_list.append(line)
+                multiline = geometry.MultiLineString(line_list)
+
+                # connect lines by nearest point of other lines
+                line_list = []
+                for line in multiline.geoms:
+                    line_list.append([[line.coords[0][0], line.coords[0][1]],
+                                      [line.coords[1][0], line.coords[1][1]]])
+                np_lines = np.array(line_list)
+                line_list = []
+                # x = polygon.bounds[0]
+                # print("polygon.bounds: {}".format(polygon.bounds))
+                x = polygon.bounds[0] - 1000
+                y = polygon.bounds[3] + 1000
+                point = geometry.Point(x, y)
+                # print("point: {}".format(point))
+                i_all = 0
+                # multilines = []
+                direction = True  # True: forward, False: backward
+                dir_last = None  # True: forward, False: backward
+                while True:
+                    nearest_line = None
+                    distance = 9999999
+                    ni = 0
+                    i_line = 0
+                    # Find the nearest line from point
+                    for line in np_lines:
+                        begin_point = geometry.Point([line[0][0], line[0][1]])
+                        end_point = geometry.Point([line[1][0], line[1][1]])
+                        if begin_point.distance(point) < distance:
+                            distance = begin_point.distance(point)
+                            nearest_line = line
+                            direction = True
+                            i_line = ni
+                        if end_point.distance(point) < distance:
+                            distance = end_point.distance(point)
+                            nearest_line = [line[1], line[0]]  # reverse line
+                            direction = False
+                            i_line = ni
+                        ni = ni + 1
+                    if nearest_line is not None:  # if any nearest line available
+                        conn_line = geometry.LineString(
+                            [[point.x, point.y], [nearest_line[0][0], nearest_line[0][1]]])
+                        # print(conn_line)
+                        # is_cross = self.is_crossing_polygon(conn_line, polygon)
+                        is_cross = self.is_crossing_polygons(conn_line, first_level_polygons)
+                        if not is_cross:  # if the line is not crossing polygon check other lines
+                            # is_cross = self.is_crossing_other_lines(conn_line, multilines.copy(), geometry.MultiLineString(line_list))
+                            is_cross = self.is_crossing_other_lines(conn_line, [], geometry.MultiLineString(line_list))
+                        if not is_cross:  # if the line is not crossing, connect
+                            line_list.append(conn_line)
+                            line_list.append(geometry.LineString(nearest_line))
+                        else:  # if the line is crossing, close cell
+                            if len(line_list) != 0:
+                                # print("Error: line_list is empty.")
+                                multilines.append(geometry.MultiLineString(line_list))
+                            line_list = []
+                            line_list.append(geometry.LineString(nearest_line))
+
+                        point = geometry.Point([nearest_line[1][0], nearest_line[1][1]])
+                        np_lines = np.delete(np_lines, [i_line], 0)
+                        dir_last = direction
+                        i_all = i_all + 1
+
+                    else:
+                        break
+                multilines.append(geometry.MultiLineString(line_list))
             # multilines += multilines
         self.current_zone.multilines = multilines
         # self.current_zone.multilines = self.interconnect_multilines()
@@ -918,10 +961,10 @@ class Node:
         multilines = self.current_zone.multilines.copy()
         multilines_new = []
         multiline_new = []
-        print("Begin connect near multilines")
-        print("Multilines: {}".format(len(multilines)))
+        # print("Begin connect near multilines")
+        # print("Multilines: {}".format(len(multilines)))
         for multiline in multilines:
-            print("Multiline: {}".format(len(multiline.geoms)))
+            # print("Multiline: {}".format(len(multiline.geoms)))
             previous_line = None
             last_line_to_connect = None
             last_line_to_start = None
@@ -932,18 +975,18 @@ class Node:
                     previous_angle = round(self.direction(previous_line.coords), 4)
                     previous_line_end = geometry.Point(previous_line.coords[-1][0], previous_line.coords[-1][1])
                     distance = previous_line_end.distance(geometry.Point(line_begin[0], line_begin[1]))
-                    print("#################")
-                    print("Distance: {}".format(distance))
-                    print("Angle: {}".format(angle))
-                    print("End angle: {}".format(previous_angle))
+                    # print("#################")
+                    # print("Distance: {}".format(distance))
+                    # print("Angle: {}".format(angle))
+                    # print("End angle: {}".format(previous_angle))
                     if distance == 0 and previous_angle == angle:
-                        print("Connect lines")
+                        # print("Connect lines")
                         last_line_to_connect = line
                         if last_line_to_start is None:
                             last_line_to_start = previous_line
                         previous_line = line
                     else:
-                        print("Not connect lines")
+                        # print("Not connect lines")
                         if last_line_to_connect is not None:
                             connected_line = geometry.LineString([[last_line_to_start.coords[0][0], last_line_to_start.coords[0][1]],
                                                                   [last_line_to_connect.coords[-1][0], last_line_to_connect.coords[-1][1]]])
@@ -954,7 +997,7 @@ class Node:
                             multiline_new.append(previous_line)
                         previous_line = line
                 else:
-                    print("Previous_line is None")
+                    # print("Previous_line is None")
                     previous_line = line
             if last_line_to_connect is not None:
                 connected_line = geometry.LineString([[last_line_to_start.coords[0][0], last_line_to_start.coords[0][1]],
@@ -989,7 +1032,8 @@ class Node:
                 # path.header.frame_id = "map"
                 # path.header.stamp = rospy.Time.now()
                 angle = self.direction(line.coords)
-                line = line.segmentize(0.05)
+                self.current_zone.msg.length += line.length
+                # line = line.segmentize(0.03)
                 for point in line.coords:
                     pose = PoseStamped()
                     pose.header.frame_id = "map"
@@ -1014,27 +1058,59 @@ class Node:
         begin = True
         last_point = []
         for polygon in self.get_polygons_ordered_by_start():
-            path = Path()
-            path.header.frame_id = "map"
-            path.header.stamp = rospy.Time.now()
+            # path = Path()
+            # path.header.frame_id = "map"
+            # path.header.stamp = rospy.Time.now()
             polygon = polygon.simplify(self.current_zone.msg.simplify)
-            polygon = polygon.segmentize(0.05)
+            # segmentize_dist = 0.03
+            # polygon = polygon.segmentize(segmentize_dist)
             n = 0
-            if not begin:
-                line = geometry.LineString([[last_point[0], last_point[1]], [polygon.coords[n][0], polygon.coords[n][1]]])
-                angle = self.direction(line.coords)
+            # Asi zbytecne - smazat tuhle podminku
+            # if not begin:
+            #     line = geometry.LineString([[last_point[0], last_point[1]], [polygon.coords[n][0], polygon.coords[n][1]]])
+            #     angle = self.direction(line.coords)
+            #
+            #     for point in line.coords:
+            #         pose = PoseStamped()
+            #         pose.header.frame_id = "map"
+            #         pose.header.stamp = rospy.Time.now()
+            #         pose.pose.position.x = point[0]
+            #         pose.pose.position.y = point[1]
+            #         pose.pose.position.z = 0.0
+            #         pose.pose.orientation = Quaternion(
+            #             *(kdl.Rotation.RPY(0, 0, angle).GetQuaternion()))
+            #         path.poses.append(pose)
 
-                for point in line.coords:
-                    pose = PoseStamped()
-                    pose.header.frame_id = "map"
-                    pose.header.stamp = rospy.Time.now()
-                    pose.pose.position.x = point[0]
-                    pose.pose.position.y = point[1]
-                    pose.pose.position.z = 0.0
-                    pose.pose.orientation = Quaternion(
-                        *(kdl.Rotation.RPY(0, 0, angle).GetQuaternion()))
-                    path.poses.append(pose)
-            for n in range(0, len(polygon.coords) -1):
+            # Cut begin of polygon separately to do not start and end on same place
+            # path = Path()
+            # path.header.frame_id = "map"
+            # path.header.stamp = rospy.Time.now()
+            # half_of_poly = int(len(polygon.coords)/2)
+            # for n in range(0, half_of_poly):
+            #
+            #     line = geometry.LineString([[polygon.coords[n][0], polygon.coords[n][1]], [polygon.coords[n + 1][0], polygon.coords[n + 1][1]]])
+            #     angle = self.direction(line.coords)
+            #     # line = line.segmentize(0.3)
+            #     for point in line.coords:
+            #         pose = PoseStamped()
+            #         pose.header.frame_id = "map"
+            #         pose.header.stamp = rospy.Time.now()
+            #         pose.pose.position.x = point[0]
+            #         pose.pose.position.y = point[1]
+            #         pose.pose.position.z = 0.0
+            #         pose.pose.orientation = Quaternion(
+            #             *(kdl.Rotation.RPY(0, 0, angle).GetQuaternion()))
+            #         path.poses.append(pose)
+            #         path_all.poses.append(pose)
+            #     # self.current_zone.msg.paths.append(path)
+            # self.current_zone.msg.paths.append(path)
+
+            # if polygon.length <  10:
+            path2 = Path()
+            path2.header.frame_id = "map"
+            path2.header.stamp = rospy.Time.now()
+            for n in range(0, len(polygon.coords) - 1):
+            # for n in range(half_of_poly, len(polygon.coords)-1):
                 # if n == len(polygon.coords):
                 #     line = geometry.LineString([[polygon.coords[n][0], polygon.coords[n][1]], [polygon.coords[-1][0], polygon.coords[-1][1]]])
                 # else:
@@ -1045,6 +1121,7 @@ class Node:
                 # path.header.stamp = rospy.Time.now()
 
                 line = geometry.LineString([[polygon.coords[n][0], polygon.coords[n][1]], [polygon.coords[n + 1][0], polygon.coords[n + 1][1]]])
+                self.current_zone.msg.length += line.length
                 angle = self.direction(line.coords)
                 # line = line.segmentize(0.3)
                 for point in line.coords:
@@ -1056,10 +1133,10 @@ class Node:
                     pose.pose.position.z = 0.0
                     pose.pose.orientation = Quaternion(
                         *(kdl.Rotation.RPY(0, 0, angle).GetQuaternion()))
-                    path.poses.append(pose)
+                    path2.poses.append(pose)
                     path_all.poses.append(pose)
                 # self.current_zone.msg.paths.append(path)
-            self.current_zone.msg.paths.append(path)
+            self.current_zone.msg.paths.append(path2)
             begin = True
             last_point = [polygon.coords[n+1][0], polygon.coords[n+1][1]]
         self.current_zone.path_msg_outline = path_all
@@ -1153,14 +1230,14 @@ class Node:
         return nearest_multiline, connect_to_begin, d_id
 
     def interconnect_multilines(self):
-        print("Interconnecting multilines...")
+        # print("Interconnecting multilines...")
         buffer = self.current_zone.multilines.copy()
         connected_multilines = []
         new_multiline = []
         is_any_connectable = False
         multiline = None
         while True:
-            print("Buffer len: {}".format(len(buffer)))
+            # print("Buffer len: {}".format(len(buffer)))
             if len(buffer) > 0:
                 multiline = buffer.pop(0)
                 nearest_multiline, connect_to_begin, d_id = self.get_nearest_multiline(multiline, buffer)
@@ -1271,6 +1348,14 @@ class Node:
             return result
         return result
 
+    def is_crossing_polygons(self, geom, polygons):
+        result = False
+        for polygon in polygons:
+            if not polygon.contains(geom):  # Zone polygon
+                result = True
+                return result
+        return result
+
     def is_crossing_other_lines(self, conn_line, multilines, line_list=None):
         result = False
         if line_list is not None:
@@ -1312,6 +1397,7 @@ class Node:
             for program_msg in self.map_data.planner_program_list_msg.program_list:
                 if program_msg.name == msg.data:
                     self.program_active = program_msg
+                    # self.program_active.zone_list[0].paths = program_msg.zone_list[0].paths[1:]
                     self.log_publisher("Program selected to run: {}".format(msg.data))
                     rospy.loginfo("[{}] Program selected to run: {}".format(rospy.get_caller_id(), msg.data))
                     self.program_active_pub.publish(self.program_active)
