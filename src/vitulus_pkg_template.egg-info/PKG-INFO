@@ -1,9 +1,0 @@
-Metadata-Version: 2.1
-Name: vitulus-pkg-template
-Version: 0.0.1
-Summary: Vitulus package template.
-Author: Robert Lacina
-Author-email: robert@lacina.dev
-Maintainer: Robert Lacina
-Maintainer-email: robert@lacina.dev
-License: Apache 2.0

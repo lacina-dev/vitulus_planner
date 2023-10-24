@@ -27,121 +27,186 @@ import resource
 import sys
 import geopandas as gpd
 import matplotlib.pyplot as plt
+from os import listdir
+from os.path import isfile, join, exists
+import shutil
+from node_planner.planner_data import MapData, MapSpec, PathPolygon, Zone
+
+# from node_planner.planner_data import MapData, MapSpec, PathPolygon, Zone
+# sys.modules['MapData'] = MapData
+# sys.modules['MapSpec'] = MapSpec
+# sys.modules['PathPolygon'] = PathPolygon
+# sys.modules['Zone'] = Zone
+# print(MapData)
 
 np.set_printoptions(threshold=sys.maxsize)
 
 
-class MapSpec:
-    ROBOT_RADIUS = 0.38
-    COVERAGE_DIAMETER = 0.29
-    OBSTACLE_RESERVE = 0.1
-    FILL_HOLE = 2
+# class MapSpec:
+#     ROBOT_RADIUS = 0.38
+#     COVERAGE_DIAMETER = 0.29
+#     OBSTACLE_RESERVE = 0.1
+#     FILL_HOLE = 2
+#
+#     UNKNOWN = -1
+#     FREE = 0
+#     OBSTACLE = 100
+#     BORDER_PATH = 120
+#     NOTHING = -120
+#
+#
+# class PathPolygon:
+#     def __init__(self, polygon, path_level):
+#         self.polygon = polygon
+#         self.path_level = path_level
+#
+#
+# class Zone:
+#     def __init__(self, np_zone, np_zone_navi, msg=MapEditZone()):
+#         self.msg = msg
+#         self.np_zone = np.copy(np_zone)
+#         self.np_zone_navi = np.copy(np_zone_navi)
+#         self.np_zone_paths = np.copy(np_zone)
+#         self.path_polygons = []
+#         self.multilines = []
+#         self.zone_path_lines_marker_array = MarkerArray()
+#         self.path_msg_coverage = Path()
+#         self.path_msg_coverage.header.frame_id = "map"
+#         self.path_msg_outline = Path()
+#         self.path_msg_outline.header.frame_id = "map"
+#
+#
+# class MapData:
+#     def __init__(self, np_map, map_msg=OccupancyGrid()):
+#         self.name = "map"
+#         self.initial_map = map_msg
+#         self.polygon_msgs = []
+#         self.zones = []
+#         self.planner_program_list_msg = None
+#         self.resolution = self.initial_map.info.resolution
+#         self.origin_x = self.initial_map.info.origin.position.x
+#         self.origin_y = self.initial_map.info.origin.position.y
+#         self.position_rc = [self.initial_map.info.width / 2, self.initial_map.info.height / 2]
+#         self.x_origin = -1 * int(self.initial_map.info.origin.position.x / self.resolution)
+#         self.y_origin = -1 * int(self.initial_map.info.origin.position.y / self.resolution)
+#         self.width, self.height = np.shape(np_map)
+#         self.coverage_distance_px = int(round(((MapSpec.COVERAGE_DIAMETER / 2.0) + MapSpec.OBSTACLE_RESERVE) / self.resolution))
+#         self.obstacle_margin = MapSpec.ROBOT_RADIUS
+#         self.obstacle_margin_px = int(round(MapSpec.ROBOT_RADIUS / self.resolution))
+#         self.fill_hole_px = MapSpec.FILL_HOLE
+#         self.fill_shape = 'ellipse'
+#         self.fill_shape_cv = cv2.MORPH_ELLIPSE
+#         self.np_original = np.copy(np_map)
+#         self.np_unk = np.full_like(np_map, fill_value=MapSpec.NOTHING, dtype=np.int8)
+#         self.np_free = np.full_like(np_map, fill_value=MapSpec.NOTHING, dtype=np.int8)
+#         self.np_free_filled = np.full_like(np_map, fill_value=MapSpec.NOTHING, dtype=np.int8)
+#         self.np_occupied = np.full_like(np_map, fill_value=MapSpec.NOTHING, dtype=np.int8)
+#         self.np_unk_cleaned = np.full_like(np_map, fill_value=MapSpec.NOTHING, dtype=np.int8)
+#         self.np_obstacle_margin = np.full_like(np_map, fill_value=MapSpec.NOTHING, dtype=np.int8)
+#         self.np_assembled = np.full_like(np_map, fill_value=MapSpec.FREE, dtype=np.int8)
+#         self.np_semi_assembled = np.full_like(np_map, fill_value=MapSpec.FREE, dtype=np.int8)
+#         self.np_poly_obstacle = np.full_like(np_map, fill_value=MapSpec.NOTHING, dtype=np.int8)
+#         self.np_poly_free = np.full_like(np_map, fill_value=MapSpec.NOTHING, dtype=np.int8)
+#
+#     def clear_layers(self):
+#         self.np_unk = np.full_like(self.np_original, fill_value=MapSpec.NOTHING, dtype=np.int8)
+#         self.np_free = np.full_like(self.np_original, fill_value=MapSpec.NOTHING, dtype=np.int8)
+#         self.np_free_filled = np.full_like(self.np_original, fill_value=MapSpec.NOTHING, dtype=np.int8)
+#         self.np_occupied = np.full_like(self.np_original, fill_value=MapSpec.NOTHING, dtype=np.int8)
+#         self.np_unk_cleaned = np.full_like(self.np_original, fill_value=MapSpec.NOTHING, dtype=np.int8)
+#         self.np_obstacle_margin = np.full_like(self.np_original, fill_value=MapSpec.NOTHING, dtype=np.int8)
+#         self.np_assembled = np.full_like(self.np_original, fill_value=MapSpec.FREE, dtype=np.int8)
+#         self.np_semi_assembled = np.full_like(self.np_original, fill_value=MapSpec.FREE, dtype=np.int8)
+#         self.np_poly_obstacle = np.full_like(self.np_original, fill_value=MapSpec.NOTHING, dtype=np.int8)
+#         self.np_poly_free = np.full_like(self.np_original, fill_value=MapSpec.NOTHING, dtype=np.int8)
 
-    UNKNOWN = -1
-    FREE = 0
-    OBSTACLE = 100
-    BORDER_PATH = 120
-    NOTHING = -120
-
-
-class PathPolygon:
-    def __init__(self, polygon, path_level):
-        self.polygon = polygon
-        self.path_level = path_level
-
-
-class Zone:
-    def __init__(self, np_zone, np_zone_navi, msg=MapEditZone()):
-        self.msg = msg
-        self.np_zone = np.copy(np_zone)
-        self.np_zone_navi = np.copy(np_zone_navi)
-        self.np_zone_paths = np.copy(np_zone)
-        self.path_polygons = []
-        self.multilines = []
-        self.zone_path_lines_marker_array = MarkerArray()
-        self.path_msg_coverage = Path()
-        self.path_msg_coverage.header.frame_id = "map"
-        self.path_msg_outline = Path()
-        self.path_msg_outline.header.frame_id = "map"
-
-
-class MapData:
-    def __init__(self, np_map, map_msg=OccupancyGrid()):
-        self.name = "map"
-        self.initial_map = map_msg
-        self.polygon_msgs = []
-        self.zones = []
-        self.planner_program_list_msg = None
-        self.resolution = self.initial_map.info.resolution
-        self.origin_x = self.initial_map.info.origin.position.x
-        self.origin_y = self.initial_map.info.origin.position.y
-        self.position_rc = [self.initial_map.info.width / 2, self.initial_map.info.height / 2]
-        self.x_origin = -1 * int(self.initial_map.info.origin.position.x / self.resolution)
-        self.y_origin = -1 * int(self.initial_map.info.origin.position.y / self.resolution)
-        self.width, self.height = np.shape(np_map)
-        self.coverage_distance_px = int(round(((MapSpec.COVERAGE_DIAMETER / 2.0) + MapSpec.OBSTACLE_RESERVE) / self.resolution))
-        self.obstacle_margin = MapSpec.ROBOT_RADIUS
-        self.obstacle_margin_px = int(round(MapSpec.ROBOT_RADIUS / self.resolution))
-        self.fill_hole_px = MapSpec.FILL_HOLE
-        self.fill_shape = 'ellipse'
-        self.fill_shape_cv = cv2.MORPH_ELLIPSE
-        self.np_original = np.copy(np_map)
-        self.np_unk = np.full_like(np_map, fill_value=MapSpec.NOTHING, dtype=np.int8)
-        self.np_free = np.full_like(np_map, fill_value=MapSpec.NOTHING, dtype=np.int8)
-        self.np_free_filled = np.full_like(np_map, fill_value=MapSpec.NOTHING, dtype=np.int8)
-        self.np_occupied = np.full_like(np_map, fill_value=MapSpec.NOTHING, dtype=np.int8)
-        self.np_unk_cleaned = np.full_like(np_map, fill_value=MapSpec.NOTHING, dtype=np.int8)
-        self.np_obstacle_margin = np.full_like(np_map, fill_value=MapSpec.NOTHING, dtype=np.int8)
-        self.np_assembled = np.full_like(np_map, fill_value=MapSpec.FREE, dtype=np.int8)
-        self.np_semi_assembled = np.full_like(np_map, fill_value=MapSpec.FREE, dtype=np.int8)
-        self.np_poly_obstacle = np.full_like(np_map, fill_value=MapSpec.NOTHING, dtype=np.int8)
-        self.np_poly_free = np.full_like(np_map, fill_value=MapSpec.NOTHING, dtype=np.int8)
-
-    def clear_layers(self):
-        self.np_unk = np.full_like(self.np_original, fill_value=MapSpec.NOTHING, dtype=np.int8)
-        self.np_free = np.full_like(self.np_original, fill_value=MapSpec.NOTHING, dtype=np.int8)
-        self.np_free_filled = np.full_like(self.np_original, fill_value=MapSpec.NOTHING, dtype=np.int8)
-        self.np_occupied = np.full_like(self.np_original, fill_value=MapSpec.NOTHING, dtype=np.int8)
-        self.np_unk_cleaned = np.full_like(self.np_original, fill_value=MapSpec.NOTHING, dtype=np.int8)
-        self.np_obstacle_margin = np.full_like(self.np_original, fill_value=MapSpec.NOTHING, dtype=np.int8)
-        self.np_assembled = np.full_like(self.np_original, fill_value=MapSpec.FREE, dtype=np.int8)
-        self.np_semi_assembled = np.full_like(self.np_original, fill_value=MapSpec.FREE, dtype=np.int8)
-        self.np_poly_obstacle = np.full_like(self.np_original, fill_value=MapSpec.NOTHING, dtype=np.int8)
-        self.np_poly_free = np.full_like(self.np_original, fill_value=MapSpec.NOTHING, dtype=np.int8)
-
+print(MapData)
 
 class Node:
 
     def __init__(self):
         self.map_data = None
+        self.current_navi_map_name = None
         self.np_show = None
         self.current_zone = None
         self.data_loaded = None
         self.program_active = None
 
-        self.log_pub = rospy.Publisher("log", String, queue_size=1)
-        self.reload_sub = rospy.Subscriber("reload", Bool, self.callback_map_reload)
-        self.map_sub = rospy.Subscriber("/map", OccupancyGrid, self.callback_map)
-        self.map_show_pub = rospy.Publisher("map_show", OccupancyGrid, queue_size=1)
-        self.map_assemble_sub = rospy.Subscriber("assemble_map", MapEditMap, self.callback_map_assemble)
-        self.map_data_pub = rospy.Publisher("map_data", MapEditMap, queue_size=1)
-        self.map_show_map_layer_sub = rospy.Subscriber("show_map_layer", String, self.callback_show_map_layer)
-        self.map_save_poly_sub = rospy.Subscriber("save_polygon", MapEditPolygon, self.callback_map_save_poly)
-        self.map_remove_poly_sub = rospy.Subscriber("remove_polygon", String, self.callback_map_remove_poly)
-        self.map_poly_list_pub = rospy.Publisher("polygon_list", MapEditPolygonList, queue_size=1)
-        self.zone_save_sub = rospy.Subscriber("save_zone", MapEditZone, self.callback_map_save_zone)
-        self.zone_remove_sub = rospy.Subscriber("remove_zone", String, self.callback_zone_remove)
-        self.zone_selected_sub = rospy.Subscriber("selected_zone", String, self.callback_zone_selected)
-        self.zone_list_pub = rospy.Publisher("zone_list", MapEditZoneList, queue_size=1)
-        self.marker_pub = rospy.Publisher("zone_outline_polygons", Marker, queue_size=1)
+        self.log_pub = rospy.Publisher("/web_plan/log", String, queue_size=1)
+        self.reload_sub = rospy.Subscriber("/web_plan/reload", Bool, self.callback_map_reload)
+        self.map_sub = rospy.Subscriber("/rtabmap/grid_map", OccupancyGrid, self.callback_map)
+        self.map_show_pub = rospy.Publisher("/web_plan/map_show", OccupancyGrid, queue_size=1)
+        self.map_assemble_sub = rospy.Subscriber("/web_plan/assemble_map", MapEditMap, self.callback_map_assemble)
+        self.map_data_pub = rospy.Publisher("/web_plan/map_data", MapEditMap, queue_size=1)
+        self.map_show_map_layer_sub = rospy.Subscriber("/web_plan/show_map_layer", String, self.callback_show_map_layer)
+        self.map_save_poly_sub = rospy.Subscriber("/web_plan/save_polygon", MapEditPolygon, self.callback_map_save_poly)
+        self.map_remove_poly_sub = rospy.Subscriber("/web_plan/remove_polygon", String, self.callback_map_remove_poly)
+        self.map_poly_list_pub = rospy.Publisher("/web_plan/polygon_list", MapEditPolygonList, queue_size=1)
+        self.zone_save_sub = rospy.Subscriber("/web_plan/save_zone", MapEditZone, self.callback_map_save_zone)
+        self.zone_remove_sub = rospy.Subscriber("/web_plan/remove_zone", String, self.callback_zone_remove)
+        self.zone_selected_sub = rospy.Subscriber("/web_plan/selected_zone", String, self.callback_zone_selected)
+        self.navi_active_map_sub = rospy.Subscriber("/navi_manager/active_map", String, self.callback_navi_active_map)
+        self.navi_active_map_sub = rospy.Subscriber("/navi_manager/active_map", String, self.callback_navi_active_map)
+        self.load_planner_data_sub = rospy.Subscriber("/web_plan/load_planner_data", Bool, self.callback_load_planner_data)
+        self.save_planner_data_sub = rospy.Subscriber("/web_plan/save_planner_data", Bool, self.callback_save_planner_data)
+        self.reload_map_sub = rospy.Subscriber("/web_plan/reload_map", Bool, self.callback_reload_map)
+
+        self.zone_list_pub = rospy.Publisher("/web_plan/zone_list", MapEditZoneList, queue_size=1)
+        self.marker_pub = rospy.Publisher("/web_plan/zone_outline_polygons", Marker, queue_size=1)
         self.marker_zone_path_lines_pub = rospy.Publisher("/zone_path_lines", MarkerArray, queue_size=0)
-        self.coverage_path_pub = rospy.Publisher("coverage_path", Path, queue_size=1)
-        self.outline_path_pub = rospy.Publisher("outline_path", Path, queue_size=1)
-        self.map_assembled_pub = rospy.Publisher("map_assembled", OccupancyGrid, queue_size=1)
-        self.map_edited_pub = rospy.Publisher("map_edited", OccupancyGrid, queue_size=1)
-        self.program_list_pub = rospy.Publisher("program_list", PlannerProgramList, queue_size=1)
-        self.program_active_pub = rospy.Publisher("program_active", PlannerProgram, queue_size=1)
-        self.program_select_sub = rospy.Subscriber("program_select", String, self.callback_program_select)
+        self.coverage_path_pub = rospy.Publisher("/web_plan/coverage_path", Path, queue_size=1)
+        self.outline_path_pub = rospy.Publisher("/web_plan/outline_path", Path, queue_size=1)
+        self.map_assembled_pub = rospy.Publisher("/web_plan/map_assembled", OccupancyGrid, queue_size=1)
+        self.map_edited_pub = rospy.Publisher("/web_plan/map_edited", OccupancyGrid, queue_size=1)
+        self.program_list_pub = rospy.Publisher("/web_plan/program_list", PlannerProgramList, queue_size=1)
+        self.program_active_pub = rospy.Publisher("/web_plan/program_active", PlannerProgram, queue_size=1)
+        self.program_select_sub = rospy.Subscriber("/web_plan/program_select", String, self.callback_program_select)
+
+    def callback_reload_map(self, msg):
+        if msg.data:
+            self.map_sub.unregister()
+            self.map_sub = rospy.Subscriber("/rtabmap/grid_map", OccupancyGrid, self.callback_map)
+            self.data_loaded = False
+            self.log_publisher("Be shure that you have loaded the map with RtabMap.")
+            self.log_publisher("Reloading map from /rtabmap/grid_map")
+            rospy.loginfo("[{}] Reloading map from /rtabmap/grid_map".format(rospy.get_caller_id()))
+
+    def callback_load_planner_data(self, msg):
+        if msg.data:
+            if self.current_navi_map_name != "New":
+                if (exists("/home/vitulus/.vitulus/saves/planner_data/" + self.current_navi_map_name + ".pkl")):
+                    shutil.copyfile("/home/vitulus/.vitulus/saves/planner_data/" + self.current_navi_map_name + ".pkl",
+                                    "/home/vitulus/.vitulus/running/planner_data.pkl")
+                    self.load_running_data()
+                    self.log_publisher("Planner data loaded.")
+                    rospy.loginfo("[{}] Planner data loaded.".format(rospy.get_caller_id()))
+            else:
+                self.log_publisher("Not loaded!!! It a new map. Save it in Navi Manager first.")
+                rospy.logwarn("[{}] Not loaded!!! It a new map.".format(rospy.get_caller_id()))
+
+    def callback_save_planner_data(self, msg):
+        if msg.data:
+            if self.current_navi_map_name != "New":
+                self.save_running_data()
+                if (exists("/home/vitulus/.vitulus/running/planner_data.pkl")):
+                    shutil.copyfile("/home/vitulus/.vitulus/running/planner_data.pkl",
+                                    "/home/vitulus/.vitulus/saves/planner_data/" + self.current_navi_map_name + ".pkl")
+                    self.log_publisher("Planner data saved.")
+                    rospy.loginfo("[{}] Planner data saved.".format(rospy.get_caller_id()))
+            else:
+                self.log_publisher("Not saved!!! It a new map. Save it in Navi Manager first.")
+                rospy.logwarn("[{}] Not saved!!! It a new map.".format(rospy.get_caller_id()))
+
+    def callback_navi_active_map(self, msg):
+        if self.current_navi_map_name is not None:
+            if msg.data != self.current_navi_map_name:
+                self.current_navi_map_name = msg.data
+                print("Map changed to: {}".format(self.current_navi_map_name))
+                self.callback_load_planner_data(Bool(True))
+                ## delej neco kdyz byla vybrana jina mapa
+        else:
+            self.current_navi_map_name = msg.data
+            ## delej neco kdyz se to inicializovalo
 
     def cv_show(self, np_arr):
         # plt.imshow(np_arr)
@@ -167,6 +232,7 @@ class Node:
                 self.map_data_publisher()
                 self.map_poly_list_publisher()
                 self.assemble_map()
+                self.map_sub.unregister()
 
     def map_show_publisher(self):
         if self.map_data is not None:
@@ -277,13 +343,14 @@ class Node:
         self.save_running_data()
 
     def map_data_publisher(self):
-        msg = MapEditMap()
-        msg.header.stamp = rospy.Time.now()
-        msg.name = self.map_data.name
-        msg.fill = self.map_data.fill_hole_px
-        msg.margin = self.map_data.obstacle_margin
-        msg.shape = self.map_data.fill_shape
-        self.map_data_pub.publish(msg)
+        if self.map_data is not None:
+            msg = MapEditMap()
+            msg.header.stamp = rospy.Time.now()
+            msg.name = self.map_data.name
+            msg.fill = self.map_data.fill_hole_px
+            msg.margin = self.map_data.obstacle_margin
+            msg.shape = self.map_data.fill_shape
+            self.map_data_pub.publish(msg)
 
     def callback_show_map_layer(self, msg):
         rospy.loginfo("[{}] Show map layer: {}".format(rospy.get_caller_id(), msg.data))
@@ -358,13 +425,14 @@ class Node:
         self.np_show = self.map_data.np_semi_assembled
 
     def map_poly_list_publisher(self):
-        msg = MapEditPolygonList()
-        msg.header.stamp = rospy.Time.now()
-        msg.header.frame_id = "map"
-        msg.polygon_list = []
-        for poly_msg in self.map_data.polygon_msgs:
-            msg.polygon_list.append(poly_msg)
-        self.map_poly_list_pub.publish(msg)
+        if self.map_data is not None:
+            msg = MapEditPolygonList()
+            msg.header.stamp = rospy.Time.now()
+            msg.header.frame_id = "map"
+            msg.polygon_list = []
+            for poly_msg in self.map_data.polygon_msgs:
+                msg.polygon_list.append(poly_msg)
+            self.map_poly_list_pub.publish(msg)
 
     def callback_map_save_zone(self, msg):
         polygon = []
@@ -464,13 +532,14 @@ class Node:
                     break
 
     def map_zone_list_publisher(self):
-        msg = MapEditZoneList()
-        msg.header.stamp = rospy.Time.now()
-        msg.header.frame_id = "map"
-        msg.zone_list = []
-        for zone in self.map_data.zones:
-            msg.zone_list.append(zone.msg)
-        self.zone_list_pub.publish(msg)
+        if self.map_data is not None:
+            msg = MapEditZoneList()
+            msg.header.stamp = rospy.Time.now()
+            msg.header.frame_id = "map"
+            msg.zone_list = []
+            for zone in self.map_data.zones:
+                msg.zone_list.append(zone.msg)
+            self.zone_list_pub.publish(msg)
 
     def get_shapely_poly(self, polygons, contours, hierarchy, poly_id, external, internals):
         while poly_id != -1:
@@ -1315,7 +1384,7 @@ class Node:
 
     def save_running_data(self):
         try:
-            with open(os.path.expanduser('~') + '/.vitulus/running/map_data.pkl', 'wb') as output:
+            with open(os.path.expanduser('~') + '/.vitulus/running/planner_data.pkl', 'wb') as output:
                 pickle.dump(self.map_data, output, pickle.HIGHEST_PROTOCOL)
                 rospy.loginfo("[{}] Planner data saved.".format(rospy.get_caller_id()))
             return True
@@ -1325,8 +1394,11 @@ class Node:
 
     def load_running_data(self):
         try:
-            with open(os.path.expanduser('~') + '/.vitulus/running/map_data.pkl', 'rb') as input:
+            with open(os.path.expanduser('~') + '/.vitulus/running/planner_data.pkl', 'rb') as input:
+                print("Loading planner data...")
+                print(MapData)
                 self.map_data = pickle.load(input)
+                print("loaded planner data...")
                 self.np_show = self.map_data.np_assembled
                 self.map_data_publisher()
                 self.map_poly_list_publisher()
@@ -1334,7 +1406,7 @@ class Node:
                 self.program_list_publisher()
                 self.log_publisher("Planner data loaded")
                 rospy.loginfo("[{}] Planner data loaded.".format(rospy.get_caller_id()))
-                self.map_sub.unregister()
+                # self.map_sub.unregister()
             return True
         except Exception as e:
             print(e)
@@ -1393,19 +1465,21 @@ class Node:
 
 
     def callback_program_select(self, msg):
-        if self.map_data.planner_program_list_msg is not None:
-            for program_msg in self.map_data.planner_program_list_msg.program_list:
-                if program_msg.name == msg.data:
-                    self.program_active = program_msg
-                    # self.program_active.zone_list[0].paths = program_msg.zone_list[0].paths[1:]
-                    self.log_publisher("Program selected to run: {}".format(msg.data))
-                    rospy.loginfo("[{}] Program selected to run: {}".format(rospy.get_caller_id(), msg.data))
-                    self.program_active_pub.publish(self.program_active)
-                    break
+        if self.map_data is not None:
+            if self.map_data.planner_program_list_msg is not None:
+                for program_msg in self.map_data.planner_program_list_msg.program_list:
+                    if program_msg.name == msg.data:
+                        self.program_active = program_msg
+                        # self.program_active.zone_list[0].paths = program_msg.zone_list[0].paths[1:]
+                        self.log_publisher("Program selected to run: {}".format(msg.data))
+                        rospy.loginfo("[{}] Program selected to run: {}".format(rospy.get_caller_id(), msg.data))
+                        self.program_active_pub.publish(self.program_active)
+                        break
 
     def program_list_publisher(self):
-        if self.map_data.planner_program_list_msg is not None:
-            self.program_list_pub.publish(self.map_data.planner_program_list_msg)
+        if self.map_data is not None:
+            if self.map_data.planner_program_list_msg is not None:
+                self.program_list_pub.publish(self.map_data.planner_program_list_msg)
 
 
     def log_publisher(self, log_txt):
@@ -1420,12 +1494,32 @@ class Node:
         self.program_list_publisher()
 
 if __name__ == '__main__':
+    # from node_planner import MapData
+    # import MapSpec
+    # import Zone
+    # from node_planner import MapData
+    # sys.modules['__main__.MapData'] = MapData
+    print(MapData)
+    print(dir(MapData))
+    print("ssssssssssssssssssssssss")
+    print("ssssssssssssssssssssssss")
+    print(dir(sys))
+    print("ssssssssssssssssssssssss")
+    print("ssssssssssssssssssssssss")
+    print(dir())
+    print("ssssssssssssssssssssssss")
+    print("ssssssssssssssssssssssss")
+    print(sys.modules.keys())
+    print("ssssssssssssssssssssssss")
+
     try:
-        rospy.init_node('vitulus_planner_node')
+        rospy.init_node('node_planner')
         rospy.loginfo("[{}] Initialising...".format(rospy.get_caller_id()))
         node = Node()
         r = rospy.Rate(1)  # Hz
+        rospy.loginfo("[{}] Initialising...".format(rospy.get_caller_id()))
         node.data_loaded = node.load_running_data()
+        rospy.loginfo("[{}] Initialising...".format(rospy.get_caller_id()))
 
         def signal_handler():
             rospy.signal_shutdown("end")

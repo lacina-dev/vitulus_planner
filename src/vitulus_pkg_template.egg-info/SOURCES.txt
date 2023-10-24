@@ -1,6 +1,0 @@
-setup.py
-src/node_template/__init__.py
-src/vitulus_pkg_template.egg-info/PKG-INFO
-src/vitulus_pkg_template.egg-info/SOURCES.txt
-src/vitulus_pkg_template.egg-info/dependency_links.txt
-src/vitulus_pkg_template.egg-info/top_level.txt
