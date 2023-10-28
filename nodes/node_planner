@@ -125,6 +125,7 @@ print(MapData)
 class Node:
 
     def __init__(self):
+        self.clean_running_dir()
         self.map_data = None
         self.current_navi_map_name = None
         self.np_show = None
@@ -161,6 +162,12 @@ class Node:
         self.program_list_pub = rospy.Publisher("/web_plan/program_list", PlannerProgramList, queue_size=1)
         self.program_active_pub = rospy.Publisher("/web_plan/program_active", PlannerProgram, queue_size=1)
         self.program_select_sub = rospy.Subscriber("/web_plan/program_select", String, self.callback_program_select)
+
+    def clean_running_dir(self):
+        if (exists("/home/vitulus/.vitulus/running/planner_data.pkl")):
+            os.remove("/home/vitulus/.vitulus/running/planner_data.pkl")
+            self.log_publisher("Planner data loaded.")
+            rospy.loginfo("[{}] Planner data loaded.".format(rospy.get_caller_id()))
 
     def callback_reload_map(self, msg):
         if msg.data:
@@ -1499,18 +1506,18 @@ if __name__ == '__main__':
     # import Zone
     # from node_planner import MapData
     # sys.modules['__main__.MapData'] = MapData
-    print(MapData)
-    print(dir(MapData))
-    print("ssssssssssssssssssssssss")
-    print("ssssssssssssssssssssssss")
-    print(dir(sys))
-    print("ssssssssssssssssssssssss")
-    print("ssssssssssssssssssssssss")
-    print(dir())
-    print("ssssssssssssssssssssssss")
-    print("ssssssssssssssssssssssss")
-    print(sys.modules.keys())
-    print("ssssssssssssssssssssssss")
+    # print(MapData)
+    # print(dir(MapData))
+    # print("ssssssssssssssssssssssss")
+    # print("ssssssssssssssssssssssss")
+    # print(dir(sys))
+    # print("ssssssssssssssssssssssss")
+    # print("ssssssssssssssssssssssss")
+    # print(dir())
+    # print("ssssssssssssssssssssssss")
+    # print("ssssssssssssssssssssssss")
+    # print(sys.modules.keys())
+    # print("ssssssssssssssssssssssss")
 
     try:
         rospy.init_node('node_planner')
