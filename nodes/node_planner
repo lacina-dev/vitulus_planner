@@ -1528,7 +1528,7 @@ if __name__ == '__main__':
         node.data_loaded = node.load_running_data()
         rospy.loginfo("[{}] Initialising...".format(rospy.get_caller_id()))
 
-        def signal_handler():
+        def signal_handler(sig, frame):
             rospy.signal_shutdown("end")
             sys.exit(0)
         signal.signal(signal.SIGINT, signal_handler)
