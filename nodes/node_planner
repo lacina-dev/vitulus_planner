@@ -32,99 +32,20 @@ from os.path import isfile, join, exists
 import shutil
 from node_planner.planner_data import MapData, MapSpec, PathPolygon, Zone
 
-# from node_planner.planner_data import MapData, MapSpec, PathPolygon, Zone
-# sys.modules['MapData'] = MapData
-# sys.modules['MapSpec'] = MapSpec
-# sys.modules['PathPolygon'] = PathPolygon
-# sys.modules['Zone'] = Zone
-# print(MapData)
 
 np.set_printoptions(threshold=sys.maxsize)
 
-
-# class MapSpec:
-#     ROBOT_RADIUS = 0.38
-#     COVERAGE_DIAMETER = 0.29
-#     OBSTACLE_RESERVE = 0.1
-#     FILL_HOLE = 2
-#
-#     UNKNOWN = -1
-#     FREE = 0
-#     OBSTACLE = 100
-#     BORDER_PATH = 120
-#     NOTHING = -120
-#
-#
-# class PathPolygon:
-#     def __init__(self, polygon, path_level):
-#         self.polygon = polygon
-#         self.path_level = path_level
-#
-#
-# class Zone:
-#     def __init__(self, np_zone, np_zone_navi, msg=MapEditZone()):
-#         self.msg = msg
-#         self.np_zone = np.copy(np_zone)
-#         self.np_zone_navi = np.copy(np_zone_navi)
-#         self.np_zone_paths = np.copy(np_zone)
-#         self.path_polygons = []
-#         self.multilines = []
-#         self.zone_path_lines_marker_array = MarkerArray()
-#         self.path_msg_coverage = Path()
-#         self.path_msg_coverage.header.frame_id = "map"
-#         self.path_msg_outline = Path()
-#         self.path_msg_outline.header.frame_id = "map"
-#
-#
-# class MapData:
-#     def __init__(self, np_map, map_msg=OccupancyGrid()):
-#         self.name = "map"
-#         self.initial_map = map_msg
-#         self.polygon_msgs = []
-#         self.zones = []
-#         self.planner_program_list_msg = None
-#         self.resolution = self.initial_map.info.resolution
-#         self.origin_x = self.initial_map.info.origin.position.x
-#         self.origin_y = self.initial_map.info.origin.position.y
-#         self.position_rc = [self.initial_map.info.width / 2, self.initial_map.info.height / 2]
-#         self.x_origin = -1 * int(self.initial_map.info.origin.position.x / self.resolution)
-#         self.y_origin = -1 * int(self.initial_map.info.origin.position.y / self.resolution)
-#         self.width, self.height = np.shape(np_map)
-#         self.coverage_distance_px = int(round(((MapSpec.COVERAGE_DIAMETER / 2.0) + MapSpec.OBSTACLE_RESERVE) / self.resolution))
-#         self.obstacle_margin = MapSpec.ROBOT_RADIUS
-#         self.obstacle_margin_px = int(round(MapSpec.ROBOT_RADIUS / self.resolution))
-#         self.fill_hole_px = MapSpec.FILL_HOLE
-#         self.fill_shape = 'ellipse'
-#         self.fill_shape_cv = cv2.MORPH_ELLIPSE
-#         self.np_original = np.copy(np_map)
-#         self.np_unk = np.full_like(np_map, fill_value=MapSpec.NOTHING, dtype=np.int8)
-#         self.np_free = np.full_like(np_map, fill_value=MapSpec.NOTHING, dtype=np.int8)
-#         self.np_free_filled = np.full_like(np_map, fill_value=MapSpec.NOTHING, dtype=np.int8)
-#         self.np_occupied = np.full_like(np_map, fill_value=MapSpec.NOTHING, dtype=np.int8)
-#         self.np_unk_cleaned = np.full_like(np_map, fill_value=MapSpec.NOTHING, dtype=np.int8)
-#         self.np_obstacle_margin = np.full_like(np_map, fill_value=MapSpec.NOTHING, dtype=np.int8)
-#         self.np_assembled = np.full_like(np_map, fill_value=MapSpec.FREE, dtype=np.int8)
-#         self.np_semi_assembled = np.full_like(np_map, fill_value=MapSpec.FREE, dtype=np.int8)
-#         self.np_poly_obstacle = np.full_like(np_map, fill_value=MapSpec.NOTHING, dtype=np.int8)
-#         self.np_poly_free = np.full_like(np_map, fill_value=MapSpec.NOTHING, dtype=np.int8)
-#
-#     def clear_layers(self):
-#         self.np_unk = np.full_like(self.np_original, fill_value=MapSpec.NOTHING, dtype=np.int8)
-#         self.np_free = np.full_like(self.np_original, fill_value=MapSpec.NOTHING, dtype=np.int8)
-#         self.np_free_filled = np.full_like(self.np_original, fill_value=MapSpec.NOTHING, dtype=np.int8)
-#         self.np_occupied = np.full_like(self.np_original, fill_value=MapSpec.NOTHING, dtype=np.int8)
-#         self.np_unk_cleaned = np.full_like(self.np_original, fill_value=MapSpec.NOTHING, dtype=np.int8)
-#         self.np_obstacle_margin = np.full_like(self.np_original, fill_value=MapSpec.NOTHING, dtype=np.int8)
-#         self.np_assembled = np.full_like(self.np_original, fill_value=MapSpec.FREE, dtype=np.int8)
-#         self.np_semi_assembled = np.full_like(self.np_original, fill_value=MapSpec.FREE, dtype=np.int8)
-#         self.np_poly_obstacle = np.full_like(self.np_original, fill_value=MapSpec.NOTHING, dtype=np.int8)
-#         self.np_poly_free = np.full_like(self.np_original, fill_value=MapSpec.NOTHING, dtype=np.int8)
 
 print(MapData)
 
 class Node:
 
     def __init__(self):
+        self.permanent_program_list_msg = PlannerProgramList()
+        self.permanent_program_list_msg.header.stamp = rospy.Time.now()
+        self.permanent_program_list_msg.header.frame_id = "map"
+        self.load_programs()
+        self.log_pub = rospy.Publisher("/web_plan/log", String, queue_size=1)
         self.clean_running_dir()
         self.map_data = None
         self.current_navi_map_name = None
@@ -133,7 +54,7 @@ class Node:
         self.data_loaded = None
         self.program_active = None
 
-        self.log_pub = rospy.Publisher("/web_plan/log", String, queue_size=1)
+
         self.reload_sub = rospy.Subscriber("/web_plan/reload", Bool, self.callback_map_reload)
         self.map_sub = rospy.Subscriber("/rtabmap/grid_map", OccupancyGrid, self.callback_map)
         self.map_show_pub = rospy.Publisher("/web_plan/map_show", OccupancyGrid, queue_size=1)
@@ -159,15 +80,18 @@ class Node:
         self.outline_path_pub = rospy.Publisher("/web_plan/outline_path", Path, queue_size=1)
         self.map_assembled_pub = rospy.Publisher("/web_plan/map_assembled", OccupancyGrid, queue_size=1)
         self.map_edited_pub = rospy.Publisher("/web_plan/map_edited", OccupancyGrid, queue_size=1)
-        self.program_list_pub = rospy.Publisher("/web_plan/program_list", PlannerProgramList, queue_size=1)
+        self.program_list_pub = rospy.Publisher("/web_plan/program_list", PlannerProgramList, queue_size=10)
+        self.programs_pub = rospy.Publisher("/web_plan/programs", PlannerProgramList, queue_size=10)
         self.program_active_pub = rospy.Publisher("/web_plan/program_active", PlannerProgram, queue_size=1)
         self.program_select_sub = rospy.Subscriber("/web_plan/program_select", String, self.callback_program_select)
+        self.program_new_sub = rospy.Subscriber("/web_plan/program_new", PlannerProgram, self.callback_program_new)
+        self.program_remove_sub = rospy.Subscriber("/web_plan/program_remove", String, self.callback_program_remove)
 
     def clean_running_dir(self):
         if (exists("/home/vitulus/.vitulus/running/planner_data.pkl")):
             os.remove("/home/vitulus/.vitulus/running/planner_data.pkl")
-            self.log_publisher("Planner data loaded.")
-            rospy.loginfo("[{}] Planner data loaded.".format(rospy.get_caller_id()))
+            self.log_publisher("Running planner data cleaned.")
+            rospy.loginfo("[{}] Running planner data cleaned.".format(rospy.get_caller_id()))
 
     def callback_reload_map(self, msg):
         if msg.data:
@@ -234,6 +158,11 @@ class Node:
                 arr = np.array(msg.data, dtype=np.int8)
                 arr = arr.reshape((msg.info.height, msg.info.width))
                 self.map_data = MapData(np_map=arr, map_msg=msg)
+                if self.map_data.planner_program_list_msg is None:
+                    self.map_data.planner_program_list_msg = PlannerProgramList()
+                    self.map_data.planner_program_list_msg.header.frame_id = "map"
+                    self.map_data.planner_program_list_msg.header.stamp = rospy.Time.now()
+                    self.map_data.planner_program_list_msg.program_list = []
 
                 self.np_show = self.map_data.np_unk
                 self.map_data_publisher()
@@ -505,12 +434,11 @@ class Node:
             self.map_data.zones[zone_exist_id] = self.current_zone
 
         self.map_zone_list_publisher()
-        self.create_program()  # Need add program creating in webui
-        self.program_list_publisher()
         # Show zone map
         self.np_show = self.current_zone.np_zone_paths
         self.create_zone_path_marker_array()
         self.log_publisher("Zone {} saved.".format(self.current_zone.msg.name))
+        self.program_list_publisher()
         self.save_running_data()
 
     def callback_zone_remove(self, msg):
@@ -519,7 +447,7 @@ class Node:
             if zone.msg.name == msg.data:
                 self.map_data.zones.remove(zone)
         self.map_zone_list_publisher()
-        self.create_program()
+        # self.create_program()
         self.program_list_publisher()
         # Show map
         self.np_show = self.map_data.np_assembled
@@ -1083,7 +1011,10 @@ class Node:
                 multiline_new.append(previous_line)
 
             multiline_new = [linec for linec in multiline_new]
-            multilines_new.append(geometry.MultiLineString(multiline_new))
+            print("Multiline new: {}".format(len(multiline_new)))
+            print(multiline_new)
+            if multiline_new[0] is not None:
+                multilines_new.append(geometry.MultiLineString(multiline_new))
             multiline_new = []
 
 
@@ -1389,6 +1320,30 @@ class Node:
                                         isClosed=True, color=110, thickness=2)
         return np_coverage
 
+    def save_programs(self):
+        try:
+            with open(os.path.expanduser('~') + '/.vitulus/running/planner_programs.pkl', 'wb') as output:
+                pickle.dump(self.permanent_program_list_msg, output, pickle.HIGHEST_PROTOCOL)
+                rospy.loginfo("[{}] Planner programs saved.".format(rospy.get_caller_id()))
+            return True
+        except Exception as e:
+            print(e)
+            return False
+
+    def load_programs(self):
+        try:
+            with open(os.path.expanduser('~') + '/.vitulus/running/planner_programs.pkl', 'rb') as input:
+                print("Loading planner programs...")
+                self.permanent_program_list_msg = pickle.load(input)
+                print("loaded planner programs...")
+                self.program_list_publisher()
+                self.log_publisher("Planner programs loaded")
+                rospy.loginfo("[{}] Planner programs loaded.".format(rospy.get_caller_id()))
+            return True
+        except Exception as e:
+            print(e)
+            return False
+
     def save_running_data(self):
         try:
             with open(os.path.expanduser('~') + '/.vitulus/running/planner_data.pkl', 'wb') as output:
@@ -1404,7 +1359,13 @@ class Node:
             with open(os.path.expanduser('~') + '/.vitulus/running/planner_data.pkl', 'rb') as input:
                 print("Loading planner data...")
                 print(MapData)
+
                 self.map_data = pickle.load(input)
+                if self.map_data.planner_program_list_msg is None:
+                    self.map_data.planner_program_list_msg = PlannerProgramList()
+                    self.map_data.planner_program_list_msg.header.frame_id = "map"
+                    self.map_data.planner_program_list_msg.header.stamp = rospy.Time.now()
+                    self.map_data.planner_program_list_msg.program_list = []
                 print("loaded planner data...")
                 self.np_show = self.map_data.np_assembled
                 self.map_data_publisher()
@@ -1461,20 +1422,32 @@ class Node:
         self.map_data.planner_program_list_msg = PlannerProgramList()
         self.map_data.planner_program_list_msg.header.frame_id = "map"
         self.map_data.planner_program_list_msg.header.stamp = rospy.Time.now()
+        map_name, map_env = self.current_navi_map_name.split("***env*")
         program = PlannerProgram()
-        program.name = "Auto created"
+        program.name = "Auto created ({})".format(map_name)
+        print("map_name: {}".format(self.current_navi_map_name))
+        program.map_name = self.current_navi_map_name
         area = 0
+        length = 0
         for zone in self.map_data.zones:
             program.zone_list.append(zone.msg)
             area += zone.msg.area
+            length += zone.msg.length
         program.area = area
+        program.length = length
+        # print("Program created: {}".format(program))
         self.map_data.planner_program_list_msg.program_list.append(program)
+        # print(self.map_data.planner_program_list_msg)
+        # self.program_list_pub.publish(self.map_data.planner_program_list_msg)
+
 
 
     def callback_program_select(self, msg):
         if self.map_data is not None:
-            if self.map_data.planner_program_list_msg is not None:
-                for program_msg in self.map_data.planner_program_list_msg.program_list:
+            # if self.map_data.planner_program_list_msg is not None:
+            #     for program_msg in self.map_data.planner_program_list_msg.program_list:
+            if self.permanent_program_list_msg is not None:
+                for program_msg in self.permanent_program_list_msg.program_list:
                     if program_msg.name == msg.data:
                         self.program_active = program_msg
                         # self.program_active.zone_list[0].paths = program_msg.zone_list[0].paths[1:]
@@ -1484,9 +1457,29 @@ class Node:
                         break
 
     def program_list_publisher(self):
-        if self.map_data is not None:
-            if self.map_data.planner_program_list_msg is not None:
-                self.program_list_pub.publish(self.map_data.planner_program_list_msg)
+        """ Publish program list """
+        # print(self.map_data.planner_program_list_msg)
+        if self.permanent_program_list_msg is not None:
+            rospy.loginfo("[{}] Publishing program list: {} programs".format(rospy.get_caller_id(), self.permanent_program_list_msg.header))
+            self.program_list_pub.publish(self.permanent_program_list_msg)
+
+    def callback_program_new(self, msg):
+        self.permanent_program_list_msg.program_list.append(msg)
+        print(self.permanent_program_list_msg)
+        self.save_programs()
+        self.program_list_publisher()
+
+    def callback_program_remove(self, msg):
+        rospy.loginfo("[{}] Removing program {} from list".format(rospy.get_caller_id(), msg.data))
+        ## Remove program from list
+        for program in self.permanent_program_list_msg.program_list:
+            if program.name == msg.data:
+                self.permanent_program_list_msg.program_list.remove(program)
+                rospy.loginfo("[{}] Program {} removed from list".format(rospy.get_caller_id(), msg.data))
+                break
+        print(self.permanent_program_list_msg)
+        self.save_programs()
+        self.program_list_publisher()
 
 
     def log_publisher(self, log_txt):
@@ -1501,23 +1494,6 @@ class Node:
         self.program_list_publisher()
 
 if __name__ == '__main__':
-    # from node_planner import MapData
-    # import MapSpec
-    # import Zone
-    # from node_planner import MapData
-    # sys.modules['__main__.MapData'] = MapData
-    # print(MapData)
-    # print(dir(MapData))
-    # print("ssssssssssssssssssssssss")
-    # print("ssssssssssssssssssssssss")
-    # print(dir(sys))
-    # print("ssssssssssssssssssssssss")
-    # print("ssssssssssssssssssssssss")
-    # print(dir())
-    # print("ssssssssssssssssssssssss")
-    # print("ssssssssssssssssssssssss")
-    # print(sys.modules.keys())
-    # print("ssssssssssssssssssssssss")
 
     try:
         rospy.init_node('node_planner')
