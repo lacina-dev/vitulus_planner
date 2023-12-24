@@ -8,7 +8,6 @@
   <license>Apache 2.0</license>
   <author email="robert@lacina.dev">Robert Lacina</author>
 
-
   <buildtool_depend>catkin</buildtool_depend>
   <depend>rospy</depend>
   <depend>roscpp</depend>

@@ -1,37 +1,14 @@
 #!/usr/bin/env python
-import rospy
-import time
-from std_msgs.msg import Bool, String
-import sys
-import os
-import signal
-import shapely
-from shapely import geometry
-from shapely import affinity
-from shapely import ops
-import random
-from geometry_msgs.msg import Pose, Point, Quaternion, PoseStamped, PoseArray, PoseWithCovarianceStamped
-from std_msgs.msg import Int16, String, Bool
+
 import numpy as np
 import cv2
 from nav_msgs.msg import OccupancyGrid
-import time
-import PyKDL as kdl
+
 from nav_msgs.msg import Odometry, Path
-from geometry_msgs.msg import PolygonStamped, Polygon, Point32
 from vitulus_msgs.msg import MapEditPolygon, MapEditPolygonList, MapEditZone, MapEditZoneList, MapEditMap, PlannerProgramList, PlannerProgram
 from visualization_msgs.msg import Marker, MarkerArray
-import math
-import pickle
-import resource
-import sys
-import geopandas as gpd
-import matplotlib.pyplot as plt
-from os import listdir
-from os.path import isfile, join, exists
-import shutil
 
-np.set_printoptions(threshold=sys.maxsize)
+# np.set_printoptions(threshold=sys.maxsize)
 
 
 class MapSpec:
