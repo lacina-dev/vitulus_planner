@@ -9,6 +9,7 @@ from shapely import ops
 import random
 from geometry_msgs.msg import Pose, Point, Quaternion, PoseStamped, PoseArray, PoseWithCovarianceStamped
 from std_msgs.msg import Int16, String, Bool
+from vitulus_planner.srv import Save_map, Save_mapResponse
 import numpy as np
 import cv2
 from nav_msgs.msg import OccupancyGrid
@@ -47,6 +48,7 @@ class Node:
         self.data_loaded = None
         self.program_active = None
         self.current_program_marker_array = None
+        self.rtabmap_map_received = False
 
         self.reload_sub = rospy.Subscriber("/web_plan/reload", Bool, self.callback_reload)
         self.map_sub = rospy.Subscriber("/rtabmap/grid_map", OccupancyGrid, self.callback_map)
@@ -64,6 +66,7 @@ class Node:
         self.load_planner_data_sub = rospy.Subscriber("/web_plan/load_planner_data", Bool, self.callback_load_planner_data)
         self.save_planner_data_sub = rospy.Subscriber("/web_plan/save_planner_data", Bool, self.callback_save_planner_data)
         self.reload_map_sub = rospy.Subscriber("/web_plan/reload_map", Bool, self.callback_reload_map)
+        # self.new_map_sub = rospy.Subscriber("/web_plan/new_map", String, self.callback_new_map)
 
         self.zone_list_pub = rospy.Publisher("/web_plan/zone_list", MapEditZoneList, queue_size=1)
         self.marker_pub = rospy.Publisher("/web_plan/zone_outline_polygons", Marker, queue_size=1)
@@ -81,6 +84,36 @@ class Node:
         self.program_remove_sub = rospy.Subscriber("/web_plan/program_remove", String, self.callback_program_remove)
         self.program_to_show_marker_sub = rospy.Subscriber("/web_plan/program_to_show_marker", PlannerProgram, self.callback_program_to_show_marker)
         self.planner_loaded_pub = rospy.Publisher("/web_plan/planner_loaded", String, queue_size=1, latch=True)
+
+        self.save_map_srv = rospy.Service("/web_plan/save_map", Save_map, self.save_map)
+
+    def save_map(self, srv):
+        if srv.name != "":
+            self.current_navi_map_name = srv.name + "***env*" + srv.environment
+            # self.callback_reload_map(Bool(True))
+            self.map_sub.unregister()
+            self.map_sub = rospy.Subscriber("/rtabmap/grid_map", OccupancyGrid, self.callback_map)
+            self.data_loaded = False
+            self.rtabmap_map_received = False
+            while not self.rtabmap_map_received:
+                rospy.sleep(0.5)
+                rospy.loginfo("[{}] Planner wait for rtabmap.".format(rospy.get_caller_id()))
+            rospy.loginfo("[{}] Planner rtabmap map received.".format(rospy.get_caller_id()))
+            # self.callback_save_planner_data(Bool(True))
+            self.save_running_data()
+            if (exists("/home/vitulus/.vitulus/running/planner_data.pkl")):
+                shutil.copyfile("/home/vitulus/.vitulus/running/planner_data.pkl",
+                                "/home/vitulus/.vitulus/saves/planner_data/" + self.current_navi_map_name + ".pkl")
+                self.log_publisher("Planner data saved.")
+                rospy.loginfo("[{}] Planner data saved.".format(rospy.get_caller_id()))
+
+            self.log_publisher("Planner map saved.")
+            rospy.loginfo("[{}] Planner map saved.".format(rospy.get_caller_id()))
+            return Save_mapResponse("OK", "Map " + self.current_navi_map_name + "saved.")
+        else:
+            self.log_publisher("Map name is empty.")
+            rospy.logwarn("[{}] Map name is empty.".format(rospy.get_caller_id()))
+            return Save_mapResponse("FAILED", "Map name is empty.")
 
     def clean_running_dir(self):
         if (exists("/home/vitulus/.vitulus/running/planner_data.pkl")):
@@ -121,8 +154,8 @@ class Node:
                     self.log_publisher("Planner data saved.")
                     rospy.loginfo("[{}] Planner data saved.".format(rospy.get_caller_id()))
             else:
-                self.log_publisher("Not saved!!! It a new map. Save it in Navi Manager first.")
-                rospy.logwarn("[{}] Not saved!!! It a new map.".format(rospy.get_caller_id()))
+                self.log_publisher("Not saved!!! It is a new map. Save it in Navi Manager first.")
+                rospy.logwarn("[{}] Not saved!!! It is a new map.".format(rospy.get_caller_id()))
 
     def callback_navi_active_map(self, msg):
         if self.current_navi_map_name is not None:
@@ -168,6 +201,7 @@ class Node:
                 self.map_poly_list_publisher()
                 self.assemble_map()
                 self.map_sub.unregister()
+                self.rtabmap_map_received = True
 
     def map_show_publisher(self):
         if self.map_data is not None:
@@ -896,7 +930,7 @@ class Node:
         angle = self.current_zone.msg.coverage_angle
         paths_distance = self.current_zone.msg.paths_distance
         for polygon in top_level_polygons:
-            max_length = 0.5 + shapely.distance(geometry.Point(polygon.bounds[0], polygon.bounds[1]),
+            max_length = 50.5 + shapely.distance(geometry.Point(polygon.bounds[0], polygon.bounds[1]),
                                                 geometry.Point(polygon.bounds[2], polygon.bounds[3]))
             paths_offset = int(round((0.6 / paths_distance)))
             for i_line_offset in range(0, paths_offset):
