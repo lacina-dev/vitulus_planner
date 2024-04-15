@@ -3,7 +3,7 @@
     <arg name="arg_ns" default="/"/>
     <group ns="$(arg arg_ns)">
 
-        <node name="node_planner" pkg="vitulus_planner" type="node_planner" respawn="true" respawn_delay="1" output="screen">
+        <node name="node_planner" pkg="vitulus_planner" type="node_planner" respawn="true" respawn_delay="1" output="log">
 <!--            <param name="prm_name" value="prm_value"/>-->
 <!--            <remap from="/topic" to="/another_topic" />-->
         </node>

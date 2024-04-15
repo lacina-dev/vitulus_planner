@@ -26,15 +26,19 @@ catkin_python_setup()
 ################################################################################
 # Declare ROS messages, services and actions
 ################################################################################
+add_service_files(
+  FILES
+  Save_map.srv
+)
 # add_message_files(
 #   FILES
 #   Template.msg
 # )
 #
-# generate_messages(
-#   DEPENDENCIES
-#   std_msgs
-# )
+generate_messages(
+  DEPENDENCIES
+  std_msgs
+)
 ################################################################################
 # Declare ROS dynamic reconfigure parameters
 ################################################################################
