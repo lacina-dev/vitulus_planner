@@ -80,6 +80,10 @@ class Node:
         self.programs_pub = rospy.Publisher("/web_plan/programs", PlannerProgramList, queue_size=10)
         self.program_active_pub = rospy.Publisher("/web_plan/program_active", PlannerProgram, queue_size=1)
         self.program_select_sub = rospy.Subscriber("/web_plan/program_select", String, self.callback_program_select)
+        
+        self.program_active_unfinished_pub = rospy.Publisher("/web_plan/program_active_unfinished", PlannerProgram, queue_size=1)
+        self.program_select_resume_sub = rospy.Subscriber("/web_plan/program_select_resume", String, self.callback_program_select_resume)
+        
         self.program_new_sub = rospy.Subscriber("/web_plan/program_new", PlannerProgram, self.callback_program_new)
         self.program_remove_sub = rospy.Subscriber("/web_plan/program_remove", String, self.callback_program_remove)
         self.program_to_show_marker_sub = rospy.Subscriber("/web_plan/program_to_show_marker", PlannerProgram, self.callback_program_to_show_marker)
@@ -423,7 +427,8 @@ class Node:
             msg.header.stamp = rospy.Time.now()
             msg.header.frame_id = "map"
             msg.polygon_list = []
-            for poly_msg in self.map_data.polygon_msgs:
+            sorted_polygons = sorted(self.map_data.polygon_msgs, key=lambda x: x.name)
+            for poly_msg in sorted_polygons:
                 msg.polygon_list.append(poly_msg)
             self.map_poly_list_pub.publish(msg)
 
@@ -527,7 +532,8 @@ class Node:
             msg.header.stamp = rospy.Time.now()
             msg.header.frame_id = "map"
             msg.zone_list = []
-            for zone in self.map_data.zones:
+            sorted_zones = sorted(self.map_data.zones, key=lambda x: x.msg.name)
+            for zone in sorted_zones:
                 msg.zone_list.append(zone.msg)
             self.zone_list_pub.publish(msg)
 
@@ -1327,6 +1333,8 @@ class Node:
             with open(os.path.expanduser('~') + '/.vitulus/running/planner_programs.pkl', 'wb') as output:
                 pickle.dump(self.permanent_program_list_msg, output, pickle.HIGHEST_PROTOCOL)
                 rospy.loginfo("[{}] Planner programs saved.".format(rospy.get_caller_id()))
+            with open(os.path.expanduser('~') + '/.vitulus/running/planner_programs.pkl.BACK', 'wb') as output:
+                pickle.dump(self.permanent_program_list_msg, output, pickle.HIGHEST_PROTOCOL)
             return True
         except Exception as e:
             print(e)
@@ -1443,10 +1451,24 @@ class Node:
                     self.program_active_pub.publish(self.program_active)
                     break
 
+    def callback_program_select_resume(self, msg):
+        if self.permanent_program_list_msg is not None:
+            for program_msg in self.permanent_program_list_msg.program_list:
+                print("program_msg.name: {}".format(program_msg.name))
+                if program_msg.name == msg.data:
+                    self.program_active = program_msg
+                    # self.program_active.zone_list[0].paths = program_msg.zone_list[0].paths[1:]
+                    self.log_publisher("Program selected to resume: {}".format(msg.data))
+                    rospy.loginfo("[{}] Program selected to resume: {}".format(rospy.get_caller_id(), msg.data))
+                    self.program_active_unfinished_pub.publish(self.program_active)
+                    break
+
     def program_list_publisher(self):
         """ Publish program list """
         # print(self.map_data.planner_program_list_msg)
         if self.permanent_program_list_msg is not None:
+            prog_list_msg_ordered = sorted(self.permanent_program_list_msg.program_list, key=lambda x: x.name.lower())
+            self.permanent_program_list_msg.program_list = prog_list_msg_ordered
             rospy.loginfo("[{}] Publishing program list: {} programs".format(rospy.get_caller_id(), self.permanent_program_list_msg.header))
             self.program_list_pub.publish(self.permanent_program_list_msg)
 
