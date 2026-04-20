@@ -467,6 +467,10 @@ class Node:
         cv2.fillPoly(np_zone_navi, pts=[np_polygon_navi], color=MapSpec.OBSTACLE)
         np_zone_navi = np.where(np_zone_navi == MapSpec.OBSTACLE, self.map_data.np_semi_assembled, MapSpec.OBSTACLE)
         zone = Zone(np_zone, np_zone_navi, msg)
+        # Store first clicked point as start reference (ROS map frame, metres)
+        if len(msg.polygon.polygon.points) > 0:
+            zone.start_point = geometry.Point(msg.polygon.polygon.points[0].x,
+                                              msg.polygon.polygon.points[0].y)
 
         # Create paths around zone and coverage paths
         self.current_zone = zone
@@ -863,8 +867,18 @@ class Node:
                 polygons.append(poly.polygon)
         return polygons
 
+    def rotate_ring_to_nearest_start(self, ring, ref_point):
+        """Return a new LinearRing rotated so coords[0] is the vertex nearest to ref_point."""
+        coords = list(ring.coords[:-1])  # exclude the closing duplicate
+        nearest_idx = min(
+            range(len(coords)),
+            key=lambda i: (coords[i][0] - ref_point.x) ** 2 + (coords[i][1] - ref_point.y) ** 2
+        )
+        rotated = coords[nearest_idx:] + coords[:nearest_idx]
+        rotated.append(rotated[0])  # close the ring
+        return geometry.LinearRing(rotated)
+
     def get_polygons_ordered_by_start(self):
-        distance = 99999999
         int_polygons = []
         ext_polygons = []
         out_polygons = []
@@ -874,46 +888,48 @@ class Node:
                 for in_poly in polygon.interiors:
                     int_polygons.append(in_poly)
 
-        # Outlines
-        prev_pol = ext_polygons.pop(0)
-        id_n = 0
-        out_polygons.append(prev_pol)
-        while True:
-            nearest_pol = None
-            n = 0
-            id_n = 0
-            for pol in ext_polygons:
-                line = geometry.LineString([[prev_pol.coords[0][0], prev_pol.coords[0][1]], [pol.coords[0][0], pol.coords[0][1]]])
-                if line.length < distance:
-                    nearest_pol = pol
-                    id_n = n
-                n += 1
-            if nearest_pol is not None:
-                prev_pol = ext_polygons.pop(id_n)
-                out_polygons.append(prev_pol)
-            else:
-                break
+        if not ext_polygons:
+            return out_polygons
 
-        # Obstacles
-        prev_pol = out_polygons[-1]
-        id_n = 0
-        # out_polygons.append(prev_pol)
-        while True:
-            nearest_pol = None
-            n = 0
-            id_n = 0
-            for pol in int_polygons:
-                line = geometry.LineString([[prev_pol.coords[0][0], prev_pol.coords[0][1]],
-                                            [pol.coords[0][0], pol.coords[0][1]]])
-                if line.length < distance:
-                    nearest_pol = pol
-                    id_n = n
-                n += 1
-            if nearest_pol is not None:
-                prev_pol = int_polygons.pop(id_n)
-                out_polygons.append(prev_pol)
-            else:
-                break
+        # Starting reference: first clicked point of the zone polygon
+        if hasattr(self.current_zone, 'start_point') and self.current_zone.start_point is not None:
+            ref_point = self.current_zone.start_point
+        else:
+            ref_point = geometry.Point(ext_polygons[0].coords[0])
+
+        # Exterior outlines — greedy nearest vertex, rotate each ring to start there
+        while ext_polygons:
+            nearest_dist = float('inf')
+            nearest_idx = 0
+            for n, pol in enumerate(ext_polygons):
+                coords = list(pol.coords[:-1])
+                d = min((c[0] - ref_point.x) ** 2 + (c[1] - ref_point.y) ** 2 for c in coords)
+                if d < nearest_dist:
+                    nearest_dist = d
+                    nearest_idx = n
+            pol = ext_polygons.pop(nearest_idx)
+            rotated = self.rotate_ring_to_nearest_start(pol, ref_point)
+            out_polygons.append(rotated)
+            # Outline is a closed loop: robot ends back at coords[0]
+            ref_point = geometry.Point(rotated.coords[0])
+
+        # Interior holes (obstacles) — chain from end of last exterior
+        if out_polygons:
+            ref_point = geometry.Point(out_polygons[-1].coords[0])
+        while int_polygons:
+            nearest_dist = float('inf')
+            nearest_idx = 0
+            for n, pol in enumerate(int_polygons):
+                coords = list(pol.coords[:-1])
+                d = min((c[0] - ref_point.x) ** 2 + (c[1] - ref_point.y) ** 2 for c in coords)
+                if d < nearest_dist:
+                    nearest_dist = d
+                    nearest_idx = n
+            pol = int_polygons.pop(nearest_idx)
+            rotated = self.rotate_ring_to_nearest_start(pol, ref_point)
+            out_polygons.append(rotated)
+            ref_point = geometry.Point(rotated.coords[0])
+
         return out_polygons
 
     def filter_list_of_polygons(self, polygons_in, min_length=0.8, min_area=0.3):
@@ -933,6 +949,7 @@ class Node:
         first_level_polygons = self.filter_list_of_polygons(first_level_polygons)
 
         multilines = []
+        raw_lines_by_pass = {}  # {pass_idx: [LineString, ...]} — raw coverage lines, no connectors
         angle = self.current_zone.msg.coverage_angle
         paths_distance = self.current_zone.msg.paths_distance
         for polygon in top_level_polygons:
@@ -988,6 +1005,9 @@ class Node:
                     if line.length > 0.15:
                         line_list.append(line)
                 multiline = geometry.MultiLineString(line_list)
+
+                # Store raw coverage lines per pass (before connector generation)
+                raw_lines_by_pass.setdefault(i_line_offset, []).extend(list(multiline.geoms))
 
                 # connect lines by nearest point of other lines
                 line_list = []
@@ -1047,6 +1067,8 @@ class Node:
                         break
                 multilines.append(geometry.MultiLineString(line_list))
         self.current_zone.multilines = multilines
+        n_passes = max(raw_lines_by_pass.keys()) + 1 if raw_lines_by_pass else 0
+        self.current_zone.multilines_by_pass = [raw_lines_by_pass.get(i, []) for i in range(n_passes)]
 
         # Draw multilines to map
         for multiline in multilines:
@@ -1104,37 +1126,143 @@ class Node:
 
         return multilines_new
 
+    def build_coverage_pass_paths(self, raw_lines, ref_point, first_level_polygons):
+        """Greedy ordering of raw coverage lines starting from ref_point.
+
+        Each line can be traversed forward or reversed — whichever endpoint is
+        nearer. Connections that would cross a polygon boundary get a large
+        distance penalty so the greedy picks a less-obstructed line first.
+        When a connection inevitably crosses an obstacle the current path
+        segment is closed and a new one begins (the navigator handles the
+        transit between segments via full path planning).
+
+        Returns (list_of_MultiLineString, end_point).
+        """
+        if not raw_lines:
+            return [], ref_point
+
+        PENALTY = 1000.0
+        remaining = list(range(len(raw_lines)))
+        result_segments = []
+        current_segment = []
+        current_point = ref_point
+
+        while remaining:
+            best_idx = None
+            best_dist = float('inf')
+            best_reversed = False
+
+            for idx in remaining:
+                line = raw_lines[idx]
+                p_start = geometry.Point(line.coords[0])
+                p_end = geometry.Point(line.coords[-1])
+
+                # Cost to reach start of line (forward direction)
+                d_fwd = current_point.distance(p_start)
+                if d_fwd > 0.001:
+                    conn_fwd = geometry.LineString([[current_point.x, current_point.y],
+                                                   [p_start.x, p_start.y]])
+                    if self.is_crossing_polygons(conn_fwd, first_level_polygons):
+                        d_fwd *= PENALTY
+
+                # Cost to reach end of line (reversed direction)
+                d_rev = current_point.distance(p_end)
+                if d_rev > 0.001:
+                    conn_rev = geometry.LineString([[current_point.x, current_point.y],
+                                                   [p_end.x, p_end.y]])
+                    if self.is_crossing_polygons(conn_rev, first_level_polygons):
+                        d_rev *= PENALTY
+
+                if d_fwd <= d_rev:
+                    d, rev = d_fwd, False
+                else:
+                    d, rev = d_rev, True
+
+                if d < best_dist:
+                    best_dist = d
+                    best_idx = idx
+                    best_reversed = rev
+
+            remaining.remove(best_idx)
+            chosen_line = raw_lines[best_idx]
+            if best_reversed:
+                chosen_line = geometry.LineString(list(reversed(chosen_line.coords)))
+
+            chosen_start = geometry.Point(chosen_line.coords[0])
+            dist_to_start = current_point.distance(chosen_start)
+
+            # Decide whether to connect directly or start a new segment
+            needs_connector = dist_to_start > 0.001 and len(current_segment) > 0
+            can_connect = False
+            conn = None
+            if needs_connector:
+                conn = geometry.LineString([[current_point.x, current_point.y],
+                                           [chosen_start.x, chosen_start.y]])
+                can_connect = not self.is_crossing_polygons(conn, first_level_polygons)
+
+            if needs_connector and not can_connect:
+                # Obstacle in the way — close current segment, start fresh
+                result_segments.append(geometry.MultiLineString(current_segment))
+                current_segment = []
+
+            if needs_connector and can_connect:
+                current_segment.append(conn)
+
+            current_segment.append(chosen_line)
+            current_point = geometry.Point(chosen_line.coords[-1])
+
+        if current_segment:
+            result_segments.append(geometry.MultiLineString(current_segment))
+
+        return result_segments, current_point
+
     def create_coverage_path_msg(self):
+        # Determine starting reference: end of outline path
+        outline = self.current_zone.path_msg_outline
+        if outline.poses:
+            last = outline.poses[-1].pose.position
+            ref_point = geometry.Point(last.x, last.y)
+        elif hasattr(self.current_zone, 'start_point') and self.current_zone.start_point is not None:
+            ref_point = self.current_zone.start_point
+        else:
+            top_poly = self.get_top_level_outline_poly()
+            top_poly = self.filter_list_of_polygons(top_poly)
+            ref_point = geometry.Point(top_poly[0].centroid) if top_poly else geometry.Point(0, 0)
 
+        first_level_polygons = self.get_first_level_outline_poly()
+        first_level_polygons = self.filter_list_of_polygons(first_level_polygons)
 
-        # Create path from coverage lines
         path_all = Path()
         path_all.header.frame_id = "map"
         path_all.header.stamp = rospy.Time.now()
 
-        # for multiline in self.current_zone.multilines:
-        for multiline in self.connect_near_multilines():
-            path = Path()
-            path.header.frame_id = "map"
-            path.header.stamp = rospy.Time.now()
-            end_point = None
-            for line in multiline.geoms:
-                angle = self.direction(line.coords)
-                self.current_zone.msg.length += line.length
-                # line = line.segmentize(0.03)
-                for point in line.coords:
-                    pose = PoseStamped()
-                    pose.header.frame_id = "map"
-                    pose.header.stamp = rospy.Time.now()
-                    pose.pose.position.x = point[0]
-                    pose.pose.position.y = point[1]
-                    pose.pose.position.z = 0.0
-                    pose.pose.orientation = Quaternion(
-                        *(kdl.Rotation.RPY(0, 0, angle).GetQuaternion()))
-                    path.poses.append(pose)
-                    path_all.poses.append(pose)
-                    end_point = point
-            self.current_zone.msg.paths.append(path)
+        # Process each pass in order; passes are already stored as raw coverage lines
+        for pass_raw_lines in (self.current_zone.multilines_by_pass or []):
+            if not pass_raw_lines:
+                continue
+            pass_segments, ref_point = self.build_coverage_pass_paths(
+                pass_raw_lines, ref_point, first_level_polygons)
+
+            for multiline in pass_segments:
+                path = Path()
+                path.header.frame_id = "map"
+                path.header.stamp = rospy.Time.now()
+                for line in multiline.geoms:
+                    angle = self.direction(line.coords)
+                    self.current_zone.msg.length += line.length
+                    for point in line.coords:
+                        pose = PoseStamped()
+                        pose.header.frame_id = "map"
+                        pose.header.stamp = rospy.Time.now()
+                        pose.pose.position.x = point[0]
+                        pose.pose.position.y = point[1]
+                        pose.pose.position.z = 0.0
+                        pose.pose.orientation = Quaternion(
+                            *(kdl.Rotation.RPY(0, 0, angle).GetQuaternion()))
+                        path.poses.append(pose)
+                        path_all.poses.append(pose)
+                self.current_zone.msg.paths.append(path)
+
         self.current_zone.path_msg_coverage = path_all
 
     def create_outline_path_msg(self):
