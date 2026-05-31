@@ -1470,14 +1470,73 @@ class Node:
 
     def load_programs(self):
         try:
-            with open(os.path.expanduser('~') + '/.vitulus/running/planner_programs.pkl', 'rb') as input:
-                self.permanent_program_list_msg = pickle.load(input)
-                self.program_list_publisher()
-                self.log_publisher("Planner programs loaded")
-                rospy.loginfo("[{}] Planner programs loaded.".format(rospy.get_caller_id()))
+            from vitulus_msgs.msg import PlannerProgram as _PlannerProgram
+
+            pkl_path = os.path.expanduser('~') + '/.vitulus/running/planner_programs.pkl'
+
+            # Known old slot layout (18 fields, before schedule-fields removal).
+            # Empirically determined from existing pickle data.
+            OLD_SLOTS_18 = [
+                'header', 'name', 'map_name', 'last_result', 'area', 'length',
+                'last_duration_minutes', 'start_hour', 'mon', 'tue', 'wed', 'thu',
+                'fri', 'sat', 'sun', 'start_minute', 'zone_list', 'enabled',
+            ]
+
+            raw_states = []
+
+            def _capture_setstate(self, state):
+                raw_states.append(list(state))
+                # Do not call original; we reconstruct correctly below.
+
+            _PlannerProgram.__setstate__ = _capture_setstate
+            try:
+                with open(pkl_path, 'rb') as f:
+                    old_msg = pickle.load(f)
+            finally:
+                del _PlannerProgram.__setstate__
+
+            current_slots = list(_PlannerProgram.__slots__)
+
+            new_programs = []
+            for state in raw_states:
+                prg = _PlannerProgram()
+                if len(state) == len(OLD_SLOTS_18):
+                    # Old format: map values by field name
+                    old_dict = dict(zip(OLD_SLOTS_18, state))
+                    for slot in current_slots:
+                        if slot in old_dict:
+                            setattr(prg, slot, old_dict[slot])
+                else:
+                    # Current or compatible format: assign by position
+                    for slot, val in zip(current_slots, state):
+                        setattr(prg, slot, val)
+
+                # Validate / apply defaults for new fields
+                if not isinstance(getattr(prg, 'rpm', None), int) or isinstance(prg.rpm, bool):
+                    prg.rpm = 0
+                if not isinstance(getattr(prg, 'cut_height', None), int) or isinstance(prg.cut_height, bool):
+                    prg.cut_height = 0
+                if getattr(prg, 'speed', None) not in ('slow', 'mid', 'fast'):
+                    prg.speed = 'mid'
+                if not isinstance(getattr(prg, 'override_zone', None), bool):
+                    prg.override_zone = False
+                if not isinstance(getattr(prg, 'zone_list', None), list):
+                    prg.zone_list = []
+
+                new_programs.append(prg)
+
+            self.permanent_program_list_msg.header = old_msg.header
+            self.permanent_program_list_msg.program_list = new_programs
+
+            # Re-save in the current format so future restarts load cleanly
+            self.save_programs()
+
+            self.program_list_publisher()
+            self.log_publisher("Planner programs loaded")
+            rospy.loginfo("[{}] Planner programs loaded.".format(rospy.get_caller_id()))
             return True
         except Exception as e:
-            print(e)
+            rospy.logerr("[{}] Failed to load programs: {}".format(rospy.get_caller_id(), e))
             return False
 
     def save_running_data(self):

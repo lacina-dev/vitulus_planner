@@ -1,0 +1,36 @@
+# Vitulus Master Controller Configuration
+
+# Master switch: set to false to put the master controller into a fully
+# passive "bypass" mode (no auto-start, no auto-sleep). Useful for purely
+# manual operation.
+automation_enabled: true
+
+# Mandatory grace period (seconds) after node startup during which no
+# programs are started and no sleep is triggered. Gives operators time
+# to intervene manually.
+boot_grace_period_s: 300.0
+
+# Short settle delay (seconds) before the FSM leaves STATE_INIT.
+startup_delay_s: 10.0
+
+# How often (seconds) the IDLE state re-evaluates the calendar.
+# Safety checks still run every second.
+check_interval_s: 30.0
+
+# Sleep durations for various preempt / interrupt reasons.
+weather_sleep_duration_h: 4.0
+temp_sleep_duration_h: 1.0
+critical_error_sleep_duration_h: 0.5
+terminal_error_short_wait_min: 20.0
+terminal_error_long_sleep_h: 8.0
+
+# Battery thresholds (in %, 0-100).
+battery_recovery_min_capacity: 40
+battery_critically_low_preempt: 25
+
+# Buffer time subtracted from the next scheduled start time to give the
+# robot time to boot up and get a GPS fix.
+boot_time_buffer_s: 120.0
+
+# Default inhibit state if no value is present in the persistent state.
+default_inhibit: false

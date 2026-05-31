@@ -7,6 +7,10 @@
 <!--            <param name="prm_name" value="prm_value"/>-->
 <!--            <remap from="/topic" to="/another_topic" />-->
         </node>
+
+        <node name="master_controller" pkg="vitulus_planner" type="master_controller" respawn="true" respawn_delay="5" output="screen">
+            <rosparam command="load" file="$(find vitulus_planner)/config/master_controller.yaml" />
+        </node>
     </group>
 
 </launch>

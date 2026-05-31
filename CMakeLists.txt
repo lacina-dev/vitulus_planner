@@ -87,6 +87,7 @@ install(DIRECTORY launch config rviz
 
 catkin_install_python(PROGRAMS
   nodes/node_planner
+  nodes/master_controller
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 

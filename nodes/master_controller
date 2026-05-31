@@ -1,0 +1,735 @@
+#!/usr/bin/env python3
+"""
+Vitulus Master Controller Node.
+
+Calendar-driven scheduler with sleep coordination.
+Programs describe *what* to mow; the calendar describes *when*.
+FSM ticks at 1 Hz. Persistent state in ~/.vitulus/scheduler_state.json.
+
+Logic summary:
+  - If inhibited or NOT in dock → do nothing (like inhibit).
+  - If interrupted program exists and battery charged → resume.
+  - If interrupted program exists and battery low → sleep until charged.
+  - If calendar event is active NOW → start program.
+  - If next event is ≤ 20 min away → stay awake and wait.
+  - If next event is > 20 min away → sleep, wake 10 min before.
+  - If program ends and robot is off-dock → wait 20 min, then emergency sleep.
+"""
+
+import datetime
+import json
+import os
+import threading
+import time
+
+import rospy
+from std_msgs.msg import Bool, String, UInt64
+from vitulus_msgs.msg import PlannerProgramList, Power_status
+
+
+# ---------------------------------------------------------------------------
+# Calendar evaluator
+# ---------------------------------------------------------------------------
+class MowerScheduler(object):
+    """Pure-Python calendar evaluator.
+
+    Operates on a list of CalendarEvent dictionaries::
+
+        {
+          "id":            "uuid-or-unique-string",
+          "program_name":  "Predni_Zahrada",
+          "enabled":       true,
+          "recurrence":    "none|daily|weekly|monthly|yearly",
+          "start_time":    "HH:MM",
+          "start_date":    "YYYY-MM-DD",
+          "days_of_week":  [0..6],        # weekly only (0=Mon, 6=Sun)
+          "day_of_month":  1..31,         # monthly only
+          "month":         1..12          # yearly only
+        }
+    """
+
+    # After start_time, how long the event remains "active now"
+    START_WINDOW_SECONDS = 900  # 15 min
+
+    @staticmethod
+    def _parse_hhmm(s):
+        try:
+            parts = s.split(':')
+            h, m = int(parts[0]), int(parts[1])
+            if 0 <= h <= 23 and 0 <= m <= 59:
+                return h, m
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _parse_date(s):
+        try:
+            return datetime.datetime.strptime(s, "%Y-%m-%d").date()
+        except Exception:
+            return None
+
+    @classmethod
+    def validate_event(cls, ev):
+        if not isinstance(ev, dict):
+            return False
+        if not ev.get('id') or not ev.get('program_name'):
+            return False
+        if cls._parse_hhmm(ev.get('start_time', '')) is None:
+            return False
+        rec = ev.get('recurrence', 'none')
+        if rec not in ('none', 'daily', 'weekly', 'monthly', 'yearly'):
+            return False
+        if rec == 'none' and cls._parse_date(ev.get('start_date', '')) is None:
+            return False
+        if rec == 'weekly':
+            dows = ev.get('days_of_week', [])
+            if not isinstance(dows, list) or not all(
+                    isinstance(d, int) and 0 <= d <= 6 for d in dows):
+                return False
+        if rec == 'monthly':
+            dom = ev.get('day_of_month')
+            if not (isinstance(dom, int) and 1 <= dom <= 31):
+                return False
+        if rec == 'yearly':
+            if not (isinstance(ev.get('day_of_month'), int)
+                    and 1 <= ev['day_of_month'] <= 31):
+                return False
+            if not (isinstance(ev.get('month'), int)
+                    and 1 <= ev['month'] <= 12):
+                return False
+        return True
+
+    @classmethod
+    def validate_calendar(cls, events):
+        if not isinstance(events, list):
+            return []
+        return [e for e in events if cls.validate_event(e)]
+
+    @classmethod
+    def _event_runs_on(cls, ev, day):
+        """Return True if event recurrence permits a run on the given date."""
+        if not ev.get('enabled', False):
+            return False
+        sd_str = ev.get('start_date')
+        if sd_str:
+            sd = cls._parse_date(sd_str)
+            if sd is not None and day < sd:
+                return False
+        rec = ev.get('recurrence', 'none')
+        if rec == 'none':
+            sd = cls._parse_date(ev.get('start_date', ''))
+            return sd is not None and sd == day
+        if rec == 'daily':
+            return True
+        if rec == 'weekly':
+            return day.weekday() in ev.get('days_of_week', [])
+        if rec == 'monthly':
+            return day.day == ev.get('day_of_month')
+        if rec == 'yearly':
+            return (day.day == ev.get('day_of_month')
+                    and day.month == ev.get('month'))
+        return False
+
+    @classmethod
+    def get_active_event(cls, calendar_events, last_run_by_event, now=None):
+        """Return event whose start window contains now and hasn't run today."""
+        if now is None:
+            now = datetime.datetime.now()
+        today_str = now.strftime("%Y-%m-%d")
+
+        for ev in calendar_events:
+            if not cls._event_runs_on(ev, now.date()):
+                continue
+            hm = cls._parse_hhmm(ev.get('start_time', ''))
+            if hm is None:
+                continue
+            start_dt = now.replace(hour=hm[0], minute=hm[1],
+                                   second=0, microsecond=0)
+            diff = (now - start_dt).total_seconds()
+            # Window: 0 to +15 min after start_time
+            if 0 <= diff <= cls.START_WINDOW_SECONDS:
+                if last_run_by_event.get(ev['id']) != today_str:
+                    return ev
+        return None
+
+    @classmethod
+    def get_next_event(cls, calendar_events, now=None, horizon_days=8):
+        """Find closest upcoming event.
+
+        Returns (next_datetime, event_dict) or (None, None).
+        """
+        if now is None:
+            now = datetime.datetime.now()
+        best_dt = None
+        best_ev = None
+        for d_idx in range(horizon_days):
+            day = (now + datetime.timedelta(days=d_idx)).date()
+            for ev in calendar_events:
+                if not cls._event_runs_on(ev, day):
+                    continue
+                hm = cls._parse_hhmm(ev.get('start_time', ''))
+                if hm is None:
+                    continue
+                cand = datetime.datetime.combine(
+                    day, datetime.time(hour=hm[0], minute=hm[1]))
+                if cand <= now:
+                    continue
+                if best_dt is None or cand < best_dt:
+                    best_dt = cand
+                    best_ev = ev
+        return best_dt, best_ev
+
+
+# ---------------------------------------------------------------------------
+# Master Controller
+# ---------------------------------------------------------------------------
+class MasterController(object):
+    STATE_DISABLED = "DISABLED"
+    STATE_INIT = "INIT"
+    STATE_INHIBITED = "INHIBITED"
+    STATE_IDLE = "IDLE"
+    STATE_MOWING = "MOWING"
+    STATE_WAIT_OFF_DOCK = "WAIT_OFF_DOCK"
+    STATE_PREPARE_SLEEP = "PREPARE_SLEEP"
+
+    def __init__(self):
+        rospy.init_node('master_controller')
+
+        # ---- parameters ----------------------------------------------------
+        self.automation_enabled = rospy.get_param('~automation_enabled', True)
+        self.startup_delay_s = rospy.get_param('~startup_delay_s', 10.0)
+        self.wake_before_program_s = rospy.get_param(
+            '~wake_before_program_s', 600.0)        # 10 min
+        self.idle_sleep_threshold_s = rospy.get_param(
+            '~idle_sleep_threshold_s', 1200.0)     # 20 min
+        self.off_dock_wait_s = rospy.get_param(
+            '~off_dock_wait_s', 1200.0)            # 20 min
+        self.battery_resume_min = rospy.get_param(
+            '~battery_resume_min', 90)
+        self.terminal_error_timeout_s = rospy.get_param(
+            '~terminal_error_timeout_s', 1200.0)   # 20 min
+
+        # ---- persistence ---------------------------------------------------
+        self.state_dir = os.path.expanduser('~/.vitulus')
+        if not os.path.exists(self.state_dir):
+            os.makedirs(self.state_dir)
+        self.state_file = os.path.join(self.state_dir, 'scheduler_state.json')
+
+        # ---- threading -----------------------------------------------------
+        self.lock = threading.Lock()
+
+        # ---- runtime state -------------------------------------------------
+        self.is_in_dock = False
+        self.program_list = []
+        self.programs_loaded = False
+        self.battery_capacity = 0
+        self.supply_status = "UNKNOWN"
+        self.smach_status = "Ready"
+        self.stop_reason = ""
+        self.active_program_name = ""
+        self.sleep_confirmed = False
+
+        # FSM
+        self.state = self.STATE_INIT
+        self.node_start_time = time.time()
+        self.off_dock_since = None
+        self.terminal_error_since = None
+        self._mowing_grace_until = 0.0
+
+        # ---- persistent state ----------------------------------------------
+        self.persistent = self._load_state()
+        self.is_inhibited = bool(self.persistent.get('inhibit', False))
+        self.calendar = MowerScheduler.validate_calendar(
+            self.persistent.get('calendar', []))
+        self.persistent['calendar'] = self.calendar
+        self._save_state()
+
+        # ---- publishers ----------------------------------------------------
+        self.status_pub = rospy.Publisher(
+            '/scheduler/status', String, latch=True, queue_size=1)
+        self.next_run_pub = rospy.Publisher(
+            '/scheduler/next_run', String, latch=True, queue_size=1)
+        self.inhibit_status_pub = rospy.Publisher(
+            '/scheduler/inhibit_status', Bool, latch=True, queue_size=1)
+        self.calendar_pub = rospy.Publisher(
+            '/scheduler/calendar', String, latch=True, queue_size=1)
+
+        self.program_select_pub = rospy.Publisher(
+            '/web_plan/program_select', String, queue_size=1)
+        self.program_select_resume_pub = rospy.Publisher(
+            '/web_plan/program_select_resume', String, queue_size=1)
+        self.smach_reset_pub = rospy.Publisher(
+            '/mower_smach/reset', Bool, queue_size=1)
+
+        # power module
+        self.set_sleep_time_pub = rospy.Publisher(
+            '/set_sleep_time', UInt64, queue_size=1)
+        self.set_robot_sleep_pub = rospy.Publisher(
+            '/set_robot_sleep', Bool, queue_size=1)
+        self.set_sleep_until_charged_pub = rospy.Publisher(
+            '/set_sleep_until_charged', Bool, queue_size=1)
+        self.set_sleep_wait_before_standby_pub = rospy.Publisher(
+            '/set_sleep_wait_before_standby', UInt64, queue_size=1)
+
+        # logging
+        self.lcd_log_pub = rospy.Publisher(
+            '/nextion/log_info', String, queue_size=10, latch=True)
+        self.web_log_pub = rospy.Publisher(
+            '/web_plan/log', String, queue_size=10)
+
+        # ---- subscribers ---------------------------------------------------
+        rospy.Subscriber('/dock_manager/is_in_dock_confirmed', Bool,
+                         self.dock_callback)
+        rospy.Subscriber('/web_plan/programs', PlannerProgramList,
+                         self.programs_callback)
+        rospy.Subscriber('/pm/power_status', Power_status,
+                         self.power_callback)
+        rospy.Subscriber('/mower_smach/status', String,
+                         self.smach_status_callback)
+        rospy.Subscriber('/mower_smach/stop_reason', String,
+                         self.stop_reason_callback)
+        rospy.Subscriber('/mower_smach/active_program', String,
+                         self.active_program_callback)
+        rospy.Subscriber('/scheduler/inhibit', Bool,
+                         self.inhibit_callback)
+        rospy.Subscriber('/scheduler/set_calendar', String,
+                         self.set_calendar_callback)
+        rospy.Subscriber('/pm/sleep_confirmed', Bool,
+                         self.sleep_confirmed_callback)
+
+        # initial publishes
+        self.inhibit_status_pub.publish(Bool(self.is_inhibited))
+        self.calendar_pub.publish(String(json.dumps(self.calendar)))
+
+        rospy.loginfo("Master Controller initialised.")
+        self.log("[Master] Init. automation=%s" % self.automation_enabled)
+
+    # =====================================================================
+    # logging
+    # =====================================================================
+    def log(self, msg):
+        rospy.loginfo(msg)
+        self.lcd_log_pub.publish(String(msg))
+        self.web_log_pub.publish(String(msg))
+
+    # =====================================================================
+    # persistent state
+    # =====================================================================
+    def _default_state(self):
+        return {
+            "calendar": [],
+            "last_run_by_event": {},
+            "interrupted_event_id": None,
+            "inhibit": False,
+        }
+
+    def _load_state(self):
+        if os.path.exists(self.state_file):
+            try:
+                with open(self.state_file, 'r') as f:
+                    data = json.load(f)
+                defaults = self._default_state()
+                for k, v in defaults.items():
+                    data.setdefault(k, v)
+                rospy.loginfo("Loaded state from %s", self.state_file)
+                return data
+            except Exception as e:
+                rospy.logerr("Failed to load state: %s", str(e))
+        return self._default_state()
+
+    def _save_state(self):
+        try:
+            with open(self.state_file, 'w') as f:
+                json.dump(self.persistent, f, indent=2)
+        except Exception as e:
+            rospy.logerr("Failed to save state: %s", str(e))
+
+    # =====================================================================
+    # callbacks
+    # =====================================================================
+    def dock_callback(self, msg):
+        with self.lock:
+            self.is_in_dock = msg.data
+
+    def programs_callback(self, msg):
+        with self.lock:
+            self.program_list = msg.program_list
+            self.programs_loaded = True
+
+    def power_callback(self, msg):
+        with self.lock:
+            self.battery_capacity = msg.battery_capacity
+            self.supply_status = msg.supply_status
+
+    def smach_status_callback(self, msg):
+        with self.lock:
+            self.smach_status = msg.data
+
+    def stop_reason_callback(self, msg):
+        with self.lock:
+            self.stop_reason = msg.data
+
+    def active_program_callback(self, msg):
+        with self.lock:
+            self.active_program_name = msg.data
+
+    def sleep_confirmed_callback(self, msg):
+        with self.lock:
+            self.sleep_confirmed = bool(msg.data)
+
+    def inhibit_callback(self, msg):
+        with self.lock:
+            self.is_inhibited = bool(msg.data)
+            self.persistent['inhibit'] = self.is_inhibited
+            self._save_state()
+        self.inhibit_status_pub.publish(Bool(self.is_inhibited))
+
+    def set_calendar_callback(self, msg):
+        try:
+            events = json.loads(msg.data)
+        except Exception as e:
+            rospy.logerr("set_calendar: invalid JSON: %s", str(e))
+            return
+        valid = MowerScheduler.validate_calendar(events)
+        if len(valid) != len(events):
+            rospy.logwarn("set_calendar: dropped %d invalid event(s).",
+                          len(events) - len(valid))
+        with self.lock:
+            self.calendar = valid
+            self.persistent['calendar'] = valid
+            self._save_state()
+        self.calendar_pub.publish(String(json.dumps(valid)))
+        self.log("[Master] Calendar updated (%d events)" % len(valid))
+
+    # =====================================================================
+    # FSM helpers
+    # =====================================================================
+    def _transition(self, new_state):
+        if new_state != self.state:
+            rospy.loginfo("[FSM] %s -> %s", self.state, new_state)
+            self.state = new_state
+
+    def _find_event(self, event_id):
+        for ev in self.calendar:
+            if ev.get('id') == event_id:
+                return ev
+        return None
+
+    # =====================================================================
+    # main loop
+    # =====================================================================
+    def run(self):
+        rate = rospy.Rate(1.0)
+        while not rospy.is_shutdown():
+            try:
+                self._step()
+            except Exception as e:
+                rospy.logerr("FSM exception: %s", str(e))
+            rate.sleep()
+
+    def _step(self):
+        # --- DISABLED ---
+        if self.state == self.STATE_DISABLED:
+            self.status_pub.publish(String("Disabled"))
+            return
+
+        # --- INIT ---
+        if self.state == self.STATE_INIT:
+            if not self.automation_enabled:
+                self.log("[Master] Automation DISABLED via parameter.")
+                self._transition(self.STATE_DISABLED)
+                return
+            self.status_pub.publish(String("Initialising"))
+            if (time.time() - self.node_start_time) >= self.startup_delay_s:
+                self._transition(self.STATE_IDLE)
+            return
+
+        # --- Inhibit check (all active states except PREPARE_SLEEP) ---
+        if self.is_inhibited and self.state != self.STATE_PREPARE_SLEEP:
+            self._transition(self.STATE_INHIBITED)
+
+        # --- INHIBITED ---
+        if self.state == self.STATE_INHIBITED:
+            self.status_pub.publish(String("Inhibited"))
+            if not self.is_inhibited:
+                self._transition(self.STATE_IDLE)
+            return
+
+        # --- PREPARE_SLEEP ---
+        if self.state == self.STATE_PREPARE_SLEEP:
+            self._handle_prepare_sleep()
+            return
+
+        # --- WAIT_OFF_DOCK ---
+        if self.state == self.STATE_WAIT_OFF_DOCK:
+            self._handle_wait_off_dock()
+            return
+
+        # --- MOWING ---
+        if self.state == self.STATE_MOWING:
+            self._handle_mowing()
+            return
+
+        # --- IDLE ---
+        if self.state == self.STATE_IDLE:
+            self._handle_idle()
+            return
+
+    # =====================================================================
+    # state: IDLE
+    # =====================================================================
+    def _handle_idle(self):
+        """In-dock idle. Evaluate calendar, sleep or start programs."""
+
+        # Not in dock → no actions, behave like inhibit
+        with self.lock:
+            in_dock = self.is_in_dock
+        if not in_dock:
+            self.status_pub.publish(String("Idle (Not in dock)"))
+            return
+
+        if not self.programs_loaded:
+            self.status_pub.publish(String("Waiting for programs"))
+            return
+
+        with self.lock:
+            calendar = list(self.calendar)
+            last_run = dict(self.persistent.get('last_run_by_event', {}))
+            interrupted_id = self.persistent.get('interrupted_event_id')
+            battery = self.battery_capacity
+            smach_status = self.smach_status
+
+        # Don't start/resume if SMACH isn't ready
+        if smach_status not in ("Ready", ""):
+            self.status_pub.publish(
+                String("Idle (SMACH: %s)" % smach_status))
+            return
+
+        # --- Priority 1: Resume interrupted program (battery preempt) ------
+        if interrupted_id is not None:
+            ev = self._find_event(interrupted_id)
+            if ev is None or not ev.get('enabled', False):
+                # Event removed or disabled - clear
+                with self.lock:
+                    self.persistent['interrupted_event_id'] = None
+                    self._save_state()
+            else:
+                prog_name = ev['program_name']
+                if battery < self.battery_resume_min:
+                    self.log(
+                        "[Master] Battery %d%% < %d%%. "
+                        "Sleep until charged for resume of %s."
+                        % (battery, self.battery_resume_min, prog_name))
+                    self._execute_sleep(charged=True)
+                    return
+                else:
+                    self.log("[Master] Resuming program: %s" % prog_name)
+                    self.program_select_resume_pub.publish(String(prog_name))
+                    self._mowing_grace_until = time.time() + 5.0
+                    self._transition(self.STATE_MOWING)
+                    return
+
+        # --- Priority 2: Active event NOW ----------------------------------
+        active_ev = MowerScheduler.get_active_event(calendar, last_run)
+        if active_ev is not None:
+            prog_name = active_ev['program_name']
+            self.log("[Master] Starting scheduled program: %s" % prog_name)
+            today = datetime.datetime.now().strftime("%Y-%m-%d")
+            with self.lock:
+                self.persistent['last_run_by_event'][active_ev['id']] = today
+                self.persistent['interrupted_event_id'] = active_ev['id']
+                self._save_state()
+            self.program_select_pub.publish(String(prog_name))
+            self._mowing_grace_until = time.time() + 5.0
+            self._transition(self.STATE_MOWING)
+            return
+
+        # --- Priority 3: Next scheduled event → wait or sleep --------------
+        next_dt, next_ev = MowerScheduler.get_next_event(calendar)
+        if next_dt is None:
+            self.status_pub.publish(String("Idle (No schedule)"))
+            self.next_run_pub.publish(String("None"))
+            return
+
+        now = datetime.datetime.now()
+        time_until_s = (next_dt - now).total_seconds()
+        self.next_run_pub.publish(
+            String("%s in %.0fm" % (next_ev['program_name'],
+                                    time_until_s / 60.0)))
+
+        if time_until_s <= self.idle_sleep_threshold_s:
+            # Within 20 min → stay awake, wait
+            self.status_pub.publish(
+                String("Idle (Wait %.0fm for %s)"
+                       % (time_until_s / 60.0, next_ev['program_name'])))
+        else:
+            # More than 20 min → sleep, wake 10 min before
+            sleep_s = time_until_s - self.wake_before_program_s
+            self.log(
+                "[Master] Next %s in %.0fm. Sleeping for %.0fm."
+                % (next_ev['program_name'],
+                   time_until_s / 60.0, sleep_s / 60.0))
+            self._execute_sleep(duration_ms=int(sleep_s * 1000))
+
+    # =====================================================================
+    # state: MOWING
+    # =====================================================================
+    def _handle_mowing(self):
+        """Passive monitor while mower_smach drives a program."""
+        with self.lock:
+            smach_status = self.smach_status
+            stop_reason = self.stop_reason
+            in_dock = self.is_in_dock
+
+        self.status_pub.publish(String("Mowing"))
+
+        # Grace period after start - ignore Ready for a few seconds
+        if time.time() < self._mowing_grace_until:
+            return
+
+        # Terminal error: wait terminal_error_timeout_s, then reset SMACH
+        if smach_status == "TERMINAL ERROR":
+            if self.terminal_error_since is None:
+                self.terminal_error_since = time.time()
+            elif ((time.time() - self.terminal_error_since)
+                  > self.terminal_error_timeout_s):
+                self.log("[Master] Terminal error timeout. Resetting SMACH.")
+                self.smach_reset_pub.publish(Bool(True))
+                self.terminal_error_since = None
+                rospy.sleep(3.0)
+                with self.lock:
+                    in_dock = self.is_in_dock
+                if in_dock:
+                    self._transition(self.STATE_IDLE)
+                else:
+                    self.off_dock_since = time.time()
+                    self._transition(self.STATE_WAIT_OFF_DOCK)
+            return
+
+        self.terminal_error_since = None
+
+        # SMACH returned to "Ready" → program ended
+        if smach_status == "Ready" and stop_reason:
+            if stop_reason == "succeeded":
+                self.log("[Master] Program succeeded.")
+                with self.lock:
+                    self.persistent['interrupted_event_id'] = None
+                    self._save_state()
+                if in_dock:
+                    self._transition(self.STATE_IDLE)
+                else:
+                    self.off_dock_since = time.time()
+                    self._transition(self.STATE_WAIT_OFF_DOCK)
+                return
+
+            if stop_reason.startswith("interrupted:"):
+                # SMACH interrupted (battery, user, etc.)
+                # Keep interrupted_event_id for resume after charge
+                self.log("[Master] Program interrupted: %s" % stop_reason)
+                if in_dock:
+                    self._transition(self.STATE_IDLE)
+                else:
+                    self.off_dock_since = time.time()
+                    self._transition(self.STATE_WAIT_OFF_DOCK)
+                return
+
+            # Any other stop reason → don't resume
+            self.log("[Master] Program stopped: %s" % stop_reason)
+            with self.lock:
+                self.persistent['interrupted_event_id'] = None
+                self._save_state()
+            if in_dock:
+                self._transition(self.STATE_IDLE)
+            else:
+                self.off_dock_since = time.time()
+                self._transition(self.STATE_WAIT_OFF_DOCK)
+            return
+
+    # =====================================================================
+    # state: WAIT_OFF_DOCK
+    # =====================================================================
+    def _handle_wait_off_dock(self):
+        """Robot off-dock after program ended. Wait 20 min, then sleep."""
+        with self.lock:
+            in_dock = self.is_in_dock
+
+        if in_dock:
+            self.log("[Master] Robot returned to dock.")
+            self.off_dock_since = None
+            self._transition(self.STATE_IDLE)
+            return
+
+        elapsed = time.time() - (self.off_dock_since or time.time())
+        remaining = self.off_dock_wait_s - elapsed
+        self.status_pub.publish(
+            String("Off-dock (%.0fm left)" % max(0, remaining / 60.0)))
+
+        if remaining <= 0:
+            self.log("[Master] Off-dock timeout. Emergency sleep (8h).")
+            self._execute_sleep(duration_ms=int(8 * 3600 * 1000))
+
+    # =====================================================================
+    # state: PREPARE_SLEEP
+    # =====================================================================
+    def _handle_prepare_sleep(self):
+        """Wait for PM sleep confirmation (10s timeout), then shutdown."""
+        self.status_pub.publish(String("PreparingSleep"))
+        deadline = getattr(self, '_prepare_sleep_deadline', 0.0)
+        with self.lock:
+            confirmed = self.sleep_confirmed
+
+        if confirmed:
+            self.log("[Master] Sleep confirmed. Shutting down.")
+            self._do_shutdown()
+            return
+        if time.time() >= deadline:
+            self.log("[Master] Sleep not confirmed. Fail-safe shutdown.")
+            self._do_shutdown()
+            return
+
+    # =====================================================================
+    # sleep execution
+    # =====================================================================
+    def _execute_sleep(self, duration_ms=None, charged=False):
+        """Initiate sleep handshake with power module, then PREPARE_SLEEP."""
+        with self.lock:
+            self.sleep_confirmed = False
+
+        self.set_sleep_wait_before_standby_pub.publish(UInt64(15000))
+        rospy.sleep(1.0)
+
+        if charged:
+            self.log("[Master] Sleep until charged.")
+            self.set_sleep_until_charged_pub.publish(Bool(True))
+            rospy.sleep(1.0)
+            self.set_robot_sleep_pub.publish(Bool(True))
+        elif duration_ms is not None:
+            if duration_ms < 60000:
+                duration_ms = 60000
+            self.log("[Master] Timed sleep %.0fm."
+                     % (duration_ms / 60000.0))
+            self.set_sleep_time_pub.publish(UInt64(duration_ms))
+            rospy.sleep(1.0)
+            self.set_robot_sleep_pub.publish(Bool(True))
+        else:
+            rospy.logwarn("[Master] _execute_sleep called with no params.")
+            return
+
+        self._prepare_sleep_deadline = time.time() + 10.0
+        self._transition(self.STATE_PREPARE_SLEEP)
+
+    def _do_shutdown(self):
+        rospy.sleep(2.0)
+        os.system("sudo shutdown -h now &")
+
+
+# ---------------------------------------------------------------------------
+# entry point
+# ---------------------------------------------------------------------------
+if __name__ == '__main__':
+    try:
+        controller = MasterController()
+        controller.run()
+    except rospy.ROSInterruptException:
+        pass
