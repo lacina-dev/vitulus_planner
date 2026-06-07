@@ -2,18 +2,32 @@
 """
 Vitulus Master Controller Node.
 
-Calendar-driven scheduler with sleep coordination.
+Calendar-driven scheduler with sleep coordination. The main manager that
+drives the robot: it decides *when* to mow (calendar), starts/resumes
+programs via the planner, watches how a program ended (via mower_smach
+``stop_reason``) and puts the robot to sleep / wakes it accordingly.
+
 Programs describe *what* to mow; the calendar describes *when*.
 FSM ticks at 1 Hz. Persistent state in ~/.vitulus/scheduler_state.json.
 
-Logic summary:
-  - If inhibited or NOT in dock → do nothing (like inhibit).
-  - If interrupted program exists and battery charged → resume.
-  - If interrupted program exists and battery low → sleep until charged.
-  - If calendar event is active NOW → start program.
-  - If next event is ≤ 20 min away → stay awake and wait.
-  - If next event is > 20 min away → sleep, wake 10 min before.
-  - If program ends and robot is off-dock → wait 20 min, then emergency sleep.
+Weather / battery / temperature checks live in mower_smach (PreStartCheck +
+concurrent monitors). They are reported here through ``/mower_smach/stop_reason``
+and this node reacts to them:
+
+  - succeeded                  -> clear interrupt, idle / wait-for-dock
+  - interrupted:battery        -> sleep until charged, then resume
+  - interrupted:weather        -> sleep weather_sleep_duration_h, then resume
+  - interrupted:temp           -> sleep temp_sleep_duration_h, then resume
+  - rejected:rain|recent_rain|forecast (at scheduled start)
+                               -> treat like weather interrupt (keep & retry)
+  - rejected:battery           -> sleep until charged, then resume
+  - critical:*                 -> sleep critical_error_sleep_duration_h
+  - terminal:* / stopped:*     -> clear interrupt, no auto-sleep (manual/terminal)
+
+Recovery is capped so the robot always wakes before the next scheduled
+program (the interrupted event is abandoned once a new scheduled program
+becomes due). A global allowed time-window ("don't mow at night") gates all
+starts/resumes.
 """
 
 import datetime
@@ -180,6 +194,35 @@ class MowerScheduler(object):
                     best_ev = ev
         return best_dt, best_ev
 
+    # --- allowed time-window ("don't mow at night") --------------------------
+    @staticmethod
+    def within_window(now, start_hm, end_hm):
+        """True if now's time is within [start_hm, end_hm].
+
+        Supports same-day windows (start <= end, e.g. 07:00-21:00) and
+        wrap-around windows (start > end, e.g. 21:00-07:00).
+        """
+        if start_hm is None or end_hm is None:
+            return True
+        t = now.time()
+        start = datetime.time(hour=start_hm[0], minute=start_hm[1])
+        end = datetime.time(hour=end_hm[0], minute=end_hm[1])
+        if start <= end:
+            return start <= t <= end
+        # wrap-around midnight
+        return t >= start or t <= end
+
+    @staticmethod
+    def next_window_start(now, start_hm):
+        """Next datetime at which the allowed window opens (>= now)."""
+        if start_hm is None:
+            return now
+        cand = now.replace(hour=start_hm[0], minute=start_hm[1],
+                           second=0, microsecond=0)
+        if cand <= now:
+            cand += datetime.timedelta(days=1)
+        return cand
+
 
 # ---------------------------------------------------------------------------
 # Master Controller
@@ -199,16 +242,44 @@ class MasterController(object):
         # ---- parameters ----------------------------------------------------
         self.automation_enabled = rospy.get_param('~automation_enabled', True)
         self.startup_delay_s = rospy.get_param('~startup_delay_s', 10.0)
+        self.boot_grace_period_s = rospy.get_param(
+            '~boot_grace_period_s', 300.0)
+        self.check_interval_s = rospy.get_param('~check_interval_s', 30.0)
         self.wake_before_program_s = rospy.get_param(
             '~wake_before_program_s', 600.0)        # 10 min
+        self.boot_time_buffer_s = rospy.get_param(
+            '~boot_time_buffer_s', 120.0)
         self.idle_sleep_threshold_s = rospy.get_param(
             '~idle_sleep_threshold_s', 1200.0)     # 20 min
         self.off_dock_wait_s = rospy.get_param(
             '~off_dock_wait_s', 1200.0)            # 20 min
+
+        # Battery: resume threshold == smach recovery hysteresis (40%).
         self.battery_resume_min = rospy.get_param(
-            '~battery_resume_min', 90)
-        self.terminal_error_timeout_s = rospy.get_param(
-            '~terminal_error_timeout_s', 1200.0)   # 20 min
+            '~battery_recovery_min_capacity', 40)
+
+        # Recovery sleep durations.
+        self.weather_sleep_duration_s = rospy.get_param(
+            '~weather_sleep_duration_h', 4.0) * 3600.0
+        self.temp_sleep_duration_s = rospy.get_param(
+            '~temp_sleep_duration_h', 1.0) * 3600.0
+        self.critical_sleep_duration_s = rospy.get_param(
+            '~critical_error_sleep_duration_h', 0.5) * 3600.0
+        self.terminal_short_wait_s = rospy.get_param(
+            '~terminal_error_short_wait_min', 20.0) * 60.0
+        self.terminal_long_sleep_s = rospy.get_param(
+            '~terminal_error_long_sleep_h', 8.0) * 3600.0
+
+        # Allowed time-window ("don't mow at night").
+        self.window_enabled = rospy.get_param('~allowed_window_enabled', True)
+        self.window_start = MowerScheduler._parse_hhmm(
+            str(rospy.get_param('~allowed_window_start', '07:00')))
+        self.window_end = MowerScheduler._parse_hhmm(
+            str(rospy.get_param('~allowed_window_end', '21:00')))
+        self.default_inhibit = rospy.get_param('~default_inhibit', False)
+
+        # Lead time used when computing timed wake-ups.
+        self.wake_lead_s = self.wake_before_program_s + self.boot_time_buffer_s
 
         # ---- persistence ---------------------------------------------------
         self.state_dir = os.path.expanduser('~/.vitulus')
@@ -236,10 +307,14 @@ class MasterController(object):
         self.off_dock_since = None
         self.terminal_error_since = None
         self._mowing_grace_until = 0.0
+        self._last_idle_eval = 0.0
+        self._pending_recovery_reason = None
+        self._sleep_confirmed_logged = False
 
         # ---- persistent state ----------------------------------------------
         self.persistent = self._load_state()
-        self.is_inhibited = bool(self.persistent.get('inhibit', False))
+        self.is_inhibited = bool(
+            self.persistent.get('inhibit', self.default_inhibit))
         self.calendar = MowerScheduler.validate_calendar(
             self.persistent.get('calendar', []))
         self.persistent['calendar'] = self.calendar
@@ -262,15 +337,17 @@ class MasterController(object):
         self.smach_reset_pub = rospy.Publisher(
             '/mower_smach/reset', Bool, queue_size=1)
 
-        # power module
+        # power module (vitulus_ups) - topics live under the /pm/ namespace,
+        # matching the webui power-module controls. The PM performs the actual
+        # power-off and sets the wake timer.
         self.set_sleep_time_pub = rospy.Publisher(
-            '/set_sleep_time', UInt64, queue_size=1)
+            '/pm/set_sleep_time', UInt64, queue_size=1)
         self.set_robot_sleep_pub = rospy.Publisher(
-            '/set_robot_sleep', Bool, queue_size=1)
+            '/pm/set_robot_sleep', Bool, queue_size=1)
         self.set_sleep_until_charged_pub = rospy.Publisher(
-            '/set_sleep_until_charged', Bool, queue_size=1)
+            '/pm/set_sleep_until_charged', Bool, queue_size=1)
         self.set_sleep_wait_before_standby_pub = rospy.Publisher(
-            '/set_sleep_wait_before_standby', UInt64, queue_size=1)
+            '/pm/set_sleep_wait_before_standby', UInt64, queue_size=1)
 
         # logging
         self.lcd_log_pub = rospy.Publisher(
@@ -281,7 +358,7 @@ class MasterController(object):
         # ---- subscribers ---------------------------------------------------
         rospy.Subscriber('/dock_manager/is_in_dock_confirmed', Bool,
                          self.dock_callback)
-        rospy.Subscriber('/web_plan/programs', PlannerProgramList,
+        rospy.Subscriber('/web_plan/program_list', PlannerProgramList,
                          self.programs_callback)
         rospy.Subscriber('/pm/power_status', Power_status,
                          self.power_callback)
@@ -303,7 +380,10 @@ class MasterController(object):
         self.calendar_pub.publish(String(json.dumps(self.calendar)))
 
         rospy.loginfo("Master Controller initialised.")
-        self.log("[Master] Init. automation=%s" % self.automation_enabled)
+        self.log("[Master] Init. automation=%s window=%s-%s" % (
+            self.automation_enabled,
+            rospy.get_param('~allowed_window_start', '07:00'),
+            rospy.get_param('~allowed_window_end', '21:00')))
 
     # =====================================================================
     # logging
@@ -321,7 +401,8 @@ class MasterController(object):
             "calendar": [],
             "last_run_by_event": {},
             "interrupted_event_id": None,
-            "inhibit": False,
+            "interrupted_reason": None,
+            "inhibit": self.default_inhibit,
         }
 
     def _load_state(self):
@@ -344,6 +425,18 @@ class MasterController(object):
                 json.dump(self.persistent, f, indent=2)
         except Exception as e:
             rospy.logerr("Failed to save state: %s", str(e))
+
+    def _set_interrupted(self, event_id, reason):
+        with self.lock:
+            self.persistent['interrupted_event_id'] = event_id
+            self.persistent['interrupted_reason'] = reason
+            self._save_state()
+
+    def _clear_interrupted(self):
+        with self.lock:
+            self.persistent['interrupted_event_id'] = None
+            self.persistent['interrupted_reason'] = None
+            self._save_state()
 
     # =====================================================================
     # callbacks
@@ -416,6 +509,14 @@ class MasterController(object):
                 return ev
         return None
 
+    def _in_allowed_window(self, now=None):
+        if not self.window_enabled:
+            return True
+        if now is None:
+            now = datetime.datetime.now()
+        return MowerScheduler.within_window(
+            now, self.window_start, self.window_end)
+
     # =====================================================================
     # main loop
     # =====================================================================
@@ -482,7 +583,7 @@ class MasterController(object):
     def _handle_idle(self):
         """In-dock idle. Evaluate calendar, sleep or start programs."""
 
-        # Not in dock → no actions, behave like inhibit
+        # Not in dock -> no actions, behave like inhibit
         with self.lock:
             in_dock = self.is_in_dock
         if not in_dock:
@@ -493,10 +594,24 @@ class MasterController(object):
             self.status_pub.publish(String("Waiting for programs"))
             return
 
+        # Mandatory boot grace: no start / no sleep right after boot.
+        boot_elapsed = time.time() - self.node_start_time
+        if boot_elapsed < self.boot_grace_period_s:
+            self.status_pub.publish(
+                String("Idle (Boot grace %.0fs)"
+                       % (self.boot_grace_period_s - boot_elapsed)))
+            return
+
+        # Throttle heavy calendar evaluation to check_interval_s.
+        if (time.time() - self._last_idle_eval) < self.check_interval_s:
+            return
+        self._last_idle_eval = time.time()
+
         with self.lock:
             calendar = list(self.calendar)
             last_run = dict(self.persistent.get('last_run_by_event', {}))
             interrupted_id = self.persistent.get('interrupted_event_id')
+            interrupted_reason = self.persistent.get('interrupted_reason')
             battery = self.battery_capacity
             smach_status = self.smach_status
 
@@ -506,71 +621,90 @@ class MasterController(object):
                 String("Idle (SMACH: %s)" % smach_status))
             return
 
-        # --- Priority 1: Resume interrupted program (battery preempt) ------
-        if interrupted_id is not None:
-            ev = self._find_event(interrupted_id)
-            if ev is None or not ev.get('enabled', False):
-                # Event removed or disabled - clear
-                with self.lock:
-                    self.persistent['interrupted_event_id'] = None
-                    self._save_state()
-            else:
-                prog_name = ev['program_name']
-                if battery < self.battery_resume_min:
-                    self.log(
-                        "[Master] Battery %d%% < %d%%. "
-                        "Sleep until charged for resume of %s."
-                        % (battery, self.battery_resume_min, prog_name))
-                    self._execute_sleep(charged=True)
-                    return
-                else:
-                    self.log("[Master] Resuming program: %s" % prog_name)
-                    self.program_select_resume_pub.publish(String(prog_name))
-                    self._mowing_grace_until = time.time() + 5.0
-                    self._transition(self.STATE_MOWING)
-                    return
+        now = datetime.datetime.now()
 
-        # --- Priority 2: Active event NOW ----------------------------------
-        active_ev = MowerScheduler.get_active_event(calendar, last_run)
-        if active_ev is not None:
+        # --- Time-window gate: don't mow outside the allowed window --------
+        if not self._in_allowed_window(now):
+            win_start = MowerScheduler.next_window_start(now, self.window_start)
+            sleep_s = (win_start - now).total_seconds() - self.wake_lead_s
+            self.log("[Master] Outside allowed window. Sleeping until %s."
+                     % win_start.strftime("%H:%M"))
+            self._execute_sleep(duration_ms=int(max(60.0, sleep_s) * 1000))
+            return
+
+        # --- Priority 1: A freshly scheduled program is due NOW ------------
+        # A new scheduled event that differs from the interrupted one wins:
+        # the interrupted event is abandoned (give up before next program).
+        active_ev = MowerScheduler.get_active_event(calendar, last_run, now)
+        if active_ev is not None and active_ev.get('id') != interrupted_id:
             prog_name = active_ev['program_name']
+            if interrupted_id is not None:
+                self.log("[Master] New scheduled program due; abandoning "
+                         "interrupted event.")
             self.log("[Master] Starting scheduled program: %s" % prog_name)
-            today = datetime.datetime.now().strftime("%Y-%m-%d")
+            today = now.strftime("%Y-%m-%d")
             with self.lock:
                 self.persistent['last_run_by_event'][active_ev['id']] = today
                 self.persistent['interrupted_event_id'] = active_ev['id']
+                self.persistent['interrupted_reason'] = None
                 self._save_state()
             self.program_select_pub.publish(String(prog_name))
             self._mowing_grace_until = time.time() + 5.0
             self._transition(self.STATE_MOWING)
             return
 
-        # --- Priority 3: Next scheduled event → wait or sleep --------------
-        next_dt, next_ev = MowerScheduler.get_next_event(calendar)
+        # --- Priority 2: Resume interrupted program ------------------------
+        if interrupted_id is not None:
+            ev = self._find_event(interrupted_id)
+            if ev is None or not ev.get('enabled', False):
+                # Event removed or disabled - clear
+                self._clear_interrupted()
+            else:
+                prog_name = ev['program_name']
+                # Battery interrupt or simply too low -> wait for charge.
+                if (interrupted_reason == 'battery'
+                        or battery < self.battery_resume_min):
+                    if battery < self.battery_resume_min:
+                        self.log(
+                            "[Master] Battery %d%% < %d%%. Sleep until charged "
+                            "for resume of %s."
+                            % (battery, self.battery_resume_min, prog_name))
+                        self._execute_sleep(charged=True)
+                        return
+                # Resume; smach re-runs pre-checks (weather/battery) and will
+                # re-reject if conditions are still bad -> self-correcting.
+                self.log("[Master] Resuming program: %s (reason=%s)"
+                         % (prog_name, interrupted_reason))
+                self.program_select_resume_pub.publish(String(prog_name))
+                self._mowing_grace_until = time.time() + 5.0
+                self._transition(self.STATE_MOWING)
+                return
+
+        # --- Priority 3: Next scheduled event -> wait or sleep -------------
+        next_dt, next_ev = MowerScheduler.get_next_event(calendar, now)
         if next_dt is None:
             self.status_pub.publish(String("Idle (No schedule)"))
             self.next_run_pub.publish(String("None"))
             return
 
-        now = datetime.datetime.now()
         time_until_s = (next_dt - now).total_seconds()
         self.next_run_pub.publish(
             String("%s in %.0fm" % (next_ev['program_name'],
                                     time_until_s / 60.0)))
 
         if time_until_s <= self.idle_sleep_threshold_s:
-            # Within 20 min → stay awake, wait
+            # Within threshold -> stay awake, wait
             self.status_pub.publish(
                 String("Idle (Wait %.0fm for %s)"
                        % (time_until_s / 60.0, next_ev['program_name'])))
         else:
-            # More than 20 min → sleep, wake 10 min before
-            sleep_s = time_until_s - self.wake_before_program_s
+            # Sleep, wake wake_lead before the program
+            sleep_s = time_until_s - self.wake_lead_s
             self.log(
                 "[Master] Next %s in %.0fm. Sleeping for %.0fm."
                 % (next_ev['program_name'],
                    time_until_s / 60.0, sleep_s / 60.0))
-            self._execute_sleep(duration_ms=int(sleep_s * 1000))
+            self._execute_sleep(duration_ms=int(max(60.0, sleep_s) * 1000))
 
     # =====================================================================
     # state: MOWING
@@ -588,20 +722,23 @@ class MasterController(object):
         if time.time() < self._mowing_grace_until:
             return
 
-        # Terminal error: wait terminal_error_timeout_s, then reset SMACH
+        # Terminal error: wait short, reset SMACH, then long sleep.
         if smach_status == "TERMINAL ERROR":
             if self.terminal_error_since is None:
                 self.terminal_error_since = time.time()
             elif ((time.time() - self.terminal_error_since)
-                  > self.terminal_error_timeout_s):
-                self.log("[Master] Terminal error timeout. Resetting SMACH.")
+                  > self.terminal_short_wait_s):
+                self.log("[Master] Terminal error timeout. Resetting SMACH "
+                         "and sleeping.")
                 self.smach_reset_pub.publish(Bool(True))
                 self.terminal_error_since = None
+                self._clear_interrupted()
                 rospy.sleep(3.0)
+                self._pending_recovery_reason = 'terminal'
                 with self.lock:
                     in_dock = self.is_in_dock
                 if in_dock:
-                    self._transition(self.STATE_IDLE)
+                    self._begin_recovery()
                 else:
                     self.off_dock_since = time.time()
                     self._transition(self.STATE_WAIT_OFF_DOCK)
@@ -609,55 +746,80 @@ class MasterController(object):
 
         self.terminal_error_since = None
 
-        # SMACH returned to "Ready" → program ended
+        # SMACH returned to "Ready" -> program ended (with a reason)
         if smach_status == "Ready" and stop_reason:
-            if stop_reason == "succeeded":
-                self.log("[Master] Program succeeded.")
-                with self.lock:
-                    self.persistent['interrupted_event_id'] = None
-                    self._save_state()
-                if in_dock:
-                    self._transition(self.STATE_IDLE)
-                else:
-                    self.off_dock_since = time.time()
-                    self._transition(self.STATE_WAIT_OFF_DOCK)
-                return
+            self._handle_program_end(stop_reason, in_dock)
 
-            if stop_reason.startswith("interrupted:"):
-                # SMACH interrupted (battery, user, etc.)
-                # Keep interrupted_event_id for resume after charge
-                self.log("[Master] Program interrupted: %s" % stop_reason)
-                if in_dock:
-                    self._transition(self.STATE_IDLE)
-                else:
-                    self.off_dock_since = time.time()
-                    self._transition(self.STATE_WAIT_OFF_DOCK)
-                return
+    def _handle_program_end(self, stop_reason, in_dock):
+        """Decide what to do after a program reached a terminal stop_reason."""
 
-            # Any other stop reason → don't resume
-            self.log("[Master] Program stopped: %s" % stop_reason)
-            with self.lock:
-                self.persistent['interrupted_event_id'] = None
-                self._save_state()
-            if in_dock:
-                self._transition(self.STATE_IDLE)
-            else:
-                self.off_dock_since = time.time()
-                self._transition(self.STATE_WAIT_OFF_DOCK)
+        # --- Success: clear and idle ---------------------------------------
+        if stop_reason == "succeeded":
+            self.log("[Master] Program succeeded.")
+            self._clear_interrupted()
+            self._route_after_program(None, in_dock)
             return
+
+        # --- Recoverable interrupts: keep event, schedule recovery sleep ---
+        recovery = None
+        if stop_reason == "interrupted:battery" or stop_reason == "rejected:battery":
+            recovery = 'battery'
+        elif stop_reason == "interrupted:weather" or stop_reason in (
+                "rejected:rain", "rejected:recent_rain", "rejected:forecast"):
+            recovery = 'weather'
+        elif stop_reason == "interrupted:temp":
+            recovery = 'temp'
+        elif stop_reason.startswith("critical:"):
+            recovery = 'critical'
+
+        if recovery is not None:
+            self.log("[Master] Program %s -> recovery '%s'."
+                     % (stop_reason, recovery))
+            # Persist reason against the still-interrupted event.
+            with self.lock:
+                eid = self.persistent.get('interrupted_event_id')
+                self.persistent['interrupted_reason'] = recovery
+                self._save_state()
+            if eid is None and recovery != 'critical':
+                # No event to resume (e.g. manual run) - just idle.
+                self._route_after_program(None, in_dock)
+                return
+            self._route_after_program(recovery, in_dock)
+            return
+
+        # --- Terminal / user stop: clear, no auto-sleep --------------------
+        # terminal:*, stopped:*, or anything else.
+        self.log("[Master] Program stopped: %s (no auto-sleep)" % stop_reason)
+        self._clear_interrupted()
+        self._route_after_program(None, in_dock)
+
+    def _route_after_program(self, recovery_reason, in_dock):
+        """Common routing: go idle, or wait for dock then recover."""
+        self._pending_recovery_reason = recovery_reason
+        if in_dock:
+            if recovery_reason is not None:
+                self._begin_recovery()
+            else:
+                self._transition(self.STATE_IDLE)
+        else:
+            self.off_dock_since = time.time()
+            self._transition(self.STATE_WAIT_OFF_DOCK)
 
     # =====================================================================
     # state: WAIT_OFF_DOCK
     # =====================================================================
     def _handle_wait_off_dock(self):
-        """Robot off-dock after program ended. Wait 20 min, then sleep."""
+        """Robot off-dock after program ended. Wait for dock, then act."""
         with self.lock:
             in_dock = self.is_in_dock
 
         if in_dock:
             self.log("[Master] Robot returned to dock.")
             self.off_dock_since = None
-            self._transition(self.STATE_IDLE)
+            if self._pending_recovery_reason is not None:
+                self._begin_recovery()
+            else:
+                self._transition(self.STATE_IDLE)
             return
 
         elapsed = time.time() - (self.off_dock_since or time.time())
@@ -666,27 +828,66 @@ class MasterController(object):
             String("Off-dock (%.0fm left)" % max(0, remaining / 60.0)))
 
         if remaining <= 0:
-            self.log("[Master] Off-dock timeout. Emergency sleep (8h).")
-            self._execute_sleep(duration_ms=int(8 * 3600 * 1000))
+            self.log("[Master] Off-dock timeout. Emergency sleep.")
+            self._execute_sleep(
+                duration_ms=int(self.terminal_long_sleep_s * 1000))
+
+    # =====================================================================
+    # recovery sleep
+    # =====================================================================
+    def _begin_recovery(self):
+        """Sleep according to the pending recovery reason (robot in dock)."""
+        reason = self._pending_recovery_reason
+        self._pending_recovery_reason = None
+        if reason == 'battery':
+            self.log("[Master] Recovery: sleep until charged, then resume.")
+            self._execute_sleep(charged=True)
+        elif reason == 'weather':
+            self._timed_recovery_sleep(self.weather_sleep_duration_s, "weather")
+        elif reason == 'temp':
+            self._timed_recovery_sleep(self.temp_sleep_duration_s, "temp")
+        elif reason == 'critical':
+            self._timed_recovery_sleep(self.critical_sleep_duration_s,
+                                       "critical")
+        elif reason == 'terminal':
+            self._timed_recovery_sleep(self.terminal_long_sleep_s, "terminal")
+        else:
+            self._transition(self.STATE_IDLE)
+
+    def _timed_recovery_sleep(self, desired_s, label):
+        """Timed sleep, capped so the robot wakes before the next program."""
+        now = datetime.datetime.now()
+        sleep_s = desired_s
+        next_dt, _ = MowerScheduler.get_next_event(list(self.calendar), now)
+        if next_dt is not None:
+            cap = (next_dt - now).total_seconds() - self.wake_lead_s
+            if cap < sleep_s:
+                sleep_s = cap
+        sleep_s = max(60.0, sleep_s)
+        self.log("[Master] Recovery sleep (%s) for %.0fm."
+                 % (label, sleep_s / 60.0))
+        self._execute_sleep(duration_ms=int(sleep_s * 1000))
 
     # =====================================================================
     # state: PREPARE_SLEEP
     # =====================================================================
     def _handle_prepare_sleep(self):
-        """Wait for PM sleep confirmation (10s timeout), then shutdown."""
-        self.status_pub.publish(String("PreparingSleep"))
-        deadline = getattr(self, '_prepare_sleep_deadline', 0.0)
+        """Sleep commands sent to the power module; wait for it to cut power.
+
+        The power module (vitulus_ups) performs the actual power-off and sets
+        the wake timer. We do NOT shut the OS down ourselves - this mirrors the
+        webui power-module controls, which only publish the /pm/ sleep topics.
+        If the PM publishes a confirmation we log it once; otherwise we simply
+        stay passive until power is cut (a safe failure mode if the PM is
+        unavailable: the robot just stays awake rather than wrongly powering
+        off with no wake timer).
+        """
         with self.lock:
             confirmed = self.sleep_confirmed
-
-        if confirmed:
-            self.log("[Master] Sleep confirmed. Shutting down.")
-            self._do_shutdown()
-            return
-        if time.time() >= deadline:
-            self.log("[Master] Sleep not confirmed. Fail-safe shutdown.")
-            self._do_shutdown()
-            return
+        if confirmed and not self._sleep_confirmed_logged:
+            self.log("[Master] Sleep confirmed by power module.")
+            self._sleep_confirmed_logged = True
+        self.status_pub.publish(String("Sleeping (waiting for power off)"))
 
     # =====================================================================
     # sleep execution
@@ -716,12 +917,8 @@ class MasterController(object):
             rospy.logwarn("[Master] _execute_sleep called with no params.")
             return
 
-        self._prepare_sleep_deadline = time.time() + 10.0
+        self._sleep_confirmed_logged = False
         self._transition(self.STATE_PREPARE_SLEEP)
-
-    def _do_shutdown(self):
-        rospy.sleep(2.0)
-        os.system("sudo shutdown -h now &")
 
 
 # ---------------------------------------------------------------------------

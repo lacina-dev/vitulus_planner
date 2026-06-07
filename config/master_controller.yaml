@@ -1,36 +1,59 @@
 # Vitulus Master Controller Configuration
+#
+# Parameter names here match exactly what nodes/master_controller reads via
+# rospy.get_param('~<name>', ...). Durations suffixed _h are hours, _s seconds,
+# _min minutes.
 
 # Master switch: set to false to put the master controller into a fully
-# passive "bypass" mode (no auto-start, no auto-sleep). Useful for purely
-# manual operation.
-automation_enabled: true
-
-# Mandatory grace period (seconds) after node startup during which no
-# programs are started and no sleep is triggered. Gives operators time
-# to intervene manually.
-boot_grace_period_s: 300.0
+# passive "bypass" (DISABLED) mode - no auto-start, no auto-sleep. Useful for
+# purely manual operation. A softer, runtime toggle is /scheduler/inhibit.
+automation_enabled: false
 
 # Short settle delay (seconds) before the FSM leaves STATE_INIT.
 startup_delay_s: 10.0
 
-# How often (seconds) the IDLE state re-evaluates the calendar.
-# Safety checks still run every second.
+# Mandatory grace period (seconds) after node startup during which IDLE will
+# neither start a program nor sleep. Gives operators time to intervene.
+boot_grace_period_s: 300.0
+
+# How often (seconds) IDLE re-evaluates the calendar / start decision.
+# (The 1 Hz FSM tick and inhibit handling keep running every second.)
 check_interval_s: 30.0
 
-# Sleep durations for various preempt / interrupt reasons.
+# When sleeping ahead of a scheduled program, wake this many seconds early...
+wake_before_program_s: 600.0      # 10 min
+# ...plus this extra buffer for boot-up and acquiring a GPS fix.
+boot_time_buffer_s: 120.0
+
+# If the next program is closer than this (seconds), stay awake and wait
+# instead of doing a short sleep.
+idle_sleep_threshold_s: 1200.0    # 20 min
+
+# After a program ends with the robot off-dock, wait this long for it to
+# return before triggering an emergency sleep.
+off_dock_wait_s: 1200.0           # 20 min
+
+# Battery capacity (%, 0-100) required to resume an interrupted program.
+# Matches the smach pre-start hysteresis (reject below 40%).
+battery_recovery_min_capacity: 40
+
+# Recovery sleep durations (hours) by interrupt reason. Each is capped so the
+# robot still wakes before the next scheduled program.
 weather_sleep_duration_h: 4.0
 temp_sleep_duration_h: 1.0
 critical_error_sleep_duration_h: 0.5
+
+# Terminal-error handling: wait this long (minutes) before resetting SMACH,
+# then sleep this long (hours).
 terminal_error_short_wait_min: 20.0
 terminal_error_long_sleep_h: 8.0
 
-# Battery thresholds (in %, 0-100).
-battery_recovery_min_capacity: 40
-battery_critically_low_preempt: 25
+# Global allowed time-window ("don't mow at night"). Outside it the manager
+# never starts/resumes and sleeps until the window opens. Set enabled=false to
+# rely solely on calendar times. Supports wrap-around (start > end).
+allowed_window_enabled: true
+allowed_window_start: "07:00"
+allowed_window_end: "21:00"
 
-# Buffer time subtracted from the next scheduled start time to give the
-# robot time to boot up and get a GPS fix.
-boot_time_buffer_s: 120.0
-
-# Default inhibit state if no value is present in the persistent state.
+# Default inhibit state if none is present in the persistent state file.
 default_inhibit: false
