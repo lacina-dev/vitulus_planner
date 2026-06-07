@@ -76,7 +76,7 @@ class Node:
         self.outline_path_pub = rospy.Publisher("/web_plan/outline_path", Path, queue_size=1)
         self.map_assembled_pub = rospy.Publisher("/web_plan/map_assembled", OccupancyGrid, queue_size=1)
         self.map_edited_pub = rospy.Publisher("/web_plan/map_edited", OccupancyGrid, queue_size=1)
-        self.program_list_pub = rospy.Publisher("/web_plan/program_list", PlannerProgramList, queue_size=10)
+        self.program_list_pub = rospy.Publisher("/web_plan/program_list", PlannerProgramList, latch=True, queue_size=10)
         self.programs_pub = rospy.Publisher("/web_plan/programs", PlannerProgramList, queue_size=10)
         self.program_active_pub = rospy.Publisher("/web_plan/program_active", PlannerProgram, queue_size=1)
         self.program_select_sub = rospy.Subscriber("/web_plan/program_select", String, self.callback_program_select)
@@ -90,6 +90,11 @@ class Node:
         self.planner_loaded_pub = rospy.Publisher("/web_plan/planner_loaded", String, queue_size=1, latch=True)
 
         self.save_map_srv = rospy.Service("/web_plan/save_map", Save_map, self.save_map)
+
+        # load_programs() in __init__ runs before the publishers exist, so its
+        # final publish fails. Publish the loaded list once now (latched) so
+        # late subscribers (e.g. master_controller, webui) reliably get it.
+        self.program_list_publisher()
 
     def save_map(self, srv):
         if srv.name != "":
