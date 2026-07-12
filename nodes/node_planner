@@ -20,6 +20,7 @@ from vitulus_msgs.msg import MapEditPolygon, MapEditPolygonList, MapEditZone, Ma
 from visualization_msgs.msg import Marker, MarkerArray
 import math
 import pickle
+import copy
 import resource
 import sys
 import geopandas as gpd
@@ -58,7 +59,7 @@ class Node:
         self.map_show_map_layer_sub = rospy.Subscriber("/web_plan/show_map_layer", String, self.callback_show_map_layer)
         self.map_save_poly_sub = rospy.Subscriber("/web_plan/save_polygon", MapEditPolygon, self.callback_map_save_poly)
         self.map_remove_poly_sub = rospy.Subscriber("/web_plan/remove_polygon", String, self.callback_map_remove_poly)
-        self.map_poly_list_pub = rospy.Publisher("/web_plan/polygon_list", MapEditPolygonList, queue_size=1)
+        self.map_poly_list_pub = rospy.Publisher("/web_plan/polygon_list", MapEditPolygonList, latch=True, queue_size=1)
         self.zone_save_sub = rospy.Subscriber("/web_plan/save_zone", MapEditZone, self.callback_map_save_zone)
         self.zone_remove_sub = rospy.Subscriber("/web_plan/remove_zone", String, self.callback_zone_remove)
         self.zone_selected_sub = rospy.Subscriber("/web_plan/selected_zone", String, self.callback_zone_selected)
@@ -66,9 +67,13 @@ class Node:
         self.load_planner_data_sub = rospy.Subscriber("/web_plan/load_planner_data", Bool, self.callback_load_planner_data)
         self.save_planner_data_sub = rospy.Subscriber("/web_plan/save_planner_data", Bool, self.callback_save_planner_data)
         self.reload_map_sub = rospy.Subscriber("/web_plan/reload_map", Bool, self.callback_reload_map)
+        # Lightweight "re-publish the current lists" trigger (no pickle reload) —
+        # lets the web UI reliably re-fetch zone/polygon/program lists (which are
+        # one-shot over rosbridge) without the heavy reload of /web_plan/reload.
+        self.republish_sub = rospy.Subscriber("/web_plan/republish", Bool, self.callback_republish)
         # self.new_map_sub = rospy.Subscriber("/web_plan/new_map", String, self.callback_new_map)
 
-        self.zone_list_pub = rospy.Publisher("/web_plan/zone_list", MapEditZoneList, queue_size=1)
+        self.zone_list_pub = rospy.Publisher("/web_plan/zone_list", MapEditZoneList, latch=True, queue_size=1)
         self.marker_pub = rospy.Publisher("/web_plan/zone_outline_polygons", Marker, queue_size=1)
         self.marker_zone_path_lines_pub = rospy.Publisher("/web_plan/zone_path_lines", MarkerArray, queue_size=0)
         self.marker_program_paths_pub = rospy.Publisher("/web_plan/program_marker", MarkerArray, queue_size=0)
@@ -507,6 +512,9 @@ class Node:
         self.np_show = self.current_zone.np_zone_paths
         self.create_zone_path_marker_array()
         self.log_publisher("Zone {} saved.".format(self.current_zone.msg.name))
+        # Push the edited zone (new shape/route) into existing programs that use
+        # it, so a map change is reflected without rebuilding the programs.
+        self._propagate_zone_to_programs(self.current_zone.msg)
         self.program_list_publisher()
         self.save_running_data()
 
@@ -517,6 +525,8 @@ class Node:
                 self.map_data.zones.remove(zone)
         self.map_zone_list_publisher()
         # self.create_program()
+        # Drop the removed zone from existing programs that referenced it.
+        self._remove_zone_from_programs(msg.data)
         self.program_list_publisher()
         # Show map
         self.np_show = self.map_data.np_assembled
@@ -1664,6 +1674,65 @@ class Node:
             rospy.loginfo("[{}] Publishing program list: {} programs".format(rospy.get_caller_id(), self.permanent_program_list_msg.header))
             self.program_list_pub.publish(self.permanent_program_list_msg)
 
+    def _propagate_zone_to_programs(self, new_zone_msg):
+        """Push an edited zone into every saved program that uses it.
+
+        Programs embed a full copy of each zone (incl. its computed coverage
+        paths), so a map edit would otherwise not reach existing programs. When
+        a zone is re-saved we refresh that copy in place — matched by zone name
+        within the same map (program.map_name == current map) — and recompute
+        the program's area/length totals. Returns the number of programs
+        changed. A deep copy is stored so later in-memory zone edits don't alias
+        back into the program until they are propagated too.
+        """
+        if self.permanent_program_list_msg is None:
+            return 0
+        changed = 0
+        for program in self.permanent_program_list_msg.program_list:
+            if program.map_name != self.current_navi_map_name:
+                continue
+            hit = False
+            for i in range(len(program.zone_list)):
+                if program.zone_list[i].name == new_zone_msg.name:
+                    program.zone_list[i] = copy.deepcopy(new_zone_msg)
+                    hit = True
+            if hit:
+                program.area = int(sum(z.area for z in program.zone_list))
+                program.length = int(sum(z.length for z in program.zone_list))
+                changed += 1
+        if changed:
+            self.save_programs()
+            self.program_list_publisher()
+            self.log_publisher("Zone '{}' update propagated to {} program(s).".format(new_zone_msg.name, changed))
+            rospy.loginfo("[{}] Zone '{}' propagated to {} program(s).".format(rospy.get_caller_id(), new_zone_msg.name, changed))
+        return changed
+
+    def _remove_zone_from_programs(self, zone_name):
+        """Drop a removed zone from every saved program that referenced it.
+
+        Mirrors _propagate_zone_to_programs for zone deletion: scoped to the
+        current map, recomputes area/length totals, and persists. Returns the
+        number of programs changed.
+        """
+        if self.permanent_program_list_msg is None:
+            return 0
+        changed = 0
+        for program in self.permanent_program_list_msg.program_list:
+            if program.map_name != self.current_navi_map_name:
+                continue
+            new_list = [z for z in program.zone_list if z.name != zone_name]
+            if len(new_list) != len(program.zone_list):
+                program.zone_list = new_list
+                program.area = int(sum(z.area for z in program.zone_list))
+                program.length = int(sum(z.length for z in program.zone_list))
+                changed += 1
+        if changed:
+            self.save_programs()
+            self.program_list_publisher()
+            self.log_publisher("Removed zone '{}' from {} program(s).".format(zone_name, changed))
+            rospy.loginfo("[{}] Removed zone '{}' from {} program(s).".format(rospy.get_caller_id(), zone_name, changed))
+        return changed
+
     def callback_program_new(self, msg):
         prg_list = [prg for prg in self.permanent_program_list_msg.program_list if prg.name != msg.name]
         prg_list.append(msg)
@@ -1690,6 +1759,15 @@ class Node:
         self.log_pub.publish(msg)
 
     def callback_reload(self, msg):
+        # Boot-order race guard: /web_plan/reload can fire before
+        # callback_navi_active_map has ever set current_navi_map_name (still None).
+        # callback_load_planner_data then does string concat on None ("..." + None)
+        # -> TypeError crash at boot. Skip until the map name is known; navi_man
+        # republishes active_map on its slow tick, so a later reload succeeds.
+        if self.current_navi_map_name is None:
+            rospy.logwarn("[{}] callback_reload: navi active map name not known "
+                          "yet (None) — skipping reload.".format(rospy.get_caller_id()))
+            return
         msg = Bool(True)
         self.callback_load_planner_data(msg)
         self.map_data_publisher()
@@ -1697,6 +1775,15 @@ class Node:
         self.map_zone_list_publisher()
         self.program_list_publisher()
         # self.program_marker_publisher()
+
+    def callback_republish(self, msg):
+        # Re-publish the current lists WITHOUT reloading the planner data from
+        # disk (cheap). Used by the web UI to reliably re-fetch the one-shot
+        # zone/polygon/program lists over rosbridge.
+        if msg.data:
+            self.map_poly_list_publisher()
+            self.map_zone_list_publisher()
+            self.program_list_publisher()
 
 
 if __name__ == '__main__':
