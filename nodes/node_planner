@@ -75,6 +75,11 @@ class Node:
         self._bundle_site_cache = None          # resolved site for _bundle_site_key
         self._bundle_site_key = None            # navi map the cache was resolved for
         self._bundle_off_logged = False         # loginfo-once when no site resolves
+        # site-native mode (flag-gated, DEFAULT OFF). navi_man owns the flag in
+        # navi_manager.yaml and does NOT push it to the param server, so read the
+        # yaml directly (cached); a /navi_manager/site_native rosparam, if set,
+        # overrides (lets an operator flip live). See _site_native().
+        self._site_native_cached = None
 
         self.reload_sub = rospy.Subscriber("/web_plan/reload", Bool, self.callback_reload)
         self.map_sub = rospy.Subscriber("/rtabmap/grid_map", OccupancyGrid, self.callback_map)
@@ -181,6 +186,11 @@ class Node:
                     self.data_loaded = self.load_running_data()
                     self.log_publisher("Planner data loaded.")
                     rospy.loginfo("[{}] Planner data loaded.".format(rospy.get_caller_id()))
+                    # site_native (2): rebuild the zone-generation workspace raster
+                    # from the served site raster BEFORE the bundle zone/program
+                    # import, so any zone regen runs against the site free space.
+                    if self.data_loaded:
+                        self._rebuild_map_from_site_grid()
                     # Bundle-wins: if the site bundle is newer than the just-loaded
                     # pickles, rebuild zones/programs from it (UTM -> map, regen).
                     self._bundle_import_if_newer()
@@ -2013,6 +2023,81 @@ class Node:
             self.program_list_publisher()
         except Exception as e:
             rospy.logwarn("[{}] Site bundle: import-if-newer failed: {} — keeping pickle state.".format(rospy.get_caller_id(), e))
+
+    # ======================================================================
+    # Site-native mode (flag-gated, DEFAULT OFF): use the served mapping-v3
+    # site raster as the zone-generation workspace instead of the legacy raster.
+    # ======================================================================
+    def _site_native(self):
+        """site_native flag. Authoritative source is navi_manager.yaml (navi_man
+        loads it the same way and does NOT expose it on the param server); a
+        /navi_manager/site_native rosparam, if present, overrides. Cached."""
+        ov = rospy.get_param('/navi_manager/site_native', None)
+        if ov is not None:
+            return bool(ov)
+        if self._site_native_cached is None:
+            val = False
+            try:
+                import yaml
+                with open('/home/vitulus/catkin_ws/src/vitulus/vitulus_navi/'
+                          'config/navi_manager.yaml') as f:
+                    cfg = yaml.load(f, Loader=yaml.Loader)
+                val = bool(cfg.get('site_native', False))
+            except Exception as e:
+                rospy.logwarn("[{}] site_native: could not read navi_manager.yaml "
+                              "({}) — assuming false.".format(rospy.get_caller_id(), e))
+            self._site_native_cached = val
+        return self._site_native_cached
+
+    def _rebuild_map_from_site_grid(self):
+        """site_native (2): rebuild the workspace raster (map_data.initial_map +
+        np layers) from the served /mapping_manager/site_map grid instead of the
+        legacy raster baked into planner_data.pkl — reusing the SAME MapData +
+        assemble_map build path callback_map uses. Zones/polygons/programs are
+        carried over (they come from the bundle / operator edits). No site_map ->
+        keep the legacy raster + logwarn. Flag off -> no-op. Returns True if the
+        raster was rebuilt."""
+        if not self._site_native():
+            return False
+        try:
+            grid = rospy.wait_for_message('/mapping_manager/site_map',
+                                          OccupancyGrid, timeout=5.0)
+        except Exception as e:
+            rospy.logwarn("[{}] site_native: no /mapping_manager/site_map within "
+                          "timeout ({}) — keeping legacy raster.".format(
+                              rospy.get_caller_id(), e))
+            return False
+        if grid.info.width * grid.info.height == 0:
+            rospy.logwarn("[{}] site_native: served site_map is empty — keeping "
+                          "legacy raster.".format(rospy.get_caller_id()))
+            return False
+        try:
+            arr = np.array(grid.data, dtype=np.int8).reshape(
+                (grid.info.height, grid.info.width))
+            new_map = MapData(np_map=arr, map_msg=grid)
+            if self.map_data is not None:
+                # carry the workspace over the fresh raster: zones/programs are
+                # bundle-owned, polygons + assemble params are operator edits.
+                new_map.zones = self.map_data.zones
+                new_map.polygon_msgs = self.map_data.polygon_msgs
+                new_map.planner_program_list_msg = self.map_data.planner_program_list_msg
+                new_map.obstacle_margin = self.map_data.obstacle_margin
+                new_map.obstacle_margin_px = self.map_data.obstacle_margin_px
+                new_map.fill_hole_px = self.map_data.fill_hole_px
+                new_map.fill_shape = self.map_data.fill_shape
+                new_map.fill_shape_cv = self.map_data.fill_shape_cv
+            self.map_data = new_map
+            self.assemble_map()
+            self.np_show = self.map_data.np_semi_assembled
+            rospy.loginfo("[{}] site_native: workspace raster rebuilt from "
+                          "/mapping_manager/site_map ({}x{} @ {:.3f} m).".format(
+                              rospy.get_caller_id(), grid.info.width,
+                              grid.info.height, grid.info.resolution))
+            return True
+        except Exception as e:
+            rospy.logwarn("[{}] site_native: rebuild from site_map failed ({}) — "
+                          "keeping legacy raster.".format(rospy.get_caller_id(), e))
+            return False
 
     def callback_program_new(self, msg):
         prg_list = [prg for prg in self.permanent_program_list_msg.program_list if prg.name != msg.name]
