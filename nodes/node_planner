@@ -21,6 +21,9 @@ from visualization_msgs.msg import Marker, MarkerArray
 import math
 import pickle
 import copy
+import threading
+import time
+import hashlib
 import resource
 import sys
 import geopandas as gpd
@@ -80,6 +83,22 @@ class Node:
         # yaml directly (cached); a /navi_manager/site_native rosparam, if set,
         # overrides (lets an operator flip live). See _site_native().
         self._site_native_cached = None
+
+        # site_native live-refresh (WP-editsync 2026-07-18): keep a PERSISTENT
+        # latched subscriber to /mapping_manager/site_map so operator map edits
+        # (obstacle/free/wall composited by mapping_manager) rebuild the planner
+        # workspace AND regenerate every zone live — no map reload needed. State
+        # for debounce + single-worker coalescing (see callback_site_map). All
+        # gated on _site_native(); when the flag is off the callback is a no-op.
+        self._site_map_lock = threading.Lock()
+        self._site_map_last_fp = None       # fingerprint of last grid SEEN (dedup)
+        self._site_map_pending = None       # newest grid awaiting a refresh run
+        self._site_map_timer = None         # debounce oneshot rospy.Timer
+        self._site_map_worker_active = False
+        self._site_map_rerun = False        # a grid arrived mid-run -> run again
+        self.site_map_sub = rospy.Subscriber("/mapping_manager/site_map",
+                                             OccupancyGrid, self.callback_site_map,
+                                             queue_size=1)
 
         self.reload_sub = rospy.Subscriber("/web_plan/reload", Bool, self.callback_reload)
         self.map_sub = rospy.Subscriber("/rtabmap/grid_map", OccupancyGrid, self.callback_map)
@@ -2067,6 +2086,16 @@ class Node:
                           "timeout ({}) — keeping legacy raster.".format(
                               rospy.get_caller_id(), e))
             return False
+        return self._rebuild_workspace_from_grid(grid)
+
+    def _rebuild_workspace_from_grid(self, grid):
+        """Core raster rebuild shared by the load-time fetch
+        (_rebuild_map_from_site_grid) and the live refresh (callback_site_map).
+        Builds a fresh MapData from `grid`, carries the existing workspace
+        (zones/programs/polygons/assemble params) over it, and re-assembles.
+        Empty grid or build error -> keep the previous raster + logwarn, return
+        False. Returns True on a successful rebuild. Does NOT re-fetch or check
+        the site_native flag (callers do)."""
         if grid.info.width * grid.info.height == 0:
             rospy.logwarn("[{}] site_native: served site_map is empty — keeping "
                           "legacy raster.".format(rospy.get_caller_id()))
@@ -2098,6 +2127,128 @@ class Node:
             rospy.logwarn("[{}] site_native: rebuild from site_map failed ({}) — "
                           "keeping legacy raster.".format(rospy.get_caller_id(), e))
             return False
+
+    # ----- site_native live refresh (debounce -> single worker, coalesced) ----
+    def _grid_fingerprint(self, grid):
+        """Cheap identity of a site_map grid: geometry + a hash of the cells.
+        Used to skip refreshes when an identical grid is (re)latched."""
+        try:
+            h = hashlib.md5()
+            info = grid.info
+            h.update("{}x{}|{:.4f}|{:.4f},{:.4f}".format(
+                info.width, info.height, info.resolution,
+                info.origin.position.x, info.origin.position.y).encode())
+            h.update(np.asarray(grid.data, dtype=np.int8).tobytes())
+            return h.hexdigest()
+        except Exception:
+            return None
+
+    def callback_site_map(self, grid):
+        """Persistent latched subscriber on /mapping_manager/site_map. On a NEW
+        grid (fingerprint differs from the last seen): stash it and (re)arm a
+        2.5 s debounce timer. Flag off -> no-op. Never blocks: the actual
+        rebuild+zone-regen runs in a worker thread (see _site_map_worker)."""
+        if not self._site_native():
+            return
+        fp = self._grid_fingerprint(grid)
+        with self._site_map_lock:
+            if fp is not None and fp == self._site_map_last_fp:
+                return  # identical grid re-latched -> nothing to do
+            self._site_map_last_fp = fp
+            self._site_map_pending = grid
+        # (re)arm the debounce timer outside the lock; edits arrive in bursts, so
+        # each new grid pushes the fire time out another 2.5 s.
+        if self._site_map_timer is not None:
+            try:
+                self._site_map_timer.shutdown()
+            except Exception:
+                pass
+        self._site_map_timer = rospy.Timer(rospy.Duration(2.5),
+                                           self._site_map_timer_fire,
+                                           oneshot=True)
+
+    def _site_map_timer_fire(self, event):
+        """Debounce elapsed. Start the worker if idle; if a run is already in
+        progress, flag a rerun so the just-arrived grid is picked up after it."""
+        with self._site_map_lock:
+            if self._site_map_worker_active:
+                self._site_map_rerun = True
+                return
+            self._site_map_worker_active = True
+        t = threading.Thread(target=self._site_map_worker,
+                             name="site_map_refresh")
+        t.daemon = True
+        t.start()
+
+    def _site_map_worker(self):
+        """Worker loop: process the pending grid, then loop once more if a new
+        grid arrived (rerun flag) so bursts coalesce into at most one trailing
+        run. Guarded so only one worker runs at a time."""
+        try:
+            while True:
+                with self._site_map_lock:
+                    grid = self._site_map_pending
+                    self._site_map_pending = None
+                if grid is not None:
+                    self._do_live_refresh(grid)
+                with self._site_map_lock:
+                    if not self._site_map_rerun:
+                        break
+                    self._site_map_rerun = False
+                    if self._site_map_pending is None:
+                        break
+        finally:
+            with self._site_map_lock:
+                self._site_map_worker_active = False
+
+    def _do_live_refresh(self, grid):
+        """Rebuild the workspace from `grid`, regenerate EVERY zone against the
+        new free space, propagate the fresh zones into programs, export the
+        bundle and republish the latched lists + map layers. On error the
+        previous workspace is restored/kept. Runs in the worker thread."""
+        if not self._site_native():
+            return
+        if (not self.data_loaded or self.map_data is None
+                or self.current_navi_map_name in (None, "New")):
+            # No workspace to refresh yet (boot / new map). The load-time path
+            # will rebuild once data is loaded.
+            return
+        t0 = time.time()
+        prev_map_data = self.map_data
+        try:
+            # snapshot zone msgs before the raster swap; _regenerate_zone rebuilds
+            # each from its polygon against the new assembled free space.
+            prev_zone_msgs = [copy.deepcopy(z.msg) for z in self.map_data.zones]
+            if not self._rebuild_workspace_from_grid(grid):
+                # rebuild refused (empty/failed) -> keep previous workspace.
+                self.map_data = prev_map_data
+                return
+            n = 0
+            for zmsg in prev_zone_msgs:
+                try:
+                    zone = self._regenerate_zone(zmsg)
+                    self._propagate_zone_to_programs(zone.msg)
+                    n += 1
+                except Exception as e:
+                    rospy.logwarn("[{}] site_native live refresh: zone '{}' regen "
+                                  "failed: {}".format(rospy.get_caller_id(),
+                                                      getattr(zmsg, 'name', '?'), e))
+            self.current_zone = None
+            self.save_running_data()
+            # export bundle (existing hooks) + republish latched UI lists/layers.
+            self._bundle_export_zones()
+            self._bundle_export_programs()
+            self.map_zone_list_publisher()
+            self.program_list_publisher()
+            self.map_data_publisher()
+            self.map_poly_list_publisher()
+            rospy.loginfo("[{}] planner refreshed from site_map: {} zones "
+                          "regenerated in {:.1f}s".format(
+                              rospy.get_caller_id(), n, time.time() - t0))
+        except Exception as e:
+            self.map_data = prev_map_data
+            rospy.logwarn("[{}] site_native live refresh failed ({}) — keeping "
+                          "previous workspace.".format(rospy.get_caller_id(), e))
 
     def callback_program_new(self, msg):
         prg_list = [prg for prg in self.permanent_program_list_msg.program_list if prg.name != msg.name]
