@@ -30,6 +30,24 @@ from os.path import isfile, join, exists
 import shutil
 from node_planner.planner_data import MapData, MapSpec, PathPolygon, Zone
 
+# --- Site-bundle (WP-C) -----------------------------------------------------
+# Optional: persist zones/programs to the canonical per-garden site bundle
+# (~/.vitulus/mapping_v3/<site>/) in UTM, alongside the legacy pickles. Guarded
+# so a missing/unbuilt vitulus_mapping never breaks the planner. navi_man's
+# mapdata module is needed to read the active map's UTM datum from its
+# maps_data pickle (same sys.path pattern navi_man/other tools use).
+_NAVI_SRC = "/home/vitulus/catkin_ws/src/vitulus/vitulus_navi/src"
+if _NAVI_SRC not in sys.path:
+    sys.path.append(_NAVI_SRC)
+try:
+    from vitulus_mapping import bundle as vbundle
+    from vitulus_mapping import geo as vgeo
+    from node_planner import bundle_sync
+    _BUNDLE_OK = True
+except Exception as _bundle_err:
+    _BUNDLE_OK = False
+    print("[node_planner] site-bundle disabled (import failed): {}".format(_bundle_err))
+
 # np.set_printoptions(threshold=sys.maxsize)
 
 
@@ -50,6 +68,13 @@ class Node:
         self.program_active = None
         self.current_program_marker_array = None
         self.rtabmap_map_received = False
+
+        # Site-bundle (WP-C) state. `~bundle_site` forces a site; otherwise the
+        # site is auto-resolved from manifest.navi_map == active navi map name.
+        self._bundle_site_override = rospy.get_param("~bundle_site", None) or None
+        self._bundle_site_cache = None          # resolved site for _bundle_site_key
+        self._bundle_site_key = None            # navi map the cache was resolved for
+        self._bundle_off_logged = False         # loginfo-once when no site resolves
 
         self.reload_sub = rospy.Subscriber("/web_plan/reload", Bool, self.callback_reload)
         self.map_sub = rospy.Subscriber("/rtabmap/grid_map", OccupancyGrid, self.callback_map)
@@ -120,6 +145,9 @@ class Node:
                                 "/home/vitulus/.vitulus/saves/planner_data/" + self.current_navi_map_name + ".pkl")
                 self.log_publisher("Planner data saved.")
                 rospy.loginfo("[{}] Planner data saved.".format(rospy.get_caller_id()))
+                # Mirror zones + programs into the site bundle on map save.
+                self._bundle_export_zones()
+                self._bundle_export_programs()
 
             self.log_publisher("Planner map saved.")
             rospy.loginfo("[{}] Planner map saved.".format(rospy.get_caller_id()))
@@ -153,6 +181,9 @@ class Node:
                     self.data_loaded = self.load_running_data()
                     self.log_publisher("Planner data loaded.")
                     rospy.loginfo("[{}] Planner data loaded.".format(rospy.get_caller_id()))
+                    # Bundle-wins: if the site bundle is newer than the just-loaded
+                    # pickles, rebuild zones/programs from it (UTM -> map, regen).
+                    self._bundle_import_if_newer()
                     self.planner_loaded_pub.publish(String(self.current_navi_map_name))
             else:
                 self.log_publisher("Not loaded!!! It's a new map. Save it in Navi Manager first.")
@@ -167,6 +198,9 @@ class Node:
                                     "/home/vitulus/.vitulus/saves/planner_data/" + self.current_navi_map_name + ".pkl")
                     self.log_publisher("Planner data saved.")
                     rospy.loginfo("[{}] Planner data saved.".format(rospy.get_caller_id()))
+                    # Mirror zones + programs into the site bundle on explicit save.
+                    self._bundle_export_zones()
+                    self._bundle_export_programs()
             else:
                 self.log_publisher("Not saved!!! It is a new map. Save it in Navi Manager first.")
                 rospy.logwarn("[{}] Not saved!!! It is a new map.".format(rospy.get_caller_id()))
@@ -442,7 +476,15 @@ class Node:
                 msg.polygon_list.append(poly_msg)
             self.map_poly_list_pub.publish(msg)
 
-    def callback_map_save_zone(self, msg):
+    def _regenerate_zone(self, msg):
+        """Build a Zone (mask layers + outline/coverage paths) from a
+        MapEditZone msg and store it in map_data.zones (add or replace by
+        name). Sets self.current_zone. Returns the Zone.
+
+        This is the geometry-generation core shared by the live save_zone
+        handler and the site-bundle import path — regeneration MUST go through
+        this single code path so imported zones get identical coverage.
+        """
         polygon = []
         for point in msg.polygon.polygon.points:
             x_point = int(point.x / self.map_data.resolution)
@@ -506,7 +548,10 @@ class Node:
             self.map_data.zones.append(self.current_zone)
         else:
             self.map_data.zones[zone_exist_id] = self.current_zone
+        return self.current_zone
 
+    def callback_map_save_zone(self, msg):
+        self._regenerate_zone(msg)
         self.map_zone_list_publisher()
         # Show zone map
         self.np_show = self.current_zone.np_zone_paths
@@ -517,6 +562,8 @@ class Node:
         self._propagate_zone_to_programs(self.current_zone.msg)
         self.program_list_publisher()
         self.save_running_data()
+        # Mirror the workspace zones into the site bundle (UTM, bundle-wins).
+        self._bundle_export_zones()
 
     def callback_zone_remove(self, msg):
         # Remove zone
@@ -532,6 +579,8 @@ class Node:
         self.np_show = self.map_data.np_assembled
         self.log_publisher("Zone {} removed.".format(msg.data))
         self.save_running_data()
+        # Reflect the removal in the site bundle.
+        self._bundle_export_zones()
 
     def callback_zone_selected(self, msg):
         if msg.data == "cancel**cancel**":
@@ -1703,6 +1752,7 @@ class Node:
         if changed:
             self.save_programs()
             self.program_list_publisher()
+            self._bundle_export_programs()
             self.log_publisher("Zone '{}' update propagated to {} program(s).".format(new_zone_msg.name, changed))
             rospy.loginfo("[{}] Zone '{}' propagated to {} program(s).".format(rospy.get_caller_id(), new_zone_msg.name, changed))
         return changed
@@ -1729,9 +1779,240 @@ class Node:
         if changed:
             self.save_programs()
             self.program_list_publisher()
+            self._bundle_export_programs()
             self.log_publisher("Removed zone '{}' from {} program(s).".format(zone_name, changed))
             rospy.loginfo("[{}] Removed zone '{}' from {} program(s).".format(rospy.get_caller_id(), zone_name, changed))
         return changed
+
+    # ======================================================================
+    # Site-bundle (WP-C): dual-write zones/programs to ~/.vitulus/mapping_v3/
+    # <site>/ in UTM, alongside the legacy pickles. bundle-wins on load.
+    # All entry points are try/except-guarded — they NEVER break legacy paths.
+    # ======================================================================
+    def _bundle_site(self):
+        """Resolve (and cache) the bundle site for the active navi map. Returns
+        the site name or None. loginfo-once when no site resolves."""
+        if not _BUNDLE_OK:
+            return None
+        m = self.current_navi_map_name
+        if not m or m == "New":
+            return None
+        if self._bundle_site_key == m:
+            return self._bundle_site_cache
+        site = None
+        try:
+            site = bundle_sync.resolve_site(m, self._bundle_site_override)
+        except Exception as e:
+            rospy.logwarn("[{}] Site bundle: resolve failed: {}".format(rospy.get_caller_id(), e))
+        self._bundle_site_key = m
+        self._bundle_site_cache = site
+        if site:
+            rospy.loginfo("[{}] Site bundle active: '{}' <- navi map '{}'".format(rospy.get_caller_id(), site, m))
+            self._bundle_off_logged = False
+        elif not self._bundle_off_logged:
+            rospy.loginfo("[{}] Site bundle: no manifest links navi map '{}' — bundle persistence off.".format(rospy.get_caller_id(), m))
+            self._bundle_off_logged = True
+        return site
+
+    def _active_map_datum(self):
+        """Canonical map<->UTM datum of the ACTIVE navi map (drives the live
+        utm<->map TF). Read from the map's maps_data pickle; fall back to the
+        site datum.yaml. Returns a canonical datum dict or None."""
+        m = self.current_navi_map_name
+        if not m:
+            return None
+        path = "/home/vitulus/.vitulus/saves/maps_data/" + m + ".pkl"
+        try:
+            if exists(path):
+                with open(path, 'rb') as f:
+                    md = pickle.load(f)
+                if md.is_utm():
+                    return vgeo.from_pickle_datum(md)
+                rospy.logwarn("[{}] Site bundle: map '{}' pickle has no UTM datum.".format(rospy.get_caller_id(), m))
+        except Exception as e:
+            rospy.logwarn("[{}] Site bundle: datum load failed: {}".format(rospy.get_caller_id(), e))
+        # fallback: refined site datum.yaml
+        site = self._bundle_site()
+        if site:
+            try:
+                dp = os.path.join(vbundle.site_dir(site), "datum.yaml")
+                if exists(dp):
+                    import yaml
+                    with open(dp) as f:
+                        dd = yaml.safe_load(f)
+                    return vgeo.from_datum_yaml(dd)
+            except Exception as e:
+                rospy.logwarn("[{}] Site bundle: datum.yaml fallback failed: {}".format(rospy.get_caller_id(), e))
+        return None
+
+    def _bundle_export_zones(self):
+        """Mirror the workspace zones (map_data.zones) into zones.geojson (UTM)."""
+        site = self._bundle_site()
+        if not site or self.map_data is None:
+            return
+        try:
+            datum = self._active_map_datum()
+            if datum is None:
+                rospy.logwarn("[{}] Site bundle: no datum — skipping zones export.".format(rospy.get_caller_id()))
+                return
+            bzones = []
+            for zone in self.map_data.zones:
+                zmsg = zone.msg
+                poly_xy = [(p.x, p.y) for p in zmsg.polygon.polygon.points]
+                if len(poly_xy) < 3:
+                    continue
+                props = {f: getattr(zmsg, f, None) for f in bundle_sync.ZONE_PROP_FIELDS}
+                bzones.append(bundle_sync.zone_to_bundle(zmsg.name, poly_xy, props, datum))
+            vbundle.save_zones(site, bzones)  # utm_zone from manifest
+            rospy.loginfo("[{}] Site bundle: exported {} zone(s) to '{}'.".format(rospy.get_caller_id(), len(bzones), site))
+        except Exception as e:
+            rospy.logwarn("[{}] Site bundle: zones export failed: {}".format(rospy.get_caller_id(), e))
+
+    def _bundle_export_programs(self):
+        """Mirror active-map programs into programs.yaml (metadata + zone_names).
+        Programs for OTHER maps live only in the global pickle and are NOT
+        written here (a site links to exactly one navi map)."""
+        site = self._bundle_site()
+        if not site or self.permanent_program_list_msg is None:
+            return
+        try:
+            progs = []
+            for p in self.permanent_program_list_msg.program_list:
+                if p.map_name != self.current_navi_map_name:
+                    continue
+                zone_names = [z.name for z in p.zone_list]
+                scalars = {f: getattr(p, f, None) for f in bundle_sync.PROGRAM_SCALAR_FIELDS}
+                progs.append(bundle_sync.program_to_bundle(p.name, zone_names, scalars))
+            vbundle.save_programs(site, progs)
+            rospy.loginfo("[{}] Site bundle: exported {} program(s) to '{}'.".format(rospy.get_caller_id(), len(progs), site))
+        except Exception as e:
+            rospy.logwarn("[{}] Site bundle: programs export failed: {}".format(rospy.get_caller_id(), e))
+
+    def _bundle_build_zone_msg(self, name, poly_xy, props):
+        """Construct a MapEditZone from a map-frame polygon + bundle props.
+        paths/area/length are (re)computed by _regenerate_zone from these."""
+        z = MapEditZone()
+        z.header.frame_id = "map"
+        z.name = name or ""
+        z.type = str(props.get('type', '') or '')
+        z.border_paths = int(props.get('border_paths', 0) or 0)
+        z.coverage_angle = int(props.get('coverage_angle', 0) or 0)
+        z.paths_distance = float(props.get('paths_distance', 0.0) or 0.0)
+        z.simplify = float(props.get('simplify', 0.0) or 0.0)
+        z.cut_height = int(props.get('cut_height', 0) or 0)
+        z.rpm = int(props.get('rpm', 0) or 0)
+        z.area = int(props.get('area', 0) or 0)
+        z.length = int(props.get('length', 0) or 0)
+        ps = PolygonStamped()
+        ps.header.frame_id = "map"
+        for (x, y) in poly_xy:
+            ps.polygon.points.append(Point32(float(x), float(y), 0.0))
+        z.polygon = ps
+        return z
+
+    def _bundle_import_zones(self, site, datum):
+        """Rebuild the workspace zones from zones.geojson (UTM -> map) and
+        REGENERATE coverage via _regenerate_zone (the same code path save_zone
+        uses). Consistency guard warns when regen area/length drift > 5%."""
+        bzones = vbundle.load_zones(site)
+        self.map_data.zones = []
+        n = 0
+        for bz in bzones:
+            poly_xy = bundle_sync.bundle_to_polygon_map(bz, datum)
+            if len(poly_xy) < 3:
+                continue
+            props = bz.get('props', {}) or {}
+            zmsg = self._bundle_build_zone_msg(bz.get('name'), poly_xy, props)
+            try:
+                zone = self._regenerate_zone(zmsg)
+            except Exception as e:
+                rospy.logwarn("[{}] Site bundle: zone '{}' regen failed: {}".format(rospy.get_caller_id(), bz.get('name'), e))
+                continue
+            for metric in ('area', 'length'):
+                rel = bundle_sync.rel_mismatch(getattr(zone.msg, metric), props.get(metric))
+                if rel is not None:
+                    rospy.logwarn("[{}] Site bundle: zone '{}' {} drifted {:.0f}% on regen (stored {} -> regen {}) — mower coverage differs.".format(
+                        rospy.get_caller_id(), bz.get('name'), metric, rel * 100.0, props.get(metric), getattr(zone.msg, metric)))
+            n += 1
+        self.current_zone = None
+        self.save_running_data()
+        rospy.loginfo("[{}] Site bundle: imported {} zone(s) from '{}'.".format(rospy.get_caller_id(), n, site))
+
+    def _bundle_import_programs(self, site):
+        """Rebuild active-map programs from programs.yaml, snapshotting a deep
+        copy (incl. fresh paths) of each regenerated zone by name. Programs for
+        OTHER maps (global pickle) are merged in untouched."""
+        bprogs = vbundle.load_programs(site)
+        active = self.current_navi_map_name
+        zone_by_name = {z.msg.name: z for z in (self.map_data.zones if self.map_data else [])}
+        kept = [p for p in self.permanent_program_list_msg.program_list if p.map_name != active]
+        new_progs = []
+        for pd in bprogs:
+            prg = PlannerProgram()
+            prg.header.frame_id = "map"
+            prg.name = pd.get('name', '') or ''
+            prg.map_name = active
+            prg.speed = pd.get('speed') if pd.get('speed') in ('slow', 'mid', 'fast') else 'mid'
+            prg.rpm = int(pd.get('rpm', 0) or 0)
+            prg.cut_height = int(pd.get('cut_height', 0) or 0)
+            prg.override_zone = bool(pd.get('override_zone', False))
+            prg.last_result = str(pd.get('last_result', '') or '')
+            prg.last_duration_minutes = int(pd.get('last_duration_minutes', 0) or 0)
+            zl = []
+            missing = []
+            for zn in (pd.get('zone_names', []) or []):
+                z = zone_by_name.get(zn)
+                if z is not None:
+                    zl.append(copy.deepcopy(z.msg))
+                else:
+                    missing.append(zn)
+            prg.zone_list = zl
+            prg.area = int(sum(z.area for z in zl))
+            prg.length = int(sum(z.length for z in zl))
+            if missing:
+                rospy.logwarn("[{}] Site bundle: program '{}' references missing zone(s): {}".format(rospy.get_caller_id(), prg.name, missing))
+            new_progs.append(prg)
+        self.permanent_program_list_msg.program_list = kept + new_progs
+        self.save_programs()  # persist merged set to the global pickle
+        rospy.loginfo("[{}] Site bundle: imported {} program(s) from '{}' ({} other-map program(s) kept).".format(
+            rospy.get_caller_id(), len(new_progs), site, len(kept)))
+
+    def _bundle_import_if_newer(self):
+        """bundle-wins: when zones.geojson / programs.yaml are newer than the
+        corresponding pickles, rebuild workspace zones/programs from the bundle.
+        Any error is logged and the pickle state is kept."""
+        site = self._bundle_site()
+        if not site:
+            return
+        try:
+            active = self.current_navi_map_name
+            map_pkl = "/home/vitulus/.vitulus/saves/planner_data/" + active + ".pkl"
+            prog_pkl = os.path.expanduser('~') + '/.vitulus/running/planner_programs.pkl'
+            map_mtime = os.path.getmtime(map_pkl) if exists(map_pkl) else 0.0
+            prog_mtime = os.path.getmtime(prog_pkl) if exists(prog_pkl) else 0.0
+            z_bt = vbundle.file_mtime(site, 'zones')
+            p_bt = vbundle.file_mtime(site, 'programs')
+            zones_newer = z_bt is not None and z_bt > map_mtime
+            programs_newer = p_bt is not None and p_bt > prog_mtime
+            if not (zones_newer or programs_newer):
+                return
+            datum = self._active_map_datum()
+            if datum is None:
+                rospy.logwarn("[{}] Site bundle: newer than pickle but no datum — keeping pickle state.".format(rospy.get_caller_id()))
+                return
+            if zones_newer:
+                if self.map_data is None:
+                    rospy.logwarn("[{}] Site bundle: zones newer but no map raster loaded — skipping zones import.".format(rospy.get_caller_id()))
+                else:
+                    self._bundle_import_zones(site, datum)
+            if programs_newer:
+                self._bundle_import_programs(site)
+            # Republish latched lists after an import.
+            self.map_poly_list_publisher()
+            self.map_zone_list_publisher()
+            self.program_list_publisher()
+        except Exception as e:
+            rospy.logwarn("[{}] Site bundle: import-if-newer failed: {} — keeping pickle state.".format(rospy.get_caller_id(), e))
 
     def callback_program_new(self, msg):
         prg_list = [prg for prg in self.permanent_program_list_msg.program_list if prg.name != msg.name]
@@ -1740,6 +2021,7 @@ class Node:
         # print(self.permanent_program_list_msg)
         self.save_programs()
         self.program_list_publisher()
+        self._bundle_export_programs()
 
     def callback_program_remove(self, msg):
         rospy.loginfo("[{}] Removing program {} from list".format(rospy.get_caller_id(), msg.data))
@@ -1751,6 +2033,7 @@ class Node:
                 break
         self.save_programs()
         self.program_list_publisher()
+        self._bundle_export_programs()
 
 
     def log_publisher(self, log_txt):
