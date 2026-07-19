@@ -1892,7 +1892,18 @@ class Node:
                     continue
                 props = {f: getattr(zmsg, f, None) for f in bundle_sync.ZONE_PROP_FIELDS}
                 bzones.append(bundle_sync.zone_to_bundle(zmsg.name, poly_xy, props, datum))
-            vbundle.save_zones(site, bzones)  # utm_zone from manifest
+            # MERGE export (2026-07-19): the workspace may legitimately hold
+            # fewer zones than the bundle (zones outside current raster coverage
+            # cannot regenerate). Workspace zones win by name; bundle-only zones
+            # are preserved so a partial-coverage session can never clobber the
+            # full garden set.
+            existing = {z.get('name'): z for z in (vbundle.load_zones(site) or [])}
+            for z in bzones:
+                existing[z.get('name')] = z
+            merged = list(existing.values())
+            if not merged:
+                return
+            vbundle.save_zones(site, merged)  # utm_zone from manifest
             rospy.loginfo("[{}] Site bundle: exported {} zone(s) to '{}'.".format(rospy.get_caller_id(), len(bzones), site))
         except Exception as e:
             rospy.logwarn("[{}] Site bundle: zones export failed: {}".format(rospy.get_caller_id(), e))
@@ -1907,11 +1918,17 @@ class Node:
         try:
             progs = []
             for p in self.permanent_program_list_msg.program_list:
-                if p.map_name != self.current_navi_map_name:
-                    continue
+                # NOTE (2026-07-19): no map_name filter. All field programs carry
+                # the legacy tag '2025_06***env*OUTDOOR'; filtering on the active
+                # map exported an EMPTY list on every save and clobbered the
+                # migrated programs.yaml. One garden = one program set.
                 zone_names = [z.name for z in p.zone_list]
                 scalars = {f: getattr(p, f, None) for f in bundle_sync.PROGRAM_SCALAR_FIELDS}
                 progs.append(bundle_sync.program_to_bundle(p.name, zone_names, scalars))
+            if not progs and (vbundle.load_programs(site) or []):
+                rospy.logwarn('[%s] Site bundle: refusing to overwrite non-empty '
+                              'programs.yaml with an EMPTY export.' % rospy.get_caller_id())
+                return
             vbundle.save_programs(site, progs)
             rospy.loginfo("[{}] Site bundle: exported {} program(s) to '{}'.".format(rospy.get_caller_id(), len(progs), site))
         except Exception as e:
