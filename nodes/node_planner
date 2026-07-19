@@ -24,6 +24,7 @@ import copy
 import threading
 import time
 import hashlib
+import json
 import resource
 import sys
 import geopandas as gpd
@@ -83,6 +84,16 @@ class Node:
         # yaml directly (cached); a /navi_manager/site_native rosparam, if set,
         # overrides (lets an operator flip live). See _site_native().
         self._site_native_cached = None
+        # legacy-maps retirement (delegacy 2026-07-19). Mirrors navi_man's
+        # legacy_maps gate (read from the SAME navi_manager.yaml; a
+        # /navi_manager/legacy_maps rosparam overrides). When False, navi_man
+        # publishes active_map='SITE' (constant) and the planner data / bundle
+        # site are keyed on the SERVING mapping-v3 site instead of active_map.
+        self._legacy_maps_cached = None
+        # Currently served mapping-v3 site (name) from /mapping_manager/status.
+        # None until a site is served. Drives planner_data key + bundle site in
+        # site-native mode; a change triggers a planner-data reload for that site.
+        self._served_site = None
 
         # site_native live-refresh (WP-editsync 2026-07-18): keep a PERSISTENT
         # latched subscriber to /mapping_manager/site_map so operator map edits
@@ -113,6 +124,10 @@ class Node:
         self.zone_remove_sub = rospy.Subscriber("/web_plan/remove_zone", String, self.callback_zone_remove)
         self.zone_selected_sub = rospy.Subscriber("/web_plan/selected_zone", String, self.callback_zone_selected)
         self.navi_active_map_sub = rospy.Subscriber("/navi_manager/active_map", String, self.callback_navi_active_map)
+        # Currently served mapping-v3 site (delegacy 2026-07-19). In site-native
+        # mode (legacy_maps=False) active_map is the constant 'SITE', so the
+        # serving-site change — not active_map — drives planner-data reloads.
+        self.mapping_status_sub = rospy.Subscriber("/mapping_manager/status", String, self.callback_mapping_status)
         self.load_planner_data_sub = rospy.Subscriber("/web_plan/load_planner_data", Bool, self.callback_load_planner_data)
         self.save_planner_data_sub = rospy.Subscriber("/web_plan/save_planner_data", Bool, self.callback_save_planner_data)
         self.reload_map_sub = rospy.Subscriber("/web_plan/reload_map", Bool, self.callback_reload_map)
@@ -197,42 +212,82 @@ class Node:
             rospy.loginfo("[{}] Reloading map from /rtabmap/grid_map".format(rospy.get_caller_id()))
 
     def callback_load_planner_data(self, msg):
-        if msg.data:
-            if self.current_navi_map_name != "New":
-                if (exists("/home/vitulus/.vitulus/saves/planner_data/" + self.current_navi_map_name + ".pkl")):
-                    shutil.copyfile("/home/vitulus/.vitulus/saves/planner_data/" + self.current_navi_map_name + ".pkl",
-                                    "/home/vitulus/.vitulus/running/planner_data.pkl")
-                    self.data_loaded = self.load_running_data()
-                    self.log_publisher("Planner data loaded.")
-                    rospy.loginfo("[{}] Planner data loaded.".format(rospy.get_caller_id()))
-                    # site_native (2): rebuild the zone-generation workspace raster
-                    # from the served site raster BEFORE the bundle zone/program
-                    # import, so any zone regen runs against the site free space.
-                    if self.data_loaded:
-                        self._rebuild_map_from_site_grid()
-                    # Bundle-wins: if the site bundle is newer than the just-loaded
-                    # pickles, rebuild zones/programs from it (UTM -> map, regen).
-                    self._bundle_import_if_newer()
-                    self.planner_loaded_pub.publish(String(self.current_navi_map_name))
+        if not msg.data:
+            return
+        if not self._legacy_maps():
+            # ---- site-native (delegacy 2026-07-19): keyed on the SERVED site ----
+            key = self._planner_key()            # served site name, or None
+            if not key:
+                self.log_publisher("No site served yet — planner data unavailable.")
+                rospy.logwarn("[{}] Planner: no site served — cannot load planner "
+                              "data yet (waits for /mapping_manager/status "
+                              "serving.site).".format(rospy.get_caller_id()))
+                return
+            pkl = "/home/vitulus/.vitulus/saves/planner_data/" + key + ".pkl"
+            if exists(pkl):
+                shutil.copyfile(pkl, "/home/vitulus/.vitulus/running/planner_data.pkl")
+                self.data_loaded = self.load_running_data()
+                self.log_publisher("Planner data loaded (site '{}').".format(key))
+                rospy.loginfo("[{}] Planner data loaded for served site '{}'.".format(
+                    rospy.get_caller_id(), key))
             else:
-                self.log_publisher("Not loaded!!! It's a new map. Save it in Navi Manager first.")
-                rospy.logwarn("[{}] Not loaded!!! It's a new map.".format(rospy.get_caller_id()))
+                # No saved planner_data for this site yet — build a fresh workspace
+                # from the served raster below (no legacy pickle to seed it).
+                self.data_loaded = False
+                rospy.loginfo("[{}] Planner: no saved planner_data for served site "
+                              "'{}' — building fresh from the served raster.".format(
+                                  rospy.get_caller_id(), key))
+            # site_native (2): (re)build the zone-generation workspace raster from
+            # the served site_map. This CREATES map_data even when there was no
+            # pickle, so zone regen / bundle import run against the site free space.
+            if self._rebuild_map_from_site_grid():
+                self.data_loaded = True
+            # Bundle-wins: rebuild zones/programs from the site bundle when newer.
+            self._bundle_import_if_newer()
+            self.planner_loaded_pub.publish(String(key))
+            return
+        # ---- legacy path (legacy_maps=True): keyed on active navi map name ----
+        if self.current_navi_map_name != "New":
+            if (exists("/home/vitulus/.vitulus/saves/planner_data/" + self.current_navi_map_name + ".pkl")):
+                shutil.copyfile("/home/vitulus/.vitulus/saves/planner_data/" + self.current_navi_map_name + ".pkl",
+                                "/home/vitulus/.vitulus/running/planner_data.pkl")
+                self.data_loaded = self.load_running_data()
+                self.log_publisher("Planner data loaded.")
+                rospy.loginfo("[{}] Planner data loaded.".format(rospy.get_caller_id()))
+                # site_native (2): rebuild the zone-generation workspace raster
+                # from the served site raster BEFORE the bundle zone/program
+                # import, so any zone regen runs against the site free space.
+                if self.data_loaded:
+                    self._rebuild_map_from_site_grid()
+                # Bundle-wins: if the site bundle is newer than the just-loaded
+                # pickles, rebuild zones/programs from it (UTM -> map, regen).
+                self._bundle_import_if_newer()
+                self.planner_loaded_pub.publish(String(self.current_navi_map_name))
+        else:
+            self.log_publisher("Not loaded!!! It's a new map. Save it in Navi Manager first.")
+            rospy.logwarn("[{}] Not loaded!!! It's a new map.".format(rospy.get_caller_id()))
 
     def callback_save_planner_data(self, msg):
-        if msg.data:
-            if self.current_navi_map_name != "New":
-                self.save_running_data()
-                if (exists("/home/vitulus/.vitulus/running/planner_data.pkl")):
-                    shutil.copyfile("/home/vitulus/.vitulus/running/planner_data.pkl",
-                                    "/home/vitulus/.vitulus/saves/planner_data/" + self.current_navi_map_name + ".pkl")
-                    self.log_publisher("Planner data saved.")
-                    rospy.loginfo("[{}] Planner data saved.".format(rospy.get_caller_id()))
-                    # Mirror zones + programs into the site bundle on explicit save.
-                    self._bundle_export_zones()
-                    self._bundle_export_programs()
-            else:
-                self.log_publisher("Not saved!!! It is a new map. Save it in Navi Manager first.")
-                rospy.logwarn("[{}] Not saved!!! It is a new map.".format(rospy.get_caller_id()))
+        if not msg.data:
+            return
+        # Pickle key: served site in site-native, active navi map name in legacy.
+        key = self._planner_key()
+        if not key or key == "New":
+            self.log_publisher("Not saved!!! No site served / new map. Save it in "
+                               "Navi Manager first.")
+            rospy.logwarn("[{}] Planner data not saved (no served site / new "
+                          "map).".format(rospy.get_caller_id()))
+            return
+        self.save_running_data()
+        if (exists("/home/vitulus/.vitulus/running/planner_data.pkl")):
+            shutil.copyfile("/home/vitulus/.vitulus/running/planner_data.pkl",
+                            "/home/vitulus/.vitulus/saves/planner_data/" + key + ".pkl")
+            self.log_publisher("Planner data saved.")
+            rospy.loginfo("[{}] Planner data saved (key '{}').".format(
+                rospy.get_caller_id(), key))
+            # Mirror zones + programs into the site bundle on explicit save.
+            self._bundle_export_zones()
+            self._bundle_export_programs()
 
     def callback_navi_active_map(self, msg):
         if self.current_navi_map_name is not None:
@@ -1705,7 +1760,9 @@ class Node:
         self.map_data.planner_program_list_msg = PlannerProgramList()
         self.map_data.planner_program_list_msg.header.frame_id = "map"
         self.map_data.planner_program_list_msg.header.stamp = rospy.Time.now()
-        map_name, map_env = self.current_navi_map_name.split("***env*")
+        # delegacy 2026-07-19: active_map is 'SITE' (no ***env* suffix) in
+        # site-native mode — split defensively so this never ValueErrors.
+        map_name = (self.current_navi_map_name or "SITE").split("***env*")[0]
         program = PlannerProgram()
         program.name = "Auto created ({})".format(map_name)
         program.map_name = self.current_navi_map_name
@@ -1823,6 +1880,14 @@ class Node:
         the site name or None. loginfo-once when no site resolves."""
         if not _BUNDLE_OK:
             return None
+        # site-native (legacy_maps=False, delegacy 2026-07-19): the bundle site is
+        # the CURRENTLY SERVED mapping-v3 site (not a manifest.navi_map match on
+        # active_map='SITE'). ~bundle_site still overrides.
+        if not self._legacy_maps():
+            if self._bundle_site_override:
+                return (self._bundle_site_override
+                        if vbundle.site_exists(self._bundle_site_override) else None)
+            return self._served_site
         m = self.current_navi_map_name
         if not m or m == "New":
             return None
@@ -2031,7 +2096,8 @@ class Node:
         if not site:
             return
         try:
-            active = self.current_navi_map_name
+            # site-native: pickle keyed on the served site (active_map is 'SITE').
+            active = self._planner_key() or self.current_navi_map_name
             map_pkl = "/home/vitulus/.vitulus/saves/planner_data/" + active + ".pkl"
             prog_pkl = os.path.expanduser('~') + '/.vitulus/running/planner_programs.pkl'
             map_mtime = os.path.getmtime(map_pkl) if exists(map_pkl) else 0.0
@@ -2084,6 +2150,65 @@ class Node:
                               "({}) — assuming false.".format(rospy.get_caller_id(), e))
             self._site_native_cached = val
         return self._site_native_cached
+
+    def _legacy_maps(self):
+        """legacy_maps flag (delegacy 2026-07-19). Authoritative source is
+        navi_manager.yaml (navi_man owns it, does NOT expose it on the param
+        server); a /navi_manager/legacy_maps rosparam overrides. DEFAULT False
+        (site-native, no legacy navi map). Cached."""
+        ov = rospy.get_param('/navi_manager/legacy_maps', None)
+        if ov is not None:
+            return bool(ov)
+        if self._legacy_maps_cached is None:
+            val = False
+            try:
+                import yaml
+                with open('/home/vitulus/catkin_ws/src/vitulus/vitulus_navi/'
+                          'config/navi_manager.yaml') as f:
+                    cfg = yaml.load(f, Loader=yaml.Loader)
+                val = bool(cfg.get('legacy_maps', False))
+            except Exception as e:
+                rospy.logwarn("[{}] legacy_maps: could not read navi_manager.yaml "
+                              "({}) — assuming false.".format(rospy.get_caller_id(), e))
+            self._legacy_maps_cached = val
+        return self._legacy_maps_cached
+
+    def _planner_key(self):
+        """Base name for the planner_data pickle + the resolved bundle site.
+        site-native (legacy_maps=False): the SERVING mapping-v3 site (decoupled
+        from active_map, which is the constant 'SITE'); may be None until a site
+        is served. Legacy: the active navi map name."""
+        if not self._legacy_maps():
+            return self._served_site
+        return self.current_navi_map_name
+
+    def callback_mapping_status(self, msg):
+        """Track the served mapping-v3 site from /mapping_manager/status. On a
+        serving-site CHANGE (site-native mode) reload the planner data keyed on
+        the new site: swap bundle authority, rebuild the raster from its site_map
+        and import zones/programs. Legacy mode: tracked but inert."""
+        try:
+            data = json.loads(msg.data)
+        except Exception:
+            return
+        serving = data.get('serving') or {}
+        site = serving.get('site') if isinstance(serving, dict) else None
+        if site == self._served_site:
+            return
+        prev = self._served_site
+        self._served_site = site
+        # active_map is 'SITE' constant in site-native, so invalidate the
+        # active-map-keyed bundle cache too (it keys on current_navi_map_name).
+        self._bundle_site_key = None
+        self._bundle_site_cache = None
+        rospy.loginfo("[{}] Served site changed {!r} -> {!r}.".format(
+            rospy.get_caller_id(), prev, site))
+        if self._legacy_maps():
+            return
+        if site and self.current_navi_map_name not in (None,):
+            # Reload planner data for the newly served site (same path a map
+            # change would take). current_navi_map_name stays 'SITE'.
+            self.callback_load_planner_data(Bool(True))
 
     def _rebuild_map_from_site_grid(self):
         """site_native (2): rebuild the workspace raster (map_data.initial_map +
