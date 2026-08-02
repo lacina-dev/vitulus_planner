@@ -7,14 +7,14 @@ from shapely import geometry
 from shapely import affinity
 from shapely import ops
 import random
-from geometry_msgs.msg import Pose, Point, Quaternion, PoseStamped
-from std_msgs.msg import String, Bool
+from geometry_msgs.msg import Pose, Point, Quaternion, PoseStamped, PoseArray, PoseWithCovarianceStamped
+from std_msgs.msg import Int16, String, Bool
 from vitulus_planner.srv import Save_map, Save_mapResponse
 import numpy as np
 import cv2
 from nav_msgs.msg import OccupancyGrid
 import PyKDL as kdl
-from nav_msgs.msg import Path
+from nav_msgs.msg import Odometry, Path
 from geometry_msgs.msg import PolygonStamped, Polygon, Point32
 from vitulus_msgs.msg import MapEditPolygon, MapEditPolygonList, MapEditZone, MapEditZoneList, MapEditMap, PlannerProgramList, PlannerProgram
 from visualization_msgs.msg import Marker, MarkerArray
@@ -25,7 +25,11 @@ import threading
 import time
 import hashlib
 import json
+import resource
 import sys
+import geopandas as gpd
+import matplotlib.pyplot as plt
+from os import listdir
 from os.path import isfile, join, exists
 import shutil
 from node_planner.planner_data import MapData, MapSpec, PathPolygon, Zone
@@ -102,9 +106,6 @@ class Node:
         self._site_map_pending = None       # newest grid awaiting a refresh run
         self._site_map_timer = None         # debounce oneshot rospy.Timer
         self._site_map_worker_active = False
-        # AUDIT #10 (2026-08-01): serialize the site_map refresh worker vs
-        # zone-mutating callbacks (save/remove) — both touch map_data.zones.
-        self._workspace_lock = threading.Lock()
         self._site_map_rerun = False        # a grid arrived mid-run -> run again
         self.site_map_sub = rospy.Subscriber("/mapping_manager/site_map",
                                              OccupancyGrid, self.callback_site_map,
@@ -137,9 +138,15 @@ class Node:
         # self.new_map_sub = rospy.Subscriber("/web_plan/new_map", String, self.callback_new_map)
 
         self.zone_list_pub = rospy.Publisher("/web_plan/zone_list", MapEditZoneList, latch=True, queue_size=1)
+        self.marker_pub = rospy.Publisher("/web_plan/zone_outline_polygons", Marker, queue_size=1)
+        self.marker_zone_path_lines_pub = rospy.Publisher("/web_plan/zone_path_lines", MarkerArray, queue_size=0)
         self.marker_program_paths_pub = rospy.Publisher("/web_plan/program_marker", MarkerArray, queue_size=0)
+        self.coverage_path_pub = rospy.Publisher("/web_plan/coverage_path", Path, queue_size=1)
+        self.outline_path_pub = rospy.Publisher("/web_plan/outline_path", Path, queue_size=1)
+        self.map_assembled_pub = rospy.Publisher("/web_plan/map_assembled", OccupancyGrid, queue_size=1)
         self.map_edited_pub = rospy.Publisher("/web_plan/map_edited", OccupancyGrid, queue_size=1)
         self.program_list_pub = rospy.Publisher("/web_plan/program_list", PlannerProgramList, latch=True, queue_size=10)
+        self.programs_pub = rospy.Publisher("/web_plan/programs", PlannerProgramList, queue_size=10)
         self.program_active_pub = rospy.Publisher("/web_plan/program_active", PlannerProgram, queue_size=1)
         self.program_select_sub = rospy.Subscriber("/web_plan/program_select", String, self.callback_program_select)
         
@@ -295,6 +302,17 @@ class Node:
             self.callback_load_planner_data(Bool(True))
             ## Do something if initiated
 
+    def cv_show(self, np_arr):
+        # plt.imshow(np_arr)
+        # plt.show()
+        np_result_window = 'RESULT'
+        # cv2.namedWindow(np_result_window, cv2.WINDOW_NORMAL)
+        cv2.namedWindow(np_result_window, cv2.WINDOW_AUTOSIZE)
+        # cv2.resizeWindow(np_result_window, self.map_data.height, self.map_data.width)
+        image = np_arr.view(np.uint8)
+        cv2.imshow(np_result_window, image)
+        cv2.waitKey()
+
     # Callback of RtabMap grid_map for initiate planner map
     def callback_map(self, msg):
         print("callback_map")
@@ -328,6 +346,18 @@ class Node:
             np_arr = self.np_show.reshape((self.np_show.size,))
             map_msg.data = np_arr.tolist()
             self.map_show_pub.publish(map_msg)
+
+    def map_assembled_publisher(self):
+        if self.map_data is not None:
+            map_msg = OccupancyGrid()
+            map_msg.header.stamp = rospy.Time.now()
+            map_msg.header.frame_id = "map"
+            map_msg.info = self.map_data.initial_map.info
+            map_msg.info.width = self.map_data.np_assembled.shape[1]
+            map_msg.info.height = self.map_data.np_assembled.shape[0]
+            np_arr = self.map_data.np_assembled.reshape((self.np_show.size,))
+            map_msg.data = np_arr.tolist()
+            self.map_assembled_pub.publish(map_msg)
 
     def map_edited_publisher(self):
         if self.map_data is not None:
@@ -605,8 +635,7 @@ class Node:
         return self.current_zone
 
     def callback_map_save_zone(self, msg):
-        with self._workspace_lock:   # AUDIT #10
-            self._regenerate_zone(msg)
+        self._regenerate_zone(msg)
         self.map_zone_list_publisher()
         # Show zone map
         self.np_show = self.current_zone.np_zone_paths
@@ -622,10 +651,11 @@ class Node:
 
     def callback_zone_remove(self, msg):
         # Remove zone
-        with self._workspace_lock:   # AUDIT #10
-            self.map_data.zones = [z for z in self.map_data.zones
-                                   if z.msg.name != msg.data]
+        for zone in self.map_data.zones:
+            if zone.msg.name == msg.data:
+                self.map_data.zones.remove(zone)
         self.map_zone_list_publisher()
+        # self.create_program()
         # Drop the removed zone from existing programs that referenced it.
         self._remove_zone_from_programs(msg.data)
         self.program_list_publisher()
@@ -799,7 +829,8 @@ class Node:
         return marker
 
     def zone_path_lines_publisher(self):
-        pass   # AUDIT dead-code: publisher removed (no consumers)
+        if self.current_zone is not None:
+            self.marker_zone_path_lines_pub.publish(self.current_zone.zone_path_lines_marker_array)
 
     def program_marker_publisher(self):
         if self.current_program_marker_array is not None:
@@ -919,7 +950,52 @@ class Node:
 
 
 
-    # AUDIT dead-code: zone_outline_poly_publisher removed (publisher deleted, uncalled)
+    def zone_outline_poly_publisher(self):
+        points = []
+        zone = self.current_zone
+        if zone is not None:
+            for poly in zone.path_polygons:
+                poly = poly.polygon.simplify(self.current_zone.msg.simplify, preserve_topology=True)
+                line_start = None
+                for point in shapely.get_coordinates(poly.exterior):
+                    if line_start == None:
+                        line_start = Point32(point[0], point[1], 0)
+                    else:
+                        points.append(line_start)
+                        points.append(Point32(point[0], point[1], 0))
+                        line_start = Point32(point[0], point[1], 0)
+                for inner in poly.interiors:
+                    line_start = None
+                    for point in shapely.get_coordinates(inner):
+                        if line_start == None:
+                            line_start = Point32(point[0], point[1], 0)
+                        else:
+                            points.append(line_start)
+                            points.append(Point32(point[0], point[1], 0))
+                            line_start = Point32(point[0], point[1], 0)
+
+        marker = Marker()
+        marker.header.frame_id = "map"
+        marker.header.stamp = rospy.Time.now()
+        marker.ns = "zone_outline_polys"
+        marker.type = Marker.LINE_LIST
+        marker.id = 0
+        marker.scale.x = 0.03
+        marker.scale.y = 0.03
+        marker.scale.z = 0.03
+        marker.color.r = 0.0
+        marker.color.g = 0.0
+        marker.color.b = 1.0
+        marker.color.a = 1.0
+        marker.pose.position.x = 0
+        marker.pose.position.y = 0
+        marker.pose.position.z = 0
+        marker.pose.orientation.x = 0.0
+        marker.pose.orientation.y = 0.0
+        marker.pose.orientation.z = 0.0
+        marker.pose.orientation.w = 1.0
+        marker.points = points
+        self.marker_pub.publish(marker)
 
     def get_top_level_outline_poly(self):
         polygons = []
@@ -1150,6 +1226,58 @@ class Node:
         for multiline in multilines:
             self.current_zone.np_zone_paths = self.draw_multilines(multiline, self.current_zone.np_zone_paths)
 
+    def connect_near_multilines(self):
+        multilines = self.current_zone.multilines.copy()
+        multilines_new = []
+        multiline_new = []
+        # print("Begin connect near multilines")
+        # print("Multilines: {}".format(len(multilines)))
+        for multiline in multilines:
+            previous_line = None
+            last_line_to_connect = None
+            last_line_to_start = None
+            for line in multiline.geoms:
+                if previous_line is not None:
+                    line_begin = line.coords[0]
+                    angle = round(self.direction(line.coords), 4)
+                    previous_angle = round(self.direction(previous_line.coords), 4)
+                    previous_line_end = geometry.Point(previous_line.coords[-1][0], previous_line.coords[-1][1])
+                    distance = previous_line_end.distance(geometry.Point(line_begin[0], line_begin[1]))
+                    if distance == 0 and previous_angle == angle:
+                        # print("Connect lines")
+                        last_line_to_connect = line
+                        if last_line_to_start is None:
+                            last_line_to_start = previous_line
+                        previous_line = line
+                    else:
+                        # print("Not connect lines")
+                        if last_line_to_connect is not None:
+                            connected_line = geometry.LineString([[last_line_to_start.coords[0][0], last_line_to_start.coords[0][1]],
+                                                                  [last_line_to_connect.coords[-1][0], last_line_to_connect.coords[-1][1]]])
+                            last_line_to_connect = None
+                            last_line_to_start = None
+                            multiline_new.append(connected_line)
+                        else:
+                            multiline_new.append(previous_line)
+                        previous_line = line
+                else:
+                    # print("Previous_line is None")
+                    previous_line = line
+            if last_line_to_connect is not None:
+                connected_line = geometry.LineString([[last_line_to_start.coords[0][0], last_line_to_start.coords[0][1]],
+                                                      [last_line_to_connect.coords[-1][0], last_line_to_connect.coords[-1][1]]])
+                multiline_new.append(connected_line)
+            else:
+                multiline_new.append(previous_line)
+
+            multiline_new = [linec for linec in multiline_new]
+            if multiline_new[0] is not None:
+                multilines_new.append(geometry.MultiLineString(multiline_new))
+            multiline_new = []
+
+
+        return multilines_new
+
     def build_coverage_pass_paths(self, raw_lines, ref_point, first_level_polygons):
         """Greedy ordering of raw coverage lines starting from ref_point.
 
@@ -1337,10 +1465,122 @@ class Node:
         return angle
 
     def zone_coverage_path_msg_publisher(self):
-        pass   # AUDIT dead-code: publisher removed (no consumers)
+        if self.current_zone is not None:
+            self.coverage_path_pub.publish(self.current_zone.path_msg_coverage)
 
     def zone_outline_path_msg_publisher(self):
-        pass   # AUDIT dead-code: publisher removed (no consumers)
+        if self.current_zone is not None:
+            self.outline_path_pub.publish(self.current_zone.path_msg_outline)
+
+    def get_nearest_multiline(self, multiline_in, buff):
+
+        top_level_polygons = self.get_top_level_outline_poly()
+        top_level_polygons = self.filter_list_of_polygons(top_level_polygons)
+
+        def check_cross(start_point, end_point):
+            is_cross = False
+            connection_line = geometry.LineString(
+                            [[start_point.x, start_point.y],
+                             [end_point.x, end_point.y]])
+            for polygon in top_level_polygons:
+                if not is_cross:
+                    is_cross = self.is_crossing_polygon(connection_line, polygon)
+            if not is_cross:
+                is_cross = self.is_crossing_other_multilines(connection_line, self.current_zone.multilines.copy())
+            return is_cross
+
+        multiline_in_start_point = geometry.Point(multiline_in.geoms[0].coords[0][0], multiline_in.geoms[0].coords[0][1])
+        multiline_in_end_point = geometry.Point(multiline_in.geoms[-1].coords[1][0], multiline_in.geoms[-1].coords[1][1])
+        d = 0
+        d_id = 0
+        distance = 9999999
+        nearest_multiline = None
+        connect_to_begin = None
+        if len(buff) > 0:
+            for multilin in buff:
+                if len(multilin.geoms) > 0:
+                    start_point = geometry.Point(multilin.geoms[0].coords[0][0], multilin.geoms[0].coords[0][1])
+                    end_point = geometry.Point(multilin.geoms[-1].coords[1][0], multilin.geoms[-1].coords[1][1])
+
+                    # Find the nearest multiline end or start from buff's multilines starts or ends
+                    if multiline_in_start_point.distance(end_point) < distance:
+                        if not check_cross(multiline_in_start_point, end_point):
+                            distance = multiline_in_start_point.distance(end_point)
+                            d_id = d
+                            nearest_multiline = multilin
+                            connect_to_begin = True
+
+                    if multiline_in_start_point.distance(start_point) < distance:
+                        if not check_cross(multiline_in_start_point, start_point):
+                            distance = multiline_in_start_point.distance(start_point)
+                            d_id = d
+                            nearest_multiline = self.reverse_multiline(multilin)
+                            connect_to_begin = True
+
+                    if multiline_in_end_point.distance(end_point) < distance:
+                        if not check_cross(multiline_in_end_point, end_point):
+                            distance = multiline_in_end_point.distance(end_point)
+                            d_id = d
+                            nearest_multiline = self.reverse_multiline(multilin)
+                            connect_to_begin = False
+
+                    if multiline_in_end_point.distance(start_point) < distance:
+                        if not check_cross(multiline_in_end_point, start_point):
+                            distance = multiline_in_end_point.distance(start_point)
+                            d_id = d
+                            nearest_multiline = multilin
+                            connect_to_begin = False
+                d += 1
+                # print("distance: {}".format(distance))
+        return nearest_multiline, connect_to_begin, d_id
+
+    def interconnect_multilines(self):
+        # print("Interconnecting multilines...")
+        buffer = self.current_zone.multilines.copy()
+        connected_multilines = []
+        new_multiline = []
+        multiline = None
+        while True:
+            if len(buffer) > 0:
+                multiline = buffer.pop(0)
+                nearest_multiline, connect_to_begin, d_id = self.get_nearest_multiline(multiline, buffer)
+                if nearest_multiline is not None:
+                    if connect_to_begin:
+                        for line in nearest_multiline.geoms:
+                            new_multiline.append(line)
+                        new_multiline.append(geometry.LineString(
+                                            [[nearest_multiline.geoms[-1].coords[1][0], nearest_multiline.geoms[-1].coords[1][1]],
+                                             [multiline.geoms[0].coords[0][0], multiline.geoms[0].coords[0][1]]]))
+                        for line in multiline.geoms:
+                            new_multiline.append(line)
+                    else:
+                        for line in multiline.geoms:
+                            new_multiline.append(line)
+                        new_multiline.append(geometry.LineString(
+                                            [[multiline.geoms[-1].coords[1][0], multiline.geoms[-1].coords[1][1]],
+                                             [nearest_multiline.geoms[0].coords[0][0], nearest_multiline.geoms[0].coords[0][1]]]))
+                        for line in nearest_multiline.geoms:
+                            new_multiline.append(line)
+                else:
+                    if len(new_multiline) > 0:
+                        connected_multilines.append(geometry.MultiLineString(new_multiline))
+                        new_multiline = []
+
+            else:
+                if len(new_multiline) > 0:
+                    connected_multilines.append(geometry.MultiLineString(new_multiline))
+                    new_multiline = []
+                else:
+                    connected_multilines.append(geometry.MultiLineString(multiline))
+                break
+        return connected_multilines
+
+    def reverse_multiline(self, multiline):
+        line_list = []
+        for line in multiline.geoms:
+            line_list.append(geometry.LineString([[line.coords[1][0], line.coords[1][1]], [line.coords[0][0], line.coords[0][1]]]))
+        line_list.reverse()
+        return geometry.MultiLineString(line_list)
 
     def draw_multilines(self, multilines, np_coverage):
         # Draw multilines to map
@@ -1349,6 +1589,23 @@ class Node:
                        self.map_data.y_origin + int(y / self.map_data.resolution)] for x, y in zip(*line.coords.xy)]
             np_coverage = cv2.polylines(np_coverage, pts=np.array([points]).astype(np.int32),
                                         isClosed=True, color=180, thickness=1)
+        return np_coverage
+
+    def draw_multilines_and_line(self, multilines, line_in,  np_coverage=None):
+        if np_coverage is None:
+            np_coverage = np.zeros_like(self.map_data.np_original)
+        # Draw multilines to map
+        for multiline in multilines:
+            for line in multiline.geoms:
+                points = [[self.map_data.x_origin + int(x / self.map_data.resolution),
+                           self.map_data.y_origin + int(y / self.map_data.resolution)] for x, y in zip(*line.coords.xy)]
+                np_coverage = cv2.polylines(np_coverage, pts=np.array([points]).astype(np.int32),
+                                             isClosed=True, color=180, thickness=1)
+            points = [[self.map_data.x_origin + int(x / self.map_data.resolution),
+                       self.map_data.y_origin + int(y / self.map_data.resolution)] for x, y in
+                      zip(*line_in.coords.xy)]
+            np_coverage = cv2.polylines(np_coverage, pts=np.array([points]).astype(np.int32),
+                                        isClosed=True, color=110, thickness=2)
         return np_coverage
 
     def save_programs(self):
@@ -1466,6 +1723,13 @@ class Node:
             return False
 
 
+    def is_crossing_polygon(self, geom, polygon):
+        result = False
+        if not polygon.contains(geom):  # Zone polygon
+            result = True
+            return result
+        return result
+
     def is_crossing_polygons(self, geom, polygons):
         result = False
         for polygon in polygons:
@@ -1486,6 +1750,35 @@ class Node:
                         result = True
                         return result
         return result
+
+    def is_crossing_other_multilines(self, conn_line, multilines):
+        result = False
+        for multiline in multilines:
+            sub_conn_line = shapely.ops.substring(conn_line, start_dist=0.00002, end_dist=-0.00001)
+            if multiline.intersects(sub_conn_line):
+                result = True
+                return result
+        return result
+
+    def create_program(self):
+        self.map_data.planner_program_list_msg = PlannerProgramList()
+        self.map_data.planner_program_list_msg.header.frame_id = "map"
+        self.map_data.planner_program_list_msg.header.stamp = rospy.Time.now()
+        # delegacy 2026-07-19: active_map is 'SITE' (no ***env* suffix) in
+        # site-native mode — split defensively so this never ValueErrors.
+        map_name = (self.current_navi_map_name or "SITE").split("***env*")[0]
+        program = PlannerProgram()
+        program.name = "Auto created ({})".format(map_name)
+        program.map_name = self.current_navi_map_name
+        area = 0
+        length = 0
+        for zone in self.map_data.zones:
+            program.zone_list.append(zone.msg)
+            area += zone.msg.area
+            length += zone.msg.length
+        program.area = area
+        program.length = length
+        self.map_data.planner_program_list_msg.program_list.append(program)
 
     def callback_program_select(self, msg):
         if self.permanent_program_list_msg is not None:
@@ -1821,9 +2114,6 @@ class Node:
         # ALL programs regardless of map_name; keeping other-tag programs whose
         # name the bundle also carries would duplicate every legacy-tagged
         # program on each import (and program_select takes the first name hit).
-        # ...and dedupe the bundle list itself by name (last wins) — a pre-fix
-        # export had already written duplicated entries to programs.yaml.
-        bprogs = list({(pd.get('name', '') or ''): pd for pd in bprogs}.values())
         bundle_names = {(pd.get('name', '') or '') for pd in bprogs}
         kept = [p for p in self.permanent_program_list_msg.program_list
                 if p.map_name != active and p.name not in bundle_names]
@@ -2019,7 +2309,6 @@ class Node:
             rospy.logwarn("[{}] site_native: served site_map is empty — keeping "
                           "legacy raster.".format(rospy.get_caller_id()))
             return False
-        prev = self.map_data   # AUDIT #11: restore point (assemble may half-fail)
         try:
             arr = np.array(grid.data, dtype=np.int8).reshape(
                 (grid.info.height, grid.info.width))
@@ -2027,9 +2316,7 @@ class Node:
             if self.map_data is not None:
                 # carry the workspace over the fresh raster: zones/programs are
                 # bundle-owned, polygons + assemble params are operator edits.
-                # AUDIT #11: copy the list — aliasing made error-restore return
-                # a workspace whose zones were already regenerated (shared list)
-                new_map.zones = list(self.map_data.zones)
+                new_map.zones = self.map_data.zones
                 new_map.polygon_msgs = self.map_data.polygon_msgs
                 new_map.planner_program_list_msg = self.map_data.planner_program_list_msg
                 new_map.obstacle_margin = self.map_data.obstacle_margin
@@ -2046,7 +2333,6 @@ class Node:
                               grid.info.height, grid.info.resolution))
             return True
         except Exception as e:
-            self.map_data = prev   # AUDIT #11: drop the half-built workspace
             rospy.logwarn("[{}] site_native: rebuild from site_map failed ({}) — "
                           "keeping legacy raster.".format(rospy.get_caller_id(), e))
             return False
@@ -2137,10 +2423,6 @@ class Node:
             # will rebuild once data is loaded.
             return
         t0 = time.time()
-        with self._workspace_lock:   # AUDIT #10
-            self._do_site_map_refresh_locked(grid, t0)
-
-    def _do_site_map_refresh_locked(self, grid, t0):
         prev_map_data = self.map_data
         try:
             # snapshot zone msgs before the raster swap; _regenerate_zone rebuilds
@@ -2252,12 +2534,13 @@ if __name__ == '__main__':
         signal.signal(signal.SIGINT, signal_handler)
 
         while not rospy.is_shutdown():
-            # AUDIT dead-code (2026-08-01): map_assembled / zone_outline_polygons /
-            # zone_path_lines / coverage_path / outline_path publishers removed —
-            # zero consumers (three.js UI reads map_show/map_data/markers/lists;
-            # RViz config referenced different names). map_edited STAYS: navi_man
-            # subscribes it (callback_web_plan_map).
             node.map_show_publisher()
+            node.map_assembled_publisher()
+
+            node.zone_outline_poly_publisher()
+            node.zone_path_lines_publisher()
+            node.zone_coverage_path_msg_publisher()
+            node.zone_outline_path_msg_publisher()
             if slow_r == slow_id:
                 node.map_edited_publisher()
                 slow_id = 0

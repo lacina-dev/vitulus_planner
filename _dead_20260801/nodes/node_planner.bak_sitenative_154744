@@ -7,25 +7,25 @@ from shapely import geometry
 from shapely import affinity
 from shapely import ops
 import random
-from geometry_msgs.msg import Pose, Point, Quaternion, PoseStamped
-from std_msgs.msg import String, Bool
+from geometry_msgs.msg import Pose, Point, Quaternion, PoseStamped, PoseArray, PoseWithCovarianceStamped
+from std_msgs.msg import Int16, String, Bool
 from vitulus_planner.srv import Save_map, Save_mapResponse
 import numpy as np
 import cv2
 from nav_msgs.msg import OccupancyGrid
 import PyKDL as kdl
-from nav_msgs.msg import Path
+from nav_msgs.msg import Odometry, Path
 from geometry_msgs.msg import PolygonStamped, Polygon, Point32
 from vitulus_msgs.msg import MapEditPolygon, MapEditPolygonList, MapEditZone, MapEditZoneList, MapEditMap, PlannerProgramList, PlannerProgram
 from visualization_msgs.msg import Marker, MarkerArray
 import math
 import pickle
 import copy
-import threading
-import time
-import hashlib
-import json
+import resource
 import sys
+import geopandas as gpd
+import matplotlib.pyplot as plt
+from os import listdir
 from os.path import isfile, join, exists
 import shutil
 from node_planner.planner_data import MapData, MapSpec, PathPolygon, Zone
@@ -75,40 +75,6 @@ class Node:
         self._bundle_site_cache = None          # resolved site for _bundle_site_key
         self._bundle_site_key = None            # navi map the cache was resolved for
         self._bundle_off_logged = False         # loginfo-once when no site resolves
-        # site-native mode (flag-gated, DEFAULT OFF). navi_man owns the flag in
-        # navi_manager.yaml and does NOT push it to the param server, so read the
-        # yaml directly (cached); a /navi_manager/site_native rosparam, if set,
-        # overrides (lets an operator flip live). See _site_native().
-        self._site_native_cached = None
-        # legacy-maps retirement (delegacy 2026-07-19). Mirrors navi_man's
-        # legacy_maps gate (read from the SAME navi_manager.yaml; a
-        # /navi_manager/legacy_maps rosparam overrides). When False, navi_man
-        # publishes active_map='SITE' (constant) and the planner data / bundle
-        # site are keyed on the SERVING mapping-v3 site instead of active_map.
-        self._legacy_maps_cached = None
-        # Currently served mapping-v3 site (name) from /mapping_manager/status.
-        # None until a site is served. Drives planner_data key + bundle site in
-        # site-native mode; a change triggers a planner-data reload for that site.
-        self._served_site = None
-
-        # site_native live-refresh (WP-editsync 2026-07-18): keep a PERSISTENT
-        # latched subscriber to /mapping_manager/site_map so operator map edits
-        # (obstacle/free/wall composited by mapping_manager) rebuild the planner
-        # workspace AND regenerate every zone live — no map reload needed. State
-        # for debounce + single-worker coalescing (see callback_site_map). All
-        # gated on _site_native(); when the flag is off the callback is a no-op.
-        self._site_map_lock = threading.Lock()
-        self._site_map_last_fp = None       # fingerprint of last grid SEEN (dedup)
-        self._site_map_pending = None       # newest grid awaiting a refresh run
-        self._site_map_timer = None         # debounce oneshot rospy.Timer
-        self._site_map_worker_active = False
-        # AUDIT #10 (2026-08-01): serialize the site_map refresh worker vs
-        # zone-mutating callbacks (save/remove) — both touch map_data.zones.
-        self._workspace_lock = threading.Lock()
-        self._site_map_rerun = False        # a grid arrived mid-run -> run again
-        self.site_map_sub = rospy.Subscriber("/mapping_manager/site_map",
-                                             OccupancyGrid, self.callback_site_map,
-                                             queue_size=1)
 
         self.reload_sub = rospy.Subscriber("/web_plan/reload", Bool, self.callback_reload)
         self.map_sub = rospy.Subscriber("/rtabmap/grid_map", OccupancyGrid, self.callback_map)
@@ -123,10 +89,6 @@ class Node:
         self.zone_remove_sub = rospy.Subscriber("/web_plan/remove_zone", String, self.callback_zone_remove)
         self.zone_selected_sub = rospy.Subscriber("/web_plan/selected_zone", String, self.callback_zone_selected)
         self.navi_active_map_sub = rospy.Subscriber("/navi_manager/active_map", String, self.callback_navi_active_map)
-        # Currently served mapping-v3 site (delegacy 2026-07-19). In site-native
-        # mode (legacy_maps=False) active_map is the constant 'SITE', so the
-        # serving-site change — not active_map — drives planner-data reloads.
-        self.mapping_status_sub = rospy.Subscriber("/mapping_manager/status", String, self.callback_mapping_status)
         self.load_planner_data_sub = rospy.Subscriber("/web_plan/load_planner_data", Bool, self.callback_load_planner_data)
         self.save_planner_data_sub = rospy.Subscriber("/web_plan/save_planner_data", Bool, self.callback_save_planner_data)
         self.reload_map_sub = rospy.Subscriber("/web_plan/reload_map", Bool, self.callback_reload_map)
@@ -137,9 +99,15 @@ class Node:
         # self.new_map_sub = rospy.Subscriber("/web_plan/new_map", String, self.callback_new_map)
 
         self.zone_list_pub = rospy.Publisher("/web_plan/zone_list", MapEditZoneList, latch=True, queue_size=1)
+        self.marker_pub = rospy.Publisher("/web_plan/zone_outline_polygons", Marker, queue_size=1)
+        self.marker_zone_path_lines_pub = rospy.Publisher("/web_plan/zone_path_lines", MarkerArray, queue_size=0)
         self.marker_program_paths_pub = rospy.Publisher("/web_plan/program_marker", MarkerArray, queue_size=0)
+        self.coverage_path_pub = rospy.Publisher("/web_plan/coverage_path", Path, queue_size=1)
+        self.outline_path_pub = rospy.Publisher("/web_plan/outline_path", Path, queue_size=1)
+        self.map_assembled_pub = rospy.Publisher("/web_plan/map_assembled", OccupancyGrid, queue_size=1)
         self.map_edited_pub = rospy.Publisher("/web_plan/map_edited", OccupancyGrid, queue_size=1)
         self.program_list_pub = rospy.Publisher("/web_plan/program_list", PlannerProgramList, latch=True, queue_size=10)
+        self.programs_pub = rospy.Publisher("/web_plan/programs", PlannerProgramList, queue_size=10)
         self.program_active_pub = rospy.Publisher("/web_plan/program_active", PlannerProgram, queue_size=1)
         self.program_select_sub = rospy.Subscriber("/web_plan/program_select", String, self.callback_program_select)
         
@@ -205,82 +173,37 @@ class Node:
             rospy.loginfo("[{}] Reloading map from /rtabmap/grid_map".format(rospy.get_caller_id()))
 
     def callback_load_planner_data(self, msg):
-        if not msg.data:
-            return
-        if not self._legacy_maps():
-            # ---- site-native (delegacy 2026-07-19): keyed on the SERVED site ----
-            key = self._planner_key()            # served site name, or None
-            if not key:
-                self.log_publisher("No site served yet — planner data unavailable.")
-                rospy.logwarn("[{}] Planner: no site served — cannot load planner "
-                              "data yet (waits for /mapping_manager/status "
-                              "serving.site).".format(rospy.get_caller_id()))
-                return
-            pkl = "/home/vitulus/.vitulus/saves/planner_data/" + key + ".pkl"
-            if exists(pkl):
-                shutil.copyfile(pkl, "/home/vitulus/.vitulus/running/planner_data.pkl")
-                self.data_loaded = self.load_running_data()
-                self.log_publisher("Planner data loaded (site '{}').".format(key))
-                rospy.loginfo("[{}] Planner data loaded for served site '{}'.".format(
-                    rospy.get_caller_id(), key))
+        if msg.data:
+            if self.current_navi_map_name != "New":
+                if (exists("/home/vitulus/.vitulus/saves/planner_data/" + self.current_navi_map_name + ".pkl")):
+                    shutil.copyfile("/home/vitulus/.vitulus/saves/planner_data/" + self.current_navi_map_name + ".pkl",
+                                    "/home/vitulus/.vitulus/running/planner_data.pkl")
+                    self.data_loaded = self.load_running_data()
+                    self.log_publisher("Planner data loaded.")
+                    rospy.loginfo("[{}] Planner data loaded.".format(rospy.get_caller_id()))
+                    # Bundle-wins: if the site bundle is newer than the just-loaded
+                    # pickles, rebuild zones/programs from it (UTM -> map, regen).
+                    self._bundle_import_if_newer()
+                    self.planner_loaded_pub.publish(String(self.current_navi_map_name))
             else:
-                # No saved planner_data for this site yet — build a fresh workspace
-                # from the served raster below (no legacy pickle to seed it).
-                self.data_loaded = False
-                rospy.loginfo("[{}] Planner: no saved planner_data for served site "
-                              "'{}' — building fresh from the served raster.".format(
-                                  rospy.get_caller_id(), key))
-            # site_native (2): (re)build the zone-generation workspace raster from
-            # the served site_map. This CREATES map_data even when there was no
-            # pickle, so zone regen / bundle import run against the site free space.
-            if self._rebuild_map_from_site_grid():
-                self.data_loaded = True
-            # Bundle-wins: rebuild zones/programs from the site bundle when newer.
-            self._bundle_import_if_newer()
-            self.planner_loaded_pub.publish(String(key))
-            return
-        # ---- legacy path (legacy_maps=True): keyed on active navi map name ----
-        if self.current_navi_map_name != "New":
-            if (exists("/home/vitulus/.vitulus/saves/planner_data/" + self.current_navi_map_name + ".pkl")):
-                shutil.copyfile("/home/vitulus/.vitulus/saves/planner_data/" + self.current_navi_map_name + ".pkl",
-                                "/home/vitulus/.vitulus/running/planner_data.pkl")
-                self.data_loaded = self.load_running_data()
-                self.log_publisher("Planner data loaded.")
-                rospy.loginfo("[{}] Planner data loaded.".format(rospy.get_caller_id()))
-                # site_native (2): rebuild the zone-generation workspace raster
-                # from the served site raster BEFORE the bundle zone/program
-                # import, so any zone regen runs against the site free space.
-                if self.data_loaded:
-                    self._rebuild_map_from_site_grid()
-                # Bundle-wins: if the site bundle is newer than the just-loaded
-                # pickles, rebuild zones/programs from it (UTM -> map, regen).
-                self._bundle_import_if_newer()
-                self.planner_loaded_pub.publish(String(self.current_navi_map_name))
-        else:
-            self.log_publisher("Not loaded!!! It's a new map. Save it in Navi Manager first.")
-            rospy.logwarn("[{}] Not loaded!!! It's a new map.".format(rospy.get_caller_id()))
+                self.log_publisher("Not loaded!!! It's a new map. Save it in Navi Manager first.")
+                rospy.logwarn("[{}] Not loaded!!! It's a new map.".format(rospy.get_caller_id()))
 
     def callback_save_planner_data(self, msg):
-        if not msg.data:
-            return
-        # Pickle key: served site in site-native, active navi map name in legacy.
-        key = self._planner_key()
-        if not key or key == "New":
-            self.log_publisher("Not saved!!! No site served / new map. Save it in "
-                               "Navi Manager first.")
-            rospy.logwarn("[{}] Planner data not saved (no served site / new "
-                          "map).".format(rospy.get_caller_id()))
-            return
-        self.save_running_data()
-        if (exists("/home/vitulus/.vitulus/running/planner_data.pkl")):
-            shutil.copyfile("/home/vitulus/.vitulus/running/planner_data.pkl",
-                            "/home/vitulus/.vitulus/saves/planner_data/" + key + ".pkl")
-            self.log_publisher("Planner data saved.")
-            rospy.loginfo("[{}] Planner data saved (key '{}').".format(
-                rospy.get_caller_id(), key))
-            # Mirror zones + programs into the site bundle on explicit save.
-            self._bundle_export_zones()
-            self._bundle_export_programs()
+        if msg.data:
+            if self.current_navi_map_name != "New":
+                self.save_running_data()
+                if (exists("/home/vitulus/.vitulus/running/planner_data.pkl")):
+                    shutil.copyfile("/home/vitulus/.vitulus/running/planner_data.pkl",
+                                    "/home/vitulus/.vitulus/saves/planner_data/" + self.current_navi_map_name + ".pkl")
+                    self.log_publisher("Planner data saved.")
+                    rospy.loginfo("[{}] Planner data saved.".format(rospy.get_caller_id()))
+                    # Mirror zones + programs into the site bundle on explicit save.
+                    self._bundle_export_zones()
+                    self._bundle_export_programs()
+            else:
+                self.log_publisher("Not saved!!! It is a new map. Save it in Navi Manager first.")
+                rospy.logwarn("[{}] Not saved!!! It is a new map.".format(rospy.get_caller_id()))
 
     def callback_navi_active_map(self, msg):
         if self.current_navi_map_name is not None:
@@ -294,6 +217,17 @@ class Node:
             print("Map changed to: {}".format(self.current_navi_map_name))
             self.callback_load_planner_data(Bool(True))
             ## Do something if initiated
+
+    def cv_show(self, np_arr):
+        # plt.imshow(np_arr)
+        # plt.show()
+        np_result_window = 'RESULT'
+        # cv2.namedWindow(np_result_window, cv2.WINDOW_NORMAL)
+        cv2.namedWindow(np_result_window, cv2.WINDOW_AUTOSIZE)
+        # cv2.resizeWindow(np_result_window, self.map_data.height, self.map_data.width)
+        image = np_arr.view(np.uint8)
+        cv2.imshow(np_result_window, image)
+        cv2.waitKey()
 
     # Callback of RtabMap grid_map for initiate planner map
     def callback_map(self, msg):
@@ -328,6 +262,18 @@ class Node:
             np_arr = self.np_show.reshape((self.np_show.size,))
             map_msg.data = np_arr.tolist()
             self.map_show_pub.publish(map_msg)
+
+    def map_assembled_publisher(self):
+        if self.map_data is not None:
+            map_msg = OccupancyGrid()
+            map_msg.header.stamp = rospy.Time.now()
+            map_msg.header.frame_id = "map"
+            map_msg.info = self.map_data.initial_map.info
+            map_msg.info.width = self.map_data.np_assembled.shape[1]
+            map_msg.info.height = self.map_data.np_assembled.shape[0]
+            np_arr = self.map_data.np_assembled.reshape((self.np_show.size,))
+            map_msg.data = np_arr.tolist()
+            self.map_assembled_pub.publish(map_msg)
 
     def map_edited_publisher(self):
         if self.map_data is not None:
@@ -605,8 +551,7 @@ class Node:
         return self.current_zone
 
     def callback_map_save_zone(self, msg):
-        with self._workspace_lock:   # AUDIT #10
-            self._regenerate_zone(msg)
+        self._regenerate_zone(msg)
         self.map_zone_list_publisher()
         # Show zone map
         self.np_show = self.current_zone.np_zone_paths
@@ -622,10 +567,11 @@ class Node:
 
     def callback_zone_remove(self, msg):
         # Remove zone
-        with self._workspace_lock:   # AUDIT #10
-            self.map_data.zones = [z for z in self.map_data.zones
-                                   if z.msg.name != msg.data]
+        for zone in self.map_data.zones:
+            if zone.msg.name == msg.data:
+                self.map_data.zones.remove(zone)
         self.map_zone_list_publisher()
+        # self.create_program()
         # Drop the removed zone from existing programs that referenced it.
         self._remove_zone_from_programs(msg.data)
         self.program_list_publisher()
@@ -633,10 +579,6 @@ class Node:
         self.np_show = self.map_data.np_assembled
         self.log_publisher("Zone {} removed.".format(msg.data))
         self.save_running_data()
-        # AUDIT A2 (2026-08-01): the merge export below preserves bundle-only
-        # zones BY DESIGN, so a plain export would resurrect the deleted zone on
-        # the next import. Delete it from the bundle file explicitly first.
-        self._bundle_remove_zone(msg.data)
         # Reflect the removal in the site bundle.
         self._bundle_export_zones()
 
@@ -799,7 +741,8 @@ class Node:
         return marker
 
     def zone_path_lines_publisher(self):
-        pass   # AUDIT dead-code: publisher removed (no consumers)
+        if self.current_zone is not None:
+            self.marker_zone_path_lines_pub.publish(self.current_zone.zone_path_lines_marker_array)
 
     def program_marker_publisher(self):
         if self.current_program_marker_array is not None:
@@ -919,7 +862,52 @@ class Node:
 
 
 
-    # AUDIT dead-code: zone_outline_poly_publisher removed (publisher deleted, uncalled)
+    def zone_outline_poly_publisher(self):
+        points = []
+        zone = self.current_zone
+        if zone is not None:
+            for poly in zone.path_polygons:
+                poly = poly.polygon.simplify(self.current_zone.msg.simplify, preserve_topology=True)
+                line_start = None
+                for point in shapely.get_coordinates(poly.exterior):
+                    if line_start == None:
+                        line_start = Point32(point[0], point[1], 0)
+                    else:
+                        points.append(line_start)
+                        points.append(Point32(point[0], point[1], 0))
+                        line_start = Point32(point[0], point[1], 0)
+                for inner in poly.interiors:
+                    line_start = None
+                    for point in shapely.get_coordinates(inner):
+                        if line_start == None:
+                            line_start = Point32(point[0], point[1], 0)
+                        else:
+                            points.append(line_start)
+                            points.append(Point32(point[0], point[1], 0))
+                            line_start = Point32(point[0], point[1], 0)
+
+        marker = Marker()
+        marker.header.frame_id = "map"
+        marker.header.stamp = rospy.Time.now()
+        marker.ns = "zone_outline_polys"
+        marker.type = Marker.LINE_LIST
+        marker.id = 0
+        marker.scale.x = 0.03
+        marker.scale.y = 0.03
+        marker.scale.z = 0.03
+        marker.color.r = 0.0
+        marker.color.g = 0.0
+        marker.color.b = 1.0
+        marker.color.a = 1.0
+        marker.pose.position.x = 0
+        marker.pose.position.y = 0
+        marker.pose.position.z = 0
+        marker.pose.orientation.x = 0.0
+        marker.pose.orientation.y = 0.0
+        marker.pose.orientation.z = 0.0
+        marker.pose.orientation.w = 1.0
+        marker.points = points
+        self.marker_pub.publish(marker)
 
     def get_top_level_outline_poly(self):
         polygons = []
@@ -1150,6 +1138,58 @@ class Node:
         for multiline in multilines:
             self.current_zone.np_zone_paths = self.draw_multilines(multiline, self.current_zone.np_zone_paths)
 
+    def connect_near_multilines(self):
+        multilines = self.current_zone.multilines.copy()
+        multilines_new = []
+        multiline_new = []
+        # print("Begin connect near multilines")
+        # print("Multilines: {}".format(len(multilines)))
+        for multiline in multilines:
+            previous_line = None
+            last_line_to_connect = None
+            last_line_to_start = None
+            for line in multiline.geoms:
+                if previous_line is not None:
+                    line_begin = line.coords[0]
+                    angle = round(self.direction(line.coords), 4)
+                    previous_angle = round(self.direction(previous_line.coords), 4)
+                    previous_line_end = geometry.Point(previous_line.coords[-1][0], previous_line.coords[-1][1])
+                    distance = previous_line_end.distance(geometry.Point(line_begin[0], line_begin[1]))
+                    if distance == 0 and previous_angle == angle:
+                        # print("Connect lines")
+                        last_line_to_connect = line
+                        if last_line_to_start is None:
+                            last_line_to_start = previous_line
+                        previous_line = line
+                    else:
+                        # print("Not connect lines")
+                        if last_line_to_connect is not None:
+                            connected_line = geometry.LineString([[last_line_to_start.coords[0][0], last_line_to_start.coords[0][1]],
+                                                                  [last_line_to_connect.coords[-1][0], last_line_to_connect.coords[-1][1]]])
+                            last_line_to_connect = None
+                            last_line_to_start = None
+                            multiline_new.append(connected_line)
+                        else:
+                            multiline_new.append(previous_line)
+                        previous_line = line
+                else:
+                    # print("Previous_line is None")
+                    previous_line = line
+            if last_line_to_connect is not None:
+                connected_line = geometry.LineString([[last_line_to_start.coords[0][0], last_line_to_start.coords[0][1]],
+                                                      [last_line_to_connect.coords[-1][0], last_line_to_connect.coords[-1][1]]])
+                multiline_new.append(connected_line)
+            else:
+                multiline_new.append(previous_line)
+
+            multiline_new = [linec for linec in multiline_new]
+            if multiline_new[0] is not None:
+                multilines_new.append(geometry.MultiLineString(multiline_new))
+            multiline_new = []
+
+
+        return multilines_new
+
     def build_coverage_pass_paths(self, raw_lines, ref_point, first_level_polygons):
         """Greedy ordering of raw coverage lines starting from ref_point.
 
@@ -1337,10 +1377,122 @@ class Node:
         return angle
 
     def zone_coverage_path_msg_publisher(self):
-        pass   # AUDIT dead-code: publisher removed (no consumers)
+        if self.current_zone is not None:
+            self.coverage_path_pub.publish(self.current_zone.path_msg_coverage)
 
     def zone_outline_path_msg_publisher(self):
-        pass   # AUDIT dead-code: publisher removed (no consumers)
+        if self.current_zone is not None:
+            self.outline_path_pub.publish(self.current_zone.path_msg_outline)
+
+    def get_nearest_multiline(self, multiline_in, buff):
+
+        top_level_polygons = self.get_top_level_outline_poly()
+        top_level_polygons = self.filter_list_of_polygons(top_level_polygons)
+
+        def check_cross(start_point, end_point):
+            is_cross = False
+            connection_line = geometry.LineString(
+                            [[start_point.x, start_point.y],
+                             [end_point.x, end_point.y]])
+            for polygon in top_level_polygons:
+                if not is_cross:
+                    is_cross = self.is_crossing_polygon(connection_line, polygon)
+            if not is_cross:
+                is_cross = self.is_crossing_other_multilines(connection_line, self.current_zone.multilines.copy())
+            return is_cross
+
+        multiline_in_start_point = geometry.Point(multiline_in.geoms[0].coords[0][0], multiline_in.geoms[0].coords[0][1])
+        multiline_in_end_point = geometry.Point(multiline_in.geoms[-1].coords[1][0], multiline_in.geoms[-1].coords[1][1])
+        d = 0
+        d_id = 0
+        distance = 9999999
+        nearest_multiline = None
+        connect_to_begin = None
+        if len(buff) > 0:
+            for multilin in buff:
+                if len(multilin.geoms) > 0:
+                    start_point = geometry.Point(multilin.geoms[0].coords[0][0], multilin.geoms[0].coords[0][1])
+                    end_point = geometry.Point(multilin.geoms[-1].coords[1][0], multilin.geoms[-1].coords[1][1])
+
+                    # Find the nearest multiline end or start from buff's multilines starts or ends
+                    if multiline_in_start_point.distance(end_point) < distance:
+                        if not check_cross(multiline_in_start_point, end_point):
+                            distance = multiline_in_start_point.distance(end_point)
+                            d_id = d
+                            nearest_multiline = multilin
+                            connect_to_begin = True
+
+                    if multiline_in_start_point.distance(start_point) < distance:
+                        if not check_cross(multiline_in_start_point, start_point):
+                            distance = multiline_in_start_point.distance(start_point)
+                            d_id = d
+                            nearest_multiline = self.reverse_multiline(multilin)
+                            connect_to_begin = True
+
+                    if multiline_in_end_point.distance(end_point) < distance:
+                        if not check_cross(multiline_in_end_point, end_point):
+                            distance = multiline_in_end_point.distance(end_point)
+                            d_id = d
+                            nearest_multiline = self.reverse_multiline(multilin)
+                            connect_to_begin = False
+
+                    if multiline_in_end_point.distance(start_point) < distance:
+                        if not check_cross(multiline_in_end_point, start_point):
+                            distance = multiline_in_end_point.distance(start_point)
+                            d_id = d
+                            nearest_multiline = multilin
+                            connect_to_begin = False
+                d += 1
+                # print("distance: {}".format(distance))
+        return nearest_multiline, connect_to_begin, d_id
+
+    def interconnect_multilines(self):
+        # print("Interconnecting multilines...")
+        buffer = self.current_zone.multilines.copy()
+        connected_multilines = []
+        new_multiline = []
+        multiline = None
+        while True:
+            if len(buffer) > 0:
+                multiline = buffer.pop(0)
+                nearest_multiline, connect_to_begin, d_id = self.get_nearest_multiline(multiline, buffer)
+                if nearest_multiline is not None:
+                    if connect_to_begin:
+                        for line in nearest_multiline.geoms:
+                            new_multiline.append(line)
+                        new_multiline.append(geometry.LineString(
+                                            [[nearest_multiline.geoms[-1].coords[1][0], nearest_multiline.geoms[-1].coords[1][1]],
+                                             [multiline.geoms[0].coords[0][0], multiline.geoms[0].coords[0][1]]]))
+                        for line in multiline.geoms:
+                            new_multiline.append(line)
+                    else:
+                        for line in multiline.geoms:
+                            new_multiline.append(line)
+                        new_multiline.append(geometry.LineString(
+                                            [[multiline.geoms[-1].coords[1][0], multiline.geoms[-1].coords[1][1]],
+                                             [nearest_multiline.geoms[0].coords[0][0], nearest_multiline.geoms[0].coords[0][1]]]))
+                        for line in nearest_multiline.geoms:
+                            new_multiline.append(line)
+                else:
+                    if len(new_multiline) > 0:
+                        connected_multilines.append(geometry.MultiLineString(new_multiline))
+                        new_multiline = []
+
+            else:
+                if len(new_multiline) > 0:
+                    connected_multilines.append(geometry.MultiLineString(new_multiline))
+                    new_multiline = []
+                else:
+                    connected_multilines.append(geometry.MultiLineString(multiline))
+                break
+        return connected_multilines
+
+    def reverse_multiline(self, multiline):
+        line_list = []
+        for line in multiline.geoms:
+            line_list.append(geometry.LineString([[line.coords[1][0], line.coords[1][1]], [line.coords[0][0], line.coords[0][1]]]))
+        line_list.reverse()
+        return geometry.MultiLineString(line_list)
 
     def draw_multilines(self, multilines, np_coverage):
         # Draw multilines to map
@@ -1349,6 +1501,23 @@ class Node:
                        self.map_data.y_origin + int(y / self.map_data.resolution)] for x, y in zip(*line.coords.xy)]
             np_coverage = cv2.polylines(np_coverage, pts=np.array([points]).astype(np.int32),
                                         isClosed=True, color=180, thickness=1)
+        return np_coverage
+
+    def draw_multilines_and_line(self, multilines, line_in,  np_coverage=None):
+        if np_coverage is None:
+            np_coverage = np.zeros_like(self.map_data.np_original)
+        # Draw multilines to map
+        for multiline in multilines:
+            for line in multiline.geoms:
+                points = [[self.map_data.x_origin + int(x / self.map_data.resolution),
+                           self.map_data.y_origin + int(y / self.map_data.resolution)] for x, y in zip(*line.coords.xy)]
+                np_coverage = cv2.polylines(np_coverage, pts=np.array([points]).astype(np.int32),
+                                             isClosed=True, color=180, thickness=1)
+            points = [[self.map_data.x_origin + int(x / self.map_data.resolution),
+                       self.map_data.y_origin + int(y / self.map_data.resolution)] for x, y in
+                      zip(*line_in.coords.xy)]
+            np_coverage = cv2.polylines(np_coverage, pts=np.array([points]).astype(np.int32),
+                                        isClosed=True, color=110, thickness=2)
         return np_coverage
 
     def save_programs(self):
@@ -1466,6 +1635,13 @@ class Node:
             return False
 
 
+    def is_crossing_polygon(self, geom, polygon):
+        result = False
+        if not polygon.contains(geom):  # Zone polygon
+            result = True
+            return result
+        return result
+
     def is_crossing_polygons(self, geom, polygons):
         result = False
         for polygon in polygons:
@@ -1486,6 +1662,33 @@ class Node:
                         result = True
                         return result
         return result
+
+    def is_crossing_other_multilines(self, conn_line, multilines):
+        result = False
+        for multiline in multilines:
+            sub_conn_line = shapely.ops.substring(conn_line, start_dist=0.00002, end_dist=-0.00001)
+            if multiline.intersects(sub_conn_line):
+                result = True
+                return result
+        return result
+
+    def create_program(self):
+        self.map_data.planner_program_list_msg = PlannerProgramList()
+        self.map_data.planner_program_list_msg.header.frame_id = "map"
+        self.map_data.planner_program_list_msg.header.stamp = rospy.Time.now()
+        map_name, map_env = self.current_navi_map_name.split("***env*")
+        program = PlannerProgram()
+        program.name = "Auto created ({})".format(map_name)
+        program.map_name = self.current_navi_map_name
+        area = 0
+        length = 0
+        for zone in self.map_data.zones:
+            program.zone_list.append(zone.msg)
+            area += zone.msg.area
+            length += zone.msg.length
+        program.area = area
+        program.length = length
+        self.map_data.planner_program_list_msg.program_list.append(program)
 
     def callback_program_select(self, msg):
         if self.permanent_program_list_msg is not None:
@@ -1591,14 +1794,6 @@ class Node:
         the site name or None. loginfo-once when no site resolves."""
         if not _BUNDLE_OK:
             return None
-        # site-native (legacy_maps=False, delegacy 2026-07-19): the bundle site is
-        # the CURRENTLY SERVED mapping-v3 site (not a manifest.navi_map match on
-        # active_map='SITE'). ~bundle_site still overrides.
-        if not self._legacy_maps():
-            if self._bundle_site_override:
-                return (self._bundle_site_override
-                        if vbundle.site_exists(self._bundle_site_override) else None)
-            return self._served_site
         m = self.current_navi_map_name
         if not m or m == "New":
             return None
@@ -1668,70 +1863,10 @@ class Node:
                     continue
                 props = {f: getattr(zmsg, f, None) for f in bundle_sync.ZONE_PROP_FIELDS}
                 bzones.append(bundle_sync.zone_to_bundle(zmsg.name, poly_xy, props, datum))
-            # MERGE export (2026-07-19): the workspace may legitimately hold
-            # fewer zones than the bundle (zones outside current raster coverage
-            # cannot regenerate). Workspace zones win by name; bundle-only zones
-            # are preserved so a partial-coverage session can never clobber the
-            # full garden set.
-            existing = {z.get('name'): z for z in (vbundle.load_zones(site) or [])}
-            for z in bzones:
-                existing[z.get('name')] = z
-            merged = list(existing.values())
-            if not merged:
-                return
-            vbundle.save_zones(site, merged)  # utm_zone from manifest
-            self._touch_bundle_stamp(site, 'zones')  # own write != external edit (A4)
+            vbundle.save_zones(site, bzones)  # utm_zone from manifest
             rospy.loginfo("[{}] Site bundle: exported {} zone(s) to '{}'.".format(rospy.get_caller_id(), len(bzones), site))
         except Exception as e:
             rospy.logwarn("[{}] Site bundle: zones export failed: {}".format(rospy.get_caller_id(), e))
-
-    def _bundle_remove_zone(self, name):
-        """AUDIT A2 (2026-08-01): explicit delete path for the merge-export
-        world. Removes the zone by name from zones.geojson so the by-name merge
-        (which intentionally preserves bundle-only zones) cannot bring it back."""
-        site = self._bundle_site()
-        if not site:
-            return
-        try:
-            existing = vbundle.load_zones(site) or []
-            kept = [z for z in existing if z.get('name') != name]
-            if len(kept) == len(existing):
-                return
-            vbundle.save_zones(site, kept)
-            self._touch_bundle_stamp(site, 'zones')
-            rospy.loginfo("[{}] Site bundle: zone '{}' DELETED from '{}'.".format(
-                rospy.get_caller_id(), name, site))
-        except Exception as e:
-            rospy.logwarn("[{}] Site bundle: zone delete failed: {}".format(
-                rospy.get_caller_id(), e))
-
-    # AUDIT A4 (2026-08-01): the old freshness test compared bundle mtimes to
-    # saves/<key>.pkl, which normal operation never touches -> the bundle was
-    # perpetually "newer" and EVERY load re-imported + regenerated all zones.
-    # A stamp file records the bundle mtime last seen by an import OR written
-    # by our own export, so re-import happens only on genuinely external edits.
-    _BUNDLE_STAMP = os.path.expanduser('~') + '/.vitulus/running/bundle_import_stamp.json'
-
-    def _bundle_stamp_get(self, site, kind):
-        try:
-            with open(self._BUNDLE_STAMP) as f:
-                return float(json.load(f).get(site, {}).get(kind, 0.0))
-        except Exception:
-            return 0.0
-
-    def _touch_bundle_stamp(self, site, kind):
-        try:
-            data = {}
-            if exists(self._BUNDLE_STAMP):
-                with open(self._BUNDLE_STAMP) as f:
-                    data = json.load(f)
-            t = vbundle.file_mtime(site, kind)
-            data.setdefault(site, {})[kind] = t if t is not None else time.time()
-            with open(self._BUNDLE_STAMP, 'w') as f:
-                json.dump(data, f)
-        except Exception as e:
-            rospy.logwarn_throttle(60.0, "[{}] bundle stamp write failed: {}".format(
-                rospy.get_caller_id(), e))
 
     def _bundle_export_programs(self):
         """Mirror active-map programs into programs.yaml (metadata + zone_names).
@@ -1743,19 +1878,12 @@ class Node:
         try:
             progs = []
             for p in self.permanent_program_list_msg.program_list:
-                # NOTE (2026-07-19): no map_name filter. All field programs carry
-                # the legacy tag '2025_06***env*OUTDOOR'; filtering on the active
-                # map exported an EMPTY list on every save and clobbered the
-                # migrated programs.yaml. One garden = one program set.
+                if p.map_name != self.current_navi_map_name:
+                    continue
                 zone_names = [z.name for z in p.zone_list]
                 scalars = {f: getattr(p, f, None) for f in bundle_sync.PROGRAM_SCALAR_FIELDS}
                 progs.append(bundle_sync.program_to_bundle(p.name, zone_names, scalars))
-            if not progs and (vbundle.load_programs(site) or []):
-                rospy.logwarn('[%s] Site bundle: refusing to overwrite non-empty '
-                              'programs.yaml with an EMPTY export.' % rospy.get_caller_id())
-                return
             vbundle.save_programs(site, progs)
-            self._touch_bundle_stamp(site, 'programs')  # own write != external edit (A4)
             rospy.loginfo("[{}] Site bundle: exported {} program(s) to '{}'.".format(rospy.get_caller_id(), len(progs), site))
         except Exception as e:
             rospy.logwarn("[{}] Site bundle: programs export failed: {}".format(rospy.get_caller_id(), e))
@@ -1817,16 +1945,7 @@ class Node:
         bprogs = vbundle.load_programs(site)
         active = self.current_navi_map_name
         zone_by_name = {z.msg.name: z for z in (self.map_data.zones if self.map_data else [])}
-        # AUDIT A3 (2026-08-01): dedupe by NAME across map tags. Export writes
-        # ALL programs regardless of map_name; keeping other-tag programs whose
-        # name the bundle also carries would duplicate every legacy-tagged
-        # program on each import (and program_select takes the first name hit).
-        # ...and dedupe the bundle list itself by name (last wins) — a pre-fix
-        # export had already written duplicated entries to programs.yaml.
-        bprogs = list({(pd.get('name', '') or ''): pd for pd in bprogs}.values())
-        bundle_names = {(pd.get('name', '') or '') for pd in bprogs}
-        kept = [p for p in self.permanent_program_list_msg.program_list
-                if p.map_name != active and p.name not in bundle_names]
+        kept = [p for p in self.permanent_program_list_msg.program_list if p.map_name != active]
         new_progs = []
         for pd in bprogs:
             prg = PlannerProgram()
@@ -1866,21 +1985,15 @@ class Node:
         if not site:
             return
         try:
-            # site-native: pickle keyed on the served site (active_map is 'SITE').
-            active = self._planner_key() or self.current_navi_map_name
+            active = self.current_navi_map_name
             map_pkl = "/home/vitulus/.vitulus/saves/planner_data/" + active + ".pkl"
             prog_pkl = os.path.expanduser('~') + '/.vitulus/running/planner_programs.pkl'
             map_mtime = os.path.getmtime(map_pkl) if exists(map_pkl) else 0.0
             prog_mtime = os.path.getmtime(prog_pkl) if exists(prog_pkl) else 0.0
             z_bt = vbundle.file_mtime(site, 'zones')
             p_bt = vbundle.file_mtime(site, 'programs')
-            # AUDIT A4: also honour the import/export stamp — the pkl mtimes
-            # above never advance in normal operation, which made the bundle
-            # perpetually "newer" and re-imported+regenerated on every load.
-            z_seen = max(map_mtime, self._bundle_stamp_get(site, 'zones'))
-            p_seen = max(prog_mtime, self._bundle_stamp_get(site, 'programs'))
-            zones_newer = z_bt is not None and z_bt > z_seen
-            programs_newer = p_bt is not None and p_bt > p_seen
+            zones_newer = z_bt is not None and z_bt > map_mtime
+            programs_newer = p_bt is not None and p_bt > prog_mtime
             if not (zones_newer or programs_newer):
                 return
             datum = self._active_map_datum()
@@ -1892,290 +2005,14 @@ class Node:
                     rospy.logwarn("[{}] Site bundle: zones newer but no map raster loaded — skipping zones import.".format(rospy.get_caller_id()))
                 else:
                     self._bundle_import_zones(site, datum)
-                    self._touch_bundle_stamp(site, 'zones')   # A4: seen it
             if programs_newer:
                 self._bundle_import_programs(site)
-                self._touch_bundle_stamp(site, 'programs')    # A4: seen it
             # Republish latched lists after an import.
             self.map_poly_list_publisher()
             self.map_zone_list_publisher()
             self.program_list_publisher()
         except Exception as e:
             rospy.logwarn("[{}] Site bundle: import-if-newer failed: {} — keeping pickle state.".format(rospy.get_caller_id(), e))
-
-    # ======================================================================
-    # Site-native mode (flag-gated, DEFAULT OFF): use the served mapping-v3
-    # site raster as the zone-generation workspace instead of the legacy raster.
-    # ======================================================================
-    def _site_native(self):
-        """site_native flag. Authoritative source is navi_manager.yaml (navi_man
-        loads it the same way and does NOT expose it on the param server); a
-        /navi_manager/site_native rosparam, if present, overrides. Cached."""
-        ov = rospy.get_param('/navi_manager/site_native', None)
-        if ov is not None:
-            return bool(ov)
-        if self._site_native_cached is None:
-            val = False
-            try:
-                import yaml
-                with open('/home/vitulus/catkin_ws/src/vitulus/vitulus_navi/'
-                          'config/navi_manager.yaml') as f:
-                    cfg = yaml.load(f, Loader=yaml.Loader)
-                val = bool(cfg.get('site_native', False))
-            except Exception as e:
-                rospy.logwarn("[{}] site_native: could not read navi_manager.yaml "
-                              "({}) — assuming false.".format(rospy.get_caller_id(), e))
-            self._site_native_cached = val
-        return self._site_native_cached
-
-    def _legacy_maps(self):
-        """legacy_maps flag (delegacy 2026-07-19). Authoritative source is
-        navi_manager.yaml (navi_man owns it, does NOT expose it on the param
-        server); a /navi_manager/legacy_maps rosparam overrides. DEFAULT False
-        (site-native, no legacy navi map). Cached."""
-        ov = rospy.get_param('/navi_manager/legacy_maps', None)
-        if ov is not None:
-            return bool(ov)
-        if self._legacy_maps_cached is None:
-            val = False
-            try:
-                import yaml
-                with open('/home/vitulus/catkin_ws/src/vitulus/vitulus_navi/'
-                          'config/navi_manager.yaml') as f:
-                    cfg = yaml.load(f, Loader=yaml.Loader)
-                val = bool(cfg.get('legacy_maps', False))
-            except Exception as e:
-                rospy.logwarn("[{}] legacy_maps: could not read navi_manager.yaml "
-                              "({}) — assuming false.".format(rospy.get_caller_id(), e))
-            self._legacy_maps_cached = val
-        return self._legacy_maps_cached
-
-    def _planner_key(self):
-        """Base name for the planner_data pickle + the resolved bundle site.
-        site-native (legacy_maps=False): the SERVING mapping-v3 site (decoupled
-        from active_map, which is the constant 'SITE'); may be None until a site
-        is served. Legacy: the active navi map name."""
-        if not self._legacy_maps():
-            return self._served_site
-        return self.current_navi_map_name
-
-    def callback_mapping_status(self, msg):
-        """Track the served mapping-v3 site from /mapping_manager/status. On a
-        serving-site CHANGE (site-native mode) reload the planner data keyed on
-        the new site: swap bundle authority, rebuild the raster from its site_map
-        and import zones/programs. Legacy mode: tracked but inert."""
-        try:
-            data = json.loads(msg.data)
-        except Exception:
-            return
-        serving = data.get('serving') or {}
-        site = serving.get('site') if isinstance(serving, dict) else None
-        if site == self._served_site:
-            return
-        prev = self._served_site
-        self._served_site = site
-        # active_map is 'SITE' constant in site-native, so invalidate the
-        # active-map-keyed bundle cache too (it keys on current_navi_map_name).
-        self._bundle_site_key = None
-        self._bundle_site_cache = None
-        rospy.loginfo("[{}] Served site changed {!r} -> {!r}.".format(
-            rospy.get_caller_id(), prev, site))
-        if self._legacy_maps():
-            return
-        if site and self.current_navi_map_name not in (None,):
-            # Reload planner data for the newly served site (same path a map
-            # change would take). current_navi_map_name stays 'SITE'.
-            self.callback_load_planner_data(Bool(True))
-
-    def _rebuild_map_from_site_grid(self):
-        """site_native (2): rebuild the workspace raster (map_data.initial_map +
-        np layers) from the served /mapping_manager/site_map grid instead of the
-        legacy raster baked into planner_data.pkl — reusing the SAME MapData +
-        assemble_map build path callback_map uses. Zones/polygons/programs are
-        carried over (they come from the bundle / operator edits). No site_map ->
-        keep the legacy raster + logwarn. Flag off -> no-op. Returns True if the
-        raster was rebuilt."""
-        if not self._site_native():
-            return False
-        try:
-            grid = rospy.wait_for_message('/mapping_manager/site_map',
-                                          OccupancyGrid, timeout=5.0)
-        except Exception as e:
-            rospy.logwarn("[{}] site_native: no /mapping_manager/site_map within "
-                          "timeout ({}) — keeping legacy raster.".format(
-                              rospy.get_caller_id(), e))
-            return False
-        return self._rebuild_workspace_from_grid(grid)
-
-    def _rebuild_workspace_from_grid(self, grid):
-        """Core raster rebuild shared by the load-time fetch
-        (_rebuild_map_from_site_grid) and the live refresh (callback_site_map).
-        Builds a fresh MapData from `grid`, carries the existing workspace
-        (zones/programs/polygons/assemble params) over it, and re-assembles.
-        Empty grid or build error -> keep the previous raster + logwarn, return
-        False. Returns True on a successful rebuild. Does NOT re-fetch or check
-        the site_native flag (callers do)."""
-        if grid.info.width * grid.info.height == 0:
-            rospy.logwarn("[{}] site_native: served site_map is empty — keeping "
-                          "legacy raster.".format(rospy.get_caller_id()))
-            return False
-        prev = self.map_data   # AUDIT #11: restore point (assemble may half-fail)
-        try:
-            arr = np.array(grid.data, dtype=np.int8).reshape(
-                (grid.info.height, grid.info.width))
-            new_map = MapData(np_map=arr, map_msg=grid)
-            if self.map_data is not None:
-                # carry the workspace over the fresh raster: zones/programs are
-                # bundle-owned, polygons + assemble params are operator edits.
-                # AUDIT #11: copy the list — aliasing made error-restore return
-                # a workspace whose zones were already regenerated (shared list)
-                new_map.zones = list(self.map_data.zones)
-                new_map.polygon_msgs = self.map_data.polygon_msgs
-                new_map.planner_program_list_msg = self.map_data.planner_program_list_msg
-                new_map.obstacle_margin = self.map_data.obstacle_margin
-                new_map.obstacle_margin_px = self.map_data.obstacle_margin_px
-                new_map.fill_hole_px = self.map_data.fill_hole_px
-                new_map.fill_shape = self.map_data.fill_shape
-                new_map.fill_shape_cv = self.map_data.fill_shape_cv
-            self.map_data = new_map
-            self.assemble_map()
-            self.np_show = self.map_data.np_semi_assembled
-            rospy.loginfo("[{}] site_native: workspace raster rebuilt from "
-                          "/mapping_manager/site_map ({}x{} @ {:.3f} m).".format(
-                              rospy.get_caller_id(), grid.info.width,
-                              grid.info.height, grid.info.resolution))
-            return True
-        except Exception as e:
-            self.map_data = prev   # AUDIT #11: drop the half-built workspace
-            rospy.logwarn("[{}] site_native: rebuild from site_map failed ({}) — "
-                          "keeping legacy raster.".format(rospy.get_caller_id(), e))
-            return False
-
-    # ----- site_native live refresh (debounce -> single worker, coalesced) ----
-    def _grid_fingerprint(self, grid):
-        """Cheap identity of a site_map grid: geometry + a hash of the cells.
-        Used to skip refreshes when an identical grid is (re)latched."""
-        try:
-            h = hashlib.md5()
-            info = grid.info
-            h.update("{}x{}|{:.4f}|{:.4f},{:.4f}".format(
-                info.width, info.height, info.resolution,
-                info.origin.position.x, info.origin.position.y).encode())
-            h.update(np.asarray(grid.data, dtype=np.int8).tobytes())
-            return h.hexdigest()
-        except Exception:
-            return None
-
-    def callback_site_map(self, grid):
-        """Persistent latched subscriber on /mapping_manager/site_map. On a NEW
-        grid (fingerprint differs from the last seen): stash it and (re)arm a
-        2.5 s debounce timer. Flag off -> no-op. Never blocks: the actual
-        rebuild+zone-regen runs in a worker thread (see _site_map_worker)."""
-        if not self._site_native():
-            return
-        fp = self._grid_fingerprint(grid)
-        with self._site_map_lock:
-            if fp is not None and fp == self._site_map_last_fp:
-                return  # identical grid re-latched -> nothing to do
-            self._site_map_last_fp = fp
-            self._site_map_pending = grid
-        # (re)arm the debounce timer outside the lock; edits arrive in bursts, so
-        # each new grid pushes the fire time out another 2.5 s.
-        if self._site_map_timer is not None:
-            try:
-                self._site_map_timer.shutdown()
-            except Exception:
-                pass
-        self._site_map_timer = rospy.Timer(rospy.Duration(2.5),
-                                           self._site_map_timer_fire,
-                                           oneshot=True)
-
-    def _site_map_timer_fire(self, event):
-        """Debounce elapsed. Start the worker if idle; if a run is already in
-        progress, flag a rerun so the just-arrived grid is picked up after it."""
-        with self._site_map_lock:
-            if self._site_map_worker_active:
-                self._site_map_rerun = True
-                return
-            self._site_map_worker_active = True
-        t = threading.Thread(target=self._site_map_worker,
-                             name="site_map_refresh")
-        t.daemon = True
-        t.start()
-
-    def _site_map_worker(self):
-        """Worker loop: process the pending grid, then loop once more if a new
-        grid arrived (rerun flag) so bursts coalesce into at most one trailing
-        run. Guarded so only one worker runs at a time."""
-        try:
-            while True:
-                with self._site_map_lock:
-                    grid = self._site_map_pending
-                    self._site_map_pending = None
-                if grid is not None:
-                    self._do_live_refresh(grid)
-                with self._site_map_lock:
-                    if not self._site_map_rerun:
-                        break
-                    self._site_map_rerun = False
-                    if self._site_map_pending is None:
-                        break
-        finally:
-            with self._site_map_lock:
-                self._site_map_worker_active = False
-
-    def _do_live_refresh(self, grid):
-        """Rebuild the workspace from `grid`, regenerate EVERY zone against the
-        new free space, propagate the fresh zones into programs, export the
-        bundle and republish the latched lists + map layers. On error the
-        previous workspace is restored/kept. Runs in the worker thread."""
-        if not self._site_native():
-            return
-        if (not self.data_loaded or self.map_data is None
-                or self.current_navi_map_name in (None, "New")):
-            # No workspace to refresh yet (boot / new map). The load-time path
-            # will rebuild once data is loaded.
-            return
-        t0 = time.time()
-        with self._workspace_lock:   # AUDIT #10
-            self._do_site_map_refresh_locked(grid, t0)
-
-    def _do_site_map_refresh_locked(self, grid, t0):
-        prev_map_data = self.map_data
-        try:
-            # snapshot zone msgs before the raster swap; _regenerate_zone rebuilds
-            # each from its polygon against the new assembled free space.
-            prev_zone_msgs = [copy.deepcopy(z.msg) for z in self.map_data.zones]
-            if not self._rebuild_workspace_from_grid(grid):
-                # rebuild refused (empty/failed) -> keep previous workspace.
-                self.map_data = prev_map_data
-                return
-            n = 0
-            for zmsg in prev_zone_msgs:
-                try:
-                    zone = self._regenerate_zone(zmsg)
-                    self._propagate_zone_to_programs(zone.msg)
-                    n += 1
-                except Exception as e:
-                    rospy.logwarn("[{}] site_native live refresh: zone '{}' regen "
-                                  "failed: {}".format(rospy.get_caller_id(),
-                                                      getattr(zmsg, 'name', '?'), e))
-            self.current_zone = None
-            self.save_running_data()
-            # export bundle (existing hooks) + republish latched UI lists/layers.
-            self._bundle_export_zones()
-            self._bundle_export_programs()
-            self.map_zone_list_publisher()
-            self.program_list_publisher()
-            self.map_data_publisher()
-            self.map_poly_list_publisher()
-            rospy.loginfo("[{}] planner refreshed from site_map: {} zones "
-                          "regenerated in {:.1f}s".format(
-                              rospy.get_caller_id(), n, time.time() - t0))
-        except Exception as e:
-            self.map_data = prev_map_data
-            rospy.logwarn("[{}] site_native live refresh failed ({}) — keeping "
-                          "previous workspace.".format(rospy.get_caller_id(), e))
 
     def callback_program_new(self, msg):
         prg_list = [prg for prg in self.permanent_program_list_msg.program_list if prg.name != msg.name]
@@ -2252,12 +2089,13 @@ if __name__ == '__main__':
         signal.signal(signal.SIGINT, signal_handler)
 
         while not rospy.is_shutdown():
-            # AUDIT dead-code (2026-08-01): map_assembled / zone_outline_polygons /
-            # zone_path_lines / coverage_path / outline_path publishers removed —
-            # zero consumers (three.js UI reads map_show/map_data/markers/lists;
-            # RViz config referenced different names). map_edited STAYS: navi_man
-            # subscribes it (callback_web_plan_map).
             node.map_show_publisher()
+            node.map_assembled_publisher()
+
+            node.zone_outline_poly_publisher()
+            node.zone_path_lines_publisher()
+            node.zone_coverage_path_msg_publisher()
+            node.zone_outline_path_msg_publisher()
             if slow_r == slow_id:
                 node.map_edited_publisher()
                 slow_id = 0
