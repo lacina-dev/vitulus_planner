@@ -722,6 +722,34 @@ class Node:
             self.map_data.zones[zone_exist_id] = self.current_zone
         return self.current_zone
 
+    def _has_workspace(self):
+        """A usable planner workspace exists. Site-native: only while a site is
+        served — a workspace left in memory with nothing served belongs to no
+        bundle, so an edit on it would be confirmed and then lost."""
+        if self.map_data is None:
+            return False
+        return self._legacy_maps() or bool(self._planner_key())
+
+    def _drop_workspace(self):
+        """Serving stopped (site-native): forget the previous site's workspace —
+        the same state as a boot with nothing served — and tell the UI the zone
+        and polygon lists are empty. saves/<site>.pkl and the site bundle are
+        untouched; they load again when the site is served. Programs keep their
+        own per-site handling. Caller holds the workspace lock."""
+        self.map_data = None
+        self.current_zone = None
+        self._raster_site = None
+        self._workspace_site = None
+        self._clear_zone_preview()
+        zones = MapEditZoneList()
+        zones.header.stamp = rospy.Time.now()
+        zones.header.frame_id = "map"
+        self.zone_list_pub.publish(zones)
+        polys = MapEditPolygonList()
+        polys.header.stamp = rospy.Time.now()
+        polys.header.frame_id = "map"
+        self.map_poly_list_pub.publish(polys)
+
     def _ensure_workspace(self, what, report=True):
         """True when a planner workspace (map_data) exists. When it does not but
         a site IS served (site-native), try to build it right now from the served
@@ -729,7 +757,7 @@ class Node:
         report `what` + the reason to the UI log and return False — never throw
         inside a rospy callback (the request would be lost silently).
         report=False: the caller reports the failure itself."""
-        if self.map_data is not None:
+        if self._has_workspace():
             return True
         if not self._legacy_maps() and self._planner_key():
             rospy.loginfo("[{}] No planner workspace yet — building it from the "
@@ -820,7 +848,7 @@ class Node:
 
     def _remove_zone(self, name):
         """Returns (ok, message for the UI)."""
-        if self.map_data is None:
+        if not self._has_workspace():
             return False, "Zone '{}' NOT removed: no map is active.".format(name)
         with self._workspace_lock:   # AUDIT #10
             # Remove zone
@@ -2564,7 +2592,9 @@ class Node:
                 return
             # The shown program / zone preview belong to the previous site's map.
             self._clear_markers_for_map_change()
-            if site and self.current_navi_map_name not in (None,):
+            if not site:
+                self._drop_workspace()
+            elif self.current_navi_map_name not in (None,):
                 # Reload planner data for the newly served site (same path a map
                 # change would take). current_navi_map_name stays 'SITE'.
                 self.callback_load_planner_data(Bool(True))
@@ -2715,6 +2745,10 @@ class Node:
         if not self._site_native():
             return
         key = None if self._legacy_maps() else self._planner_key()
+        if not self._legacy_maps() and not key:
+            # Nothing served: the grid is mapping_manager's placeholder. Never
+            # regenerate (and persist) a stale workspace's zones against it.
+            return
         if (key and self._workspace_site != key
                 and self.current_navi_map_name not in (None, "New")):
             # RETRY: the workspace of the served site is not complete (the

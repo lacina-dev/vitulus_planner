@@ -594,6 +594,45 @@ class SiteProgramsTest(unittest.TestCase):
         self.assertEqual(got, [('save', False), ('remove', False)])
         self.assertIn('no map is active', self._zone_results()[0]['message'])
 
+    # ------------------------------------------ vitulus-field#1 S19: no serving
+    def test_s19_save_refused_after_serving_deactivated(self):
+        n = self._site_a_with_mowall()
+        geojson_before = self._zones_geojson('A')
+        serve(n, None)                      # UI "Deactivate"
+        self.assertIsNone(n.map_data)
+        self.assertEqual(listed_zones(), [])
+        n._do_live_refresh(grid(1))         # mapping_manager's 1x1 placeholder
+        self.assertIsNone(n.map_data)
+        del EVENTS[:]
+        n.callback_map_save_zone(zmsg('S19test', 2, 2, 6, 6))
+        n.callback_zone_remove(String('Near'))
+        got = [(r['op'], r['ok'], r['message']) for r in self._zone_results()]
+        self.assertEqual(got, [
+            ('save', False, "Zone 'S19test' NOT saved: no map is active — "
+                            "activate or record a map first."),
+            ('remove', False, "Zone 'Near' NOT removed: no map is active.")])
+        self.assertNotIn('/web_plan/zone_list', [t for t, m in EVENTS])
+        serve(n, 'A')                       # the site's zones come back intact
+        self.assertEqual(listed_zones(), ['Far', 'Near'])
+        self.assertEqual(self._zones_geojson('A'), geojson_before)
+        self.assertEqual(mem_programs(n), {'MowAll': ['Near', 'Far']})
+
+    def test_s19_workspace_without_served_site_is_not_editable(self):
+        """A workspace in memory while nothing is served belongs to no bundle."""
+        self._site_a_with_mowall()
+        n = new_node()
+        shutil.copyfile(M._saves_pkl('A'), M._RUNNING_PKL)
+        n.data_loaded = n.load_running_data()
+        self.assertIsNotNone(n.map_data)
+        before = self._pickled_zones('A')
+        n._do_live_refresh(grid(1))
+        self.assertEqual(self._pickled_zones('A'), before)
+        del EVENTS[:]
+        n.callback_map_save_zone(zmsg('Lost', 2, 2, 6, 6))
+        self.assertEqual([(r['op'], r['ok']) for r in self._zone_results()],
+                         [('save', False)])
+        self.assertEqual(self._zones_geojson('A'), ['Far', 'Near'])
+
     # -------------------------------------------------------------- finding 7
     def test_f7_select_of_unknown_program_is_reported(self):
         n = self._site_a_with_mowall()
