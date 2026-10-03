@@ -340,11 +340,11 @@ class SiteProgramsTest(unittest.TestCase):
             serve(n, 'A')
             self.assertEqual(sorted(z.msg.name for z in n.map_data.zones), ['Near'])
             self.assertEqual(mem_programs(n), {'MowAll': ['Near']})
-            n.callback_program_new(program('Other'))        # any export
+            n.callback_program_new(program('Other', zone_msgs(n, 'Near')))  # any export
             n._do_live_refresh(grid(300))                    # ... and another
         finally:
             M.Node._regenerate_zone = orig
-        self.assertEqual(yaml_programs('A'), {'MowAll': ['Near', 'Far'], 'Other': []})
+        self.assertEqual(yaml_programs('A'), {'MowAll': ['Near', 'Far'], 'Other': ['Near']})
         # full coverage again -> the program is whole again
         serve(n, 'B')
         forget_workspace_pickle('A')
@@ -490,17 +490,19 @@ class SiteProgramsTest(unittest.TestCase):
     def test_f2_program_edited_with_nothing_served_survives_swap(self):
         n = new_node()
         serve(n, 'A')
-        n.callback_program_new(program('Offline'))
+        n.callback_map_save_zone(zmsg('Near', 2, 2, 6, 6))
+        zones = zone_msgs(n, 'Near')
+        n.callback_program_new(program('Offline', zones))
         os.remove(os.path.join(site_dir('A'), 'programs.yaml'))
         serve(n, None)
-        edited = program('Offline')
+        edited = program('Offline', zones)
         edited.rpm = 2800
         n.callback_program_new(edited)                        # export impossible
         self.assertEqual(yaml_programs('A'), None)
         serve(n, 'B')                                         # pre-swap save to A
-        self.assertEqual(yaml_programs('A'), {'Offline': []})
+        self.assertEqual(yaml_programs('A'), {'Offline': ['Near']})
         serve(n, 'A')
-        self.assertEqual(mem_programs(n), {'Offline': []})
+        self.assertEqual(mem_programs(n), {'Offline': ['Near']})
         self.assertEqual(n.permanent_program_list_msg.program_list[0].rpm, 2800)
 
     # ------------------------- vitulus-field#46: a program belongs to its map

@@ -307,6 +307,10 @@ class MasterController(object):
         self.off_dock_since = None
         self.terminal_error_since = None
         self._mowing_grace_until = 0.0
+        # A program start is confirmed only when the SMACH picks it up; until
+        # then the (latched) stop_reason of the previous mission is not ours.
+        self._mission_seen = True
+        self._mission_start_deadline = 0.0
         self._last_idle_eval = 0.0
         self._pending_recovery_reason = None
         self._sleep_confirmed_logged = False
@@ -498,6 +502,24 @@ class MasterController(object):
     # =====================================================================
     # FSM helpers
     # =====================================================================
+    def _program_on_map(self, prog_name):
+        """False when the planner's program list is loaded and lacks prog_name
+        (a calendar event of another site, a deleted or renamed program)."""
+        with self.lock:
+            if not self.programs_loaded:
+                return True
+            return any(p.name == prog_name for p in self.program_list)
+
+    def _start_program(self, prog_name, pub):
+        with self.lock:
+            self.stop_reason = ""
+            self.active_program_name = ""
+        pub.publish(String(prog_name))
+        self._mission_seen = False
+        self._mission_start_deadline = time.time() + 60.0
+        self._mowing_grace_until = time.time() + 5.0
+        self._transition(self.STATE_MOWING)
+
     def _transition(self, new_state):
         if new_state != self.state:
             rospy.loginfo("[FSM] %s -> %s", self.state, new_state)
@@ -638,6 +660,14 @@ class MasterController(object):
         active_ev = MowerScheduler.get_active_event(calendar, last_run, now)
         if active_ev is not None and active_ev.get('id') != interrupted_id:
             prog_name = active_ev['program_name']
+            if not self._program_on_map(prog_name):
+                self.log("[Master] Scheduled program '%s' is not on the active "
+                         "map - skipped today." % prog_name)
+                with self.lock:
+                    self.persistent['last_run_by_event'][active_ev['id']] = \
+                        now.strftime("%Y-%m-%d")
+                    self._save_state()
+                return
             if interrupted_id is not None:
                 self.log("[Master] New scheduled program due; abandoning "
                          "interrupted event.")
@@ -648,9 +678,7 @@ class MasterController(object):
                 self.persistent['interrupted_event_id'] = active_ev['id']
                 self.persistent['interrupted_reason'] = None
                 self._save_state()
-            self.program_select_pub.publish(String(prog_name))
-            self._mowing_grace_until = time.time() + 5.0
-            self._transition(self.STATE_MOWING)
+            self._start_program(prog_name, self.program_select_pub)
             return
 
         # --- Priority 2: Resume interrupted program ------------------------
@@ -675,9 +703,12 @@ class MasterController(object):
                 # re-reject if conditions are still bad -> self-correcting.
                 self.log("[Master] Resuming program: %s (reason=%s)"
                          % (prog_name, interrupted_reason))
-                self.program_select_resume_pub.publish(String(prog_name))
-                self._mowing_grace_until = time.time() + 5.0
-                self._transition(self.STATE_MOWING)
+                if not self._program_on_map(prog_name):
+                    self.log("[Master] Interrupted program '%s' is not on the "
+                             "active map - not resumed." % prog_name)
+                    self._clear_interrupted()
+                    return
+                self._start_program(prog_name, self.program_select_resume_pub)
                 return
 
         # --- Priority 3: Next scheduled event -> wait or sleep -------------
@@ -715,12 +746,27 @@ class MasterController(object):
             smach_status = self.smach_status
             stop_reason = self.stop_reason
             in_dock = self.is_in_dock
+            active_program = self.active_program_name.strip()
 
         self.status_pub.publish(String("Mowing"))
 
         # Grace period after start - ignore Ready for a few seconds
         if time.time() < self._mowing_grace_until:
             return
+
+        # Not picked up by the SMACH (planner refused the program, SMACH busy):
+        # give up instead of waiting forever or taking an old stop_reason.
+        if not self._mission_seen:
+            if smach_status not in ("Ready", "") or active_program or stop_reason:
+                self._mission_seen = True
+            elif time.time() > self._mission_start_deadline:
+                self.log("[Master] Program did not start (see the planner "
+                         "log) - back to idle.")
+                self._clear_interrupted()
+                self._transition(self.STATE_IDLE)
+                return
+            else:
+                return
 
         # Terminal error: wait short, reset SMACH, then long sleep.
         if smach_status == "TERMINAL ERROR":

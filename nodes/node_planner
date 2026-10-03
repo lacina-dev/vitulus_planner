@@ -1855,31 +1855,51 @@ class Node:
         self.log_publisher(text)
         rospy.logwarn("[{}] {}.".format(rospy.get_caller_id(), text))
 
-    def callback_program_select(self, msg):
+    def _program_with_current_zones(self, program_msg):
+        """Copy of `program_msg` whose zones are the CURRENT workspace zones of
+        the same names (fresh coverage paths after a map refresh / zone edit).
+        Returns (program, None) or (None, reason) when the program cannot run:
+        no zones, a zone no longer on the map, or a zone without mowing paths."""
+        if not program_msg.zone_list:
+            return None, "it has no zones — edit the program and add a zone"
+        with self._workspace_lock:
+            ws = {z.msg.name: z.msg for z in (self.map_data.zones if self.map_data else [])}
+            zones = []
+            for z in program_msg.zone_list:
+                cur = ws.get(z.name)
+                if cur is None:
+                    return None, "zone '{}' is not on the active map".format(z.name)
+                if not cur.paths:
+                    return None, "zone '{}' has no mowing paths".format(z.name)
+                zones.append(copy.deepcopy(cur))
+        program = copy.deepcopy(program_msg)
+        program.zone_list = zones
+        program.area = min(int(sum(z.area for z in zones)), 32767)
+        program.length = min(int(sum(z.length for z in zones)), 32767)
+        return program, None
+
+    def _select_program(self, name, verb, pub):
         if self.permanent_program_list_msg is not None and self._programs_usable():
             for program_msg in self.permanent_program_list_msg.program_list:
-                print("program_msg.name: {}".format(program_msg.name))
-                if program_msg.name == msg.data:
-                    self.program_active = program_msg
-                    # self.program_active.zone_list[0].paths = program_msg.zone_list[0].paths[1:]
-                    self.log_publisher("Program selected to run: {}".format(msg.data))
-                    rospy.loginfo("[{}] Program selected to run: {}".format(rospy.get_caller_id(), msg.data))
-                    self.program_active_pub.publish(self.program_active)
+                if program_msg.name == name:
+                    program, reason = self._program_with_current_zones(program_msg)
+                    if program is None:
+                        text = "Program '{}' not started: {}.".format(name, reason)
+                        self.log_publisher(text)
+                        rospy.logwarn("[{}] {}".format(rospy.get_caller_id(), text))
+                        return
+                    self.program_active = program
+                    self.log_publisher("Program selected to {}: {}".format(verb, name))
+                    rospy.loginfo("[{}] Program selected to {}: {}".format(rospy.get_caller_id(), verb, name))
+                    pub.publish(self.program_active)
                     return
-        self._program_not_found(msg.data)
+        self._program_not_found(name)
+
+    def callback_program_select(self, msg):
+        self._select_program(msg.data, "run", self.program_active_pub)
 
     def callback_program_select_resume(self, msg):
-        if self.permanent_program_list_msg is not None and self._programs_usable():
-            for program_msg in self.permanent_program_list_msg.program_list:
-                print("program_msg.name: {}".format(program_msg.name))
-                if program_msg.name == msg.data:
-                    self.program_active = program_msg
-                    # self.program_active.zone_list[0].paths = program_msg.zone_list[0].paths[1:]
-                    self.log_publisher("Program selected to resume: {}".format(msg.data))
-                    rospy.loginfo("[{}] Program selected to resume: {}".format(rospy.get_caller_id(), msg.data))
-                    self.program_active_unfinished_pub.publish(self.program_active)
-                    return
-        self._program_not_found(msg.data)
+        self._select_program(msg.data, "resume", self.program_active_unfinished_pub)
 
     def program_list_publisher(self):
         """ Publish program list """
@@ -2898,6 +2918,23 @@ class Node:
             owner = served or self._programs_site
             if owner:
                 msg.map_name = owner
+        existing = any(prg.name == msg.name
+                       for prg in self.permanent_program_list_msg.program_list)
+        if not msg.zone_list and not existing:
+            text = "Program '{}' NOT saved: it has no zones.".format(msg.name)
+            self.log_publisher(text)
+            rospy.logwarn("[{}] {}".format(rospy.get_caller_id(), text))
+            self.program_list_publisher()
+            return
+        # Zones are referenced by name: store the CURRENT workspace zones, never
+        # the sender's copy (the mission reports last_result with the snapshot it
+        # started with, which must not overwrite zones regenerated meanwhile).
+        with self._workspace_lock:
+            ws = {z.msg.name: z.msg for z in (self.map_data.zones if self.map_data else [])}
+            msg.zone_list = [copy.deepcopy(ws[z.name]) if z.name in ws else z
+                             for z in msg.zone_list]
+        msg.area = min(int(sum(z.area for z in msg.zone_list)), 32767)   # int16
+        msg.length = min(int(sum(z.length for z in msg.zone_list)), 32767)
         prg_list = [prg for prg in self.permanent_program_list_msg.program_list if prg.name != msg.name]
         prg_list.append(msg)
         self.permanent_program_list_msg.program_list = prg_list
