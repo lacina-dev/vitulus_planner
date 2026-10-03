@@ -487,16 +487,88 @@ class SiteProgramsTest(unittest.TestCase):
         self.assertEqual(mem_programs(n), {'Orphan': []})
         self.assertEqual(yaml_programs('B'), None)
 
-    def test_f2_program_created_with_nothing_served_survives_swap(self):
+    def test_f2_program_edited_with_nothing_served_survives_swap(self):
         n = new_node()
         serve(n, 'A')
+        n.callback_program_new(program('Offline'))
+        os.remove(os.path.join(site_dir('A'), 'programs.yaml'))
         serve(n, None)
-        n.callback_program_new(program('Offline'))           # export impossible
+        edited = program('Offline')
+        edited.rpm = 2800
+        n.callback_program_new(edited)                        # export impossible
         self.assertEqual(yaml_programs('A'), None)
         serve(n, 'B')                                         # pre-swap save to A
         self.assertEqual(yaml_programs('A'), {'Offline': []})
         serve(n, 'A')
         self.assertEqual(mem_programs(n), {'Offline': []})
+        self.assertEqual(n.permanent_program_list_msg.program_list[0].rpm, 2800)
+
+    # ------------------------- vitulus-field#46: a program belongs to its map
+    def _listed_map_names(self):
+        return {p.name: p.map_name for p in last('/web_plan/program_list').program_list}
+
+    def test_46_program_carries_the_site_it_was_created_on(self):
+        n = self._site_a_with_mowall()
+        self.assertEqual(self._listed_map_names(), {'MowAll': 'A'})
+        n.callback_program_select(String('MowAll'))
+        self.assertEqual(last('/web_plan/program_active').map_name, 'A')
+        # navi_man's active_map flips to 'New' on every UNDOCK: no effect
+        n.callback_navi_active_map(String('New'))
+        stamped = program('AfterUndock', zone_msgs(n, 'Near'))
+        stamped.map_name = 'New'            # what an old UI sends
+        n.callback_program_new(stamped)
+        self.assertEqual(self._listed_map_names(), {'AfterUndock': 'A', 'MowAll': 'A'})
+        serve(n, 'B')
+        n.callback_map_save_zone(zmsg('OnB', 1, 1, 5, 5))
+        n.callback_program_new(program('P_B', zone_msgs(n, 'OnB')))
+        self.assertEqual(self._listed_map_names(), {'P_B': 'B'})
+        serve(n, None)                      # the list still names its owner
+        n.program_list_publisher()
+        self.assertEqual(self._listed_map_names(), {'P_B': 'B'})
+        serve(n, 'A')
+        self.assertEqual(self._listed_map_names(), {'AfterUndock': 'A', 'MowAll': 'A'})
+
+    def test_46_new_program_needs_an_active_map(self):
+        n = self._site_a_with_mowall()
+        serve(n, None)
+        del EVENTS[:]
+        n.callback_program_new(program('Offline'))
+        self.assertEqual(mem_programs(n), {'MowAll': ['Near', 'Far']})
+        logs = [m.data for t, m in EVENTS if t == '/web_plan/log']
+        self.assertEqual(logs, ["Program 'Offline' NOT saved: no map is active — "
+                                "activate a map first (a program belongs to the "
+                                "map it is created on)."])
+        self.assertEqual(listed_programs(), ['MowAll'])
+        self.assertEqual(yaml_programs('A'), {'MowAll': ['Near', 'Far']})
+        n2 = new_node()                     # boot with nothing served
+        n2.callback_program_new(program('Boot'))
+        self.assertNotIn('Boot', mem_programs(n2))
+
+    def test_46_old_map_tags_belong_to_the_owner_site(self):
+        """Programs saved before the fix carry 'SITE' / 'New' in map_name."""
+        n = self._site_a_with_mowall()
+        n.callback_program_new(program('BB', zone_msgs(n, 'Near')))
+        for p, tag in zip(n.permanent_program_list_msg.program_list, ('New', 'SITE')):
+            p.map_name = tag
+        n.save_programs()
+        n2 = new_node()                     # stack restart: active_map is 'SITE'
+        serve(n2, 'A')
+        n2.program_list_publisher()
+        self.assertEqual(self._listed_map_names(), {'BB': 'A', 'MowAll': 'A'})
+        # a zone edit reaches the program that carried 'New'
+        area = {p.name: p.area for p in n2.permanent_program_list_msg.program_list}
+        n2.callback_map_save_zone(zmsg('Near', 2, 2, 9, 9))
+        after = {p.name: p.area for p in n2.permanent_program_list_msg.program_list}
+        self.assertGreater(after['BB'], area['BB'])
+        self.assertGreater(after['MowAll'], area['MowAll'])
+        # ... and neither leaks into another site's list
+        for p, tag in zip(n2.permanent_program_list_msg.program_list, ('New', 'SITE')):
+            p.map_name = tag
+        serve(n2, 'B')
+        self.assertEqual(mem_programs(n2), {})
+        self.assertEqual(yaml_programs('B'), None)
+        serve(n2, 'A')
+        self.assertEqual(self._listed_map_names(), {'BB': 'A', 'MowAll': 'A'})
 
     def test_f2_swap_refused_when_old_list_cannot_be_saved(self):
         n = self._site_a_with_mowall()

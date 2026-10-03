@@ -1894,6 +1894,7 @@ class Node:
                 hidden.header = self.permanent_program_list_msg.header
                 self.program_list_pub.publish(hidden)
                 return
+            self._stamp_programs_owner()
             rospy.loginfo("[{}] Publishing program list: {} programs".format(
                 rospy.get_caller_id(), len(self.permanent_program_list_msg.program_list)))
             self.program_list_pub.publish(self.permanent_program_list_msg)
@@ -1904,7 +1905,7 @@ class Node:
         Programs embed a full copy of each zone (incl. its computed coverage
         paths), so a map edit would otherwise not reach existing programs. When
         a zone is re-saved we refresh that copy in place — matched by zone name
-        within the same map (program.map_name == current map) — and recompute
+        within the same map (see _on_current_map) — and recompute
         the program's area/length totals. Returns the number of programs
         changed. A deep copy is stored so later in-memory zone edits don't alias
         back into the program until they are propagated too.
@@ -1913,7 +1914,7 @@ class Node:
             return 0
         changed = 0
         for program in self.permanent_program_list_msg.program_list:
-            if program.map_name != self.current_navi_map_name:
+            if not self._on_current_map(program):
                 continue
             hit = False
             for i in range(len(program.zone_list)):
@@ -1943,7 +1944,7 @@ class Node:
             return 0
         changed = 0
         for program in self.permanent_program_list_msg.program_list:
-            if program.map_name != self.current_navi_map_name:
+            if not self._on_current_map(program):
                 continue
             new_list = [z for z in program.zone_list if z.name != zone_name]
             if len(new_list) != len(program.zone_list):
@@ -2109,7 +2110,8 @@ class Node:
     _BUNDLE_STAMP = os.path.join(_RUNNING_DIR, 'bundle_import_stamp.json')
 
     # Site-native program ownership. The program pickle is ONE global file while
-    # active_map (hence PlannerProgram.map_name) is the constant 'SITE', so the
+    # active_map is the constant 'SITE' (data older than vitulus-field#46 carry
+    # it, or 'New', in PlannerProgram.map_name), so the
     # pickle alone cannot tell which site its programs belong to. This sidecar
     # records it; the per-site authority is <site>/programs.yaml in the bundle.
     _PROGRAMS_SITE_FILE = os.path.join(_RUNNING_DIR, 'planner_programs_site.json')
@@ -2193,6 +2195,42 @@ class Node:
         if not site:
             return True     # nothing served / bundle off: global list as before
         return self._programs_site == site and not self._programs_need_import
+
+    @staticmethod
+    def _legacy_tagged(program):
+        """Legacy programs carry "<name>***env*<ENV>" in map_name."""
+        return '***env*' in (program.map_name or '')
+
+    def _on_current_map(self, program):
+        """The program belongs to the map the list is used on. Site-native: the
+        list in memory IS the owner site's list, so every program without the
+        legacy marker belongs to it, whatever its map_name says (data written
+        before vitulus-field#46 carry 'SITE' or 'New' — navi_man's active_map
+        at the time of the save). Legacy mode / legacy tag: map_name must equal
+        the active navi map, as before."""
+        if not self._legacy_maps() and not self._legacy_tagged(program):
+            return True
+        return program.map_name == self.current_navi_map_name
+
+    def _program_map_tag(self, site):
+        """map_name of a program of `site`. Site-native: the site name — the
+        program carries the map it belongs to (vitulus-field#46). Legacy: the
+        active navi map name."""
+        if not self._legacy_maps() and site:
+            return site
+        return self.current_navi_map_name
+
+    def _stamp_programs_owner(self):
+        """Site-native: every program of the list in memory names its owner
+        site in map_name (older data carry 'SITE' / 'New'). In memory only; the
+        next save persists it. Legacy-tagged programs are left alone."""
+        site = self._programs_site
+        if (self._legacy_maps() or not site
+                or self.permanent_program_list_msg is None):
+            return
+        for program in self.permanent_program_list_msg.program_list:
+            if not self._legacy_tagged(program) and program.map_name != site:
+                program.map_name = site
 
     def _bundle_export_programs(self, allow_empty=False, site=None, only_missing=False):
         """Mirror active-map programs into programs.yaml (metadata + zone_names).
@@ -2310,13 +2348,13 @@ class Node:
         programs.yaml, snapshotting a deep copy (incl. fresh paths) of each
         workspace zone by name. Returns (program_list, adopted_names).
         Programs for OTHER maps (legacy tags, global pickle) are merged in
-        untouched. Site-native: active-map ('SITE') programs that are NOT in
+        untouched. Site-native: site programs (_on_current_map) that are NOT in
         this site's programs.yaml belong to another site and are left out —
         unless adopt_unknown (owner site of the pickle unknown, i.e. data older
         than the ownership sidecar): then they are kept, so an upgrade never
         loses a program."""
         bprogs = vbundle.load_programs(site)
-        active = self.current_navi_map_name
+        tag = self._program_map_tag(site)
         zone_by_name = {z.msg.name: z for z in (self.map_data.zones if self.map_data else [])}
         # AUDIT A3 (2026-08-01): dedupe by NAME across map tags. Export writes
         # ALL programs regardless of map_name; keeping other-tag programs whose
@@ -2327,11 +2365,11 @@ class Node:
         bprogs = list({(pd.get('name', '') or ''): pd for pd in bprogs}.values())
         bundle_names = {(pd.get('name', '') or '') for pd in bprogs}
         kept = [p for p in self.permanent_program_list_msg.program_list
-                if p.map_name != active and p.name not in bundle_names]
+                if not self._on_current_map(p) and p.name not in bundle_names]
         adopted = []
         if adopt_unknown:
             adopted = [p for p in self.permanent_program_list_msg.program_list
-                       if p.map_name == active and p.name not in bundle_names]
+                       if self._on_current_map(p) and p.name not in bundle_names]
             if adopted:
                 rospy.logwarn("[{}] Site bundle: {} program(s) of unknown site "
                               "adopted by '{}': {}".format(
@@ -2342,7 +2380,7 @@ class Node:
             prg = PlannerProgram()
             prg.header.frame_id = "map"
             prg.name = pd.get('name', '') or ''
-            prg.map_name = active
+            prg.map_name = tag
             prg.speed = pd.get('speed') if pd.get('speed') in ('slow', 'mid', 'fast') else 'mid'
             prg.rpm = int(pd.get('rpm', 0) or 0)
             prg.cut_height = int(pd.get('cut_height', 0) or 0)
@@ -2842,6 +2880,24 @@ class Node:
     def callback_program_new(self, msg):
         if self._programs_refuse_edit("Program '{}' NOT saved".format(msg.name)):
             return
+        if not self._legacy_maps() and not self._legacy_tagged(msg):
+            # A program belongs to the map it is created on (vitulus-field#46):
+            # a NEW one needs an active map; map_name names the owner site,
+            # never the sender's value ('SITE' / 'New').
+            served = self._planner_key()
+            known = any(prg.name == msg.name
+                        for prg in self.permanent_program_list_msg.program_list)
+            if not served and not known:
+                text = ("Program '{}' NOT saved: no map is active — activate a map "
+                        "first (a program belongs to the map it is created "
+                        "on).".format(msg.name))
+                self.log_publisher(text)
+                rospy.logwarn("[{}] {}".format(rospy.get_caller_id(), text))
+                self.program_list_publisher()
+                return
+            owner = served or self._programs_site
+            if owner:
+                msg.map_name = owner
         prg_list = [prg for prg in self.permanent_program_list_msg.program_list if prg.name != msg.name]
         prg_list.append(msg)
         self.permanent_program_list_msg.program_list = prg_list
