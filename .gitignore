@@ -10,3 +10,7 @@ __pycache__/
 *.swp
 *.swo
 *~
+*.bak_*
+*_bak_*
+*.orig
+.claude/
