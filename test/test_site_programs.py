@@ -717,6 +717,54 @@ class SiteProgramsTest(unittest.TestCase):
         self.assertIn("Program 'Elsewhere' not found on the active map", logs)
         self.assertEqual(len([1 for t, m in EVENTS if t == '/web_plan/program_active']), 1)
 
+    # ------------------------------------------- mission write-back (18. 10.)
+    def _from_mission(self, prg):
+        prg._connection_header = {'callerid': '/node_mower_smach'}
+        return prg
+
+    def test_mission_write_back_keeps_owner_edits(self):
+        """The mission's periodic write-back carries the copy it STARTED with;
+        it may only report the run, never revert a later edit."""
+        n = self._site_a_with_mowall()
+        n.callback_program_select(String('MowAll'))
+        started = copy.deepcopy(last('/web_plan/program_active'))
+        edited = program('MowAll', zone_msgs(n, 'Near'))
+        edited.rpm, edited.cut_height, edited.speed = 3200, 45, 'slow'
+        n.callback_program_new(edited)                        # owner edit (UI)
+        started.last_result = 'failed: on_path-Near-2-200'
+        started.last_duration_minutes = 7
+        n.callback_program_new(self._from_mission(started))
+        prg = n.permanent_program_list_msg.program_list[0]
+        self.assertEqual((prg.rpm, prg.cut_height, prg.speed), (3200, 45, 'slow'))
+        self.assertEqual([z.name for z in prg.zone_list], ['Near'])
+        self.assertEqual(prg.last_result, 'failed: on_path-Near-2-200')
+        self.assertEqual(prg.last_duration_minutes, 7)
+        self.assertEqual(yaml_programs('A'), {'MowAll': ['Near']})
+
+    def test_mission_write_back_never_brings_a_deleted_program_back(self):
+        n = self._site_a_with_mowall()
+        n.callback_program_select(String('MowAll'))
+        started = copy.deepcopy(last('/web_plan/program_active'))
+        n.callback_program_remove(String('MowAll'))
+        started.last_result = 'succeeded'
+        n.callback_program_new(self._from_mission(started))   # 60 s later
+        self.assertEqual(mem_programs(n), {})
+        self.assertEqual(yaml_programs('A'), {})
+
+    def test_running_program_is_not_deleted(self):
+        n = self._site_a_with_mowall()
+        n.callback_mission_program(String('MowAll'))
+        n.callback_mission_status(String('Mowing started'))
+        del EVENTS[:]
+        n.callback_program_remove(String('MowAll'))
+        self.assertEqual(mem_programs(n), {'MowAll': ['Near', 'Far']})
+        logs = [m.data for t, m in EVENTS if t == '/web_plan/log']
+        self.assertEqual(logs, ["Program 'MowAll' NOT deleted: it is running — "
+                                "Stop it first."])
+        n.callback_mission_status(String('Stopped'))          # STOP: over
+        n.callback_program_remove(String('MowAll'))
+        self.assertEqual(mem_programs(n), {})
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -183,6 +183,11 @@ class Node:
             self.program_list_publisher()
         self.clean_running_dir()
 
+        # What the mower mission runs now (see callback_mission_program).
+        self._mission_program = ''
+        self._mission_status = ''
+        self._mission_node = rospy.get_param('~mission_node', '/node_mower_smach')
+
         # ---- subscribers / services
         self.site_map_sub = rospy.Subscriber("/mapping_manager/site_map",
                                              OccupancyGrid, self.callback_site_map,
@@ -216,6 +221,10 @@ class Node:
         self.program_new_sub = rospy.Subscriber("/web_plan/program_new", PlannerProgram, self.callback_program_new)
         self.program_remove_sub = rospy.Subscriber("/web_plan/program_remove", String, self.callback_program_remove)
         self.program_to_show_marker_sub = rospy.Subscriber("/web_plan/program_to_show_marker", PlannerProgram, self.callback_program_to_show_marker)
+        # The mission's program (latched name, " " = none) and state: a running
+        # program is not removed under the robot.
+        self.mission_program_sub = rospy.Subscriber("/mower_smach/active_program", String, self.callback_mission_program)
+        self.mission_status_sub = rospy.Subscriber("/mower_smach/status", String, self.callback_mission_status)
 
         self.save_map_srv = rospy.Service("/web_plan/save_map", Save_map, self.save_map)
 
@@ -2897,7 +2906,59 @@ class Node:
         self.program_list_publisher()
         return True
 
+    # ---- the mission's view of programs ------------------------------------
+    # Mission states that do not move the robot any more: the program there is
+    # over (Stopped / TERMINAL ERROR wait for Reset) or none runs.
+    _MISSION_IDLE = ('', 'ready', 'stopped', 'terminal error', 'starting...')
+
+    def callback_mission_program(self, msg):
+        self._mission_program = (msg.data or '').strip()
+
+    def callback_mission_status(self, msg):
+        self._mission_status = (msg.data or '').strip()
+
+    def _program_is_running(self, name):
+        if not name or name != self._mission_program:
+            return False
+        status = self._mission_status.lower()
+        return not (status in self._MISSION_IDLE or status.startswith('rejected'))
+
+    def _from_mission(self, msg):
+        """A /web_plan/program_new sent by the mower mission itself: its
+        periodic (60 s) and end-of-run write-back of last_result."""
+        hdr = getattr(msg, '_connection_header', None) or {}
+        return hdr.get('callerid') == self._mission_node
+
+    def _mission_write_back(self, msg):
+        """The mission reports how ITS run went; it never owns the program.
+
+        Only last_result (the resume checkpoint) and last_duration_minutes are
+        taken. The mission keeps the copy it started with and repeats it every
+        60 s even after the run, so taking the whole message reverted every
+        later edit (RPM, height, speed, zones) and brought a deleted or renamed
+        program back within a minute."""
+        for prg in self.permanent_program_list_msg.program_list:
+            if prg.name == msg.name:
+                if (prg.last_result == msg.last_result
+                        and prg.last_duration_minutes == msg.last_duration_minutes):
+                    return
+                prg.last_result = msg.last_result
+                prg.last_duration_minutes = msg.last_duration_minutes
+                self.save_programs()
+                self.program_list_publisher()
+                self._bundle_export_programs()
+                return
+        rospy.loginfo("[{}] Mission result for program '{}' ignored: the program "
+                      "is not in the list (removed or renamed).".format(
+                          rospy.get_caller_id(), msg.name))
+
     def callback_program_new(self, msg):
+        if self._from_mission(msg):
+            # Silently dropped while the served site's list is not loaded: the
+            # mission repeats it every 60 s and the next one lands.
+            if self._programs_usable():
+                self._mission_write_back(msg)
+            return
         if self._programs_refuse_edit("Program '{}' NOT saved".format(msg.name)):
             return
         if not self._legacy_maps() and not self._legacy_tagged(msg):
@@ -2945,6 +3006,12 @@ class Node:
 
     def callback_program_remove(self, msg):
         if self._programs_refuse_edit("Program '{}' NOT removed".format(msg.data)):
+            return
+        if self._program_is_running(msg.data):
+            text = ("Program '{}' NOT deleted: it is running — Stop it first.".format(msg.data))
+            self.log_publisher(text)
+            rospy.logwarn("[{}] {}".format(rospy.get_caller_id(), text))
+            self.program_list_publisher()
             return
         rospy.loginfo("[{}] Removing program {} from list".format(rospy.get_caller_id(), msg.data))
         ## Remove program from list

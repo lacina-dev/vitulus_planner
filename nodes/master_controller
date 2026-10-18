@@ -569,7 +569,12 @@ class MasterController(object):
             return
 
         # --- Inhibit check (all active states except PREPARE_SLEEP) ---
-        if self.is_inhibited and self.state != self.STATE_PREPARE_SLEEP:
+        # Hold stops new starts only. A program already MOWING is still
+        # followed to its end (stop_reason, back in the dock): leaving MOWING
+        # here dropped that end, and the event it was started for stayed
+        # "interrupted" - releasing Hold then RESUMED a finished program.
+        if (self.is_inhibited and self.state not in
+                (self.STATE_PREPARE_SLEEP, self.STATE_MOWING)):
             self._transition(self.STATE_INHIBITED)
 
         # --- INHIBITED ---
@@ -748,7 +753,10 @@ class MasterController(object):
             in_dock = self.is_in_dock
             active_program = self.active_program_name.strip()
 
-        self.status_pub.publish(String("Mowing"))
+        if smach_status in ("Stopped", "TERMINAL ERROR"):
+            self.status_pub.publish(String("Mowing (%s - press Reset)" % smach_status))
+        else:
+            self.status_pub.publish(String("Mowing"))
 
         # Grace period after start - ignore Ready for a few seconds
         if time.time() < self._mowing_grace_until:
@@ -885,6 +893,14 @@ class MasterController(object):
         """Sleep according to the pending recovery reason (robot in dock)."""
         reason = self._pending_recovery_reason
         self._pending_recovery_reason = None
+        if reason is not None and self.is_inhibited:
+            # Hold: no recovery sleep (nobody asked the robot to wait for
+            # its next start). The interrupted event and its reason stay;
+            # IDLE resumes them once Hold is released.
+            self.log("[Master] Hold is on: no recovery sleep (%s); the "
+                     "program resumes after Hold is released." % reason)
+            self._transition(self.STATE_IDLE)
+            return
         if reason == 'battery':
             self.log("[Master] Recovery: sleep until charged, then resume.")
             self._execute_sleep(charged=True)
