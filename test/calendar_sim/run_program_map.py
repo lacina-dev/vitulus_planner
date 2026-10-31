@@ -159,6 +159,9 @@ class Sim(R.Sim):
     def boot(self):
         """World up, first map on, the planner ready."""
         self.wait(lambda: self.p_serve.get_num_connections() > 0, 30, 'mapping up')
+        # mapping_manager serves the newest site itself right after it subscribes:
+        # the map of the scenario has to come after that, not race with it.
+        self.wait(lambda: self.mapping.get('sites'), 30, 'status')
         if self.first_serve:
             self.p_serve.publish(String(self.first_serve))
             ok = self.wait(lambda: self.loaded == self.first_serve, 90, 'first map')
