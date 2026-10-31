@@ -30,6 +30,7 @@ from os.path import isfile, join, exists
 import shutil
 from node_planner.planner_data import MapData, MapSpec, PathPolygon, Zone
 from node_planner import planner_io
+from node_planner import run_path
 
 # Planner state lives under ~/.vitulus (created on first boot, see Node.__init__).
 _VITULUS_DIR = os.path.join(os.path.expanduser('~'), '.vitulus')
@@ -89,7 +90,6 @@ class Node:
         self.current_zone = None
         self.data_loaded = None
         self.program_active = None
-        self.current_program_marker_array = None
         self.rtabmap_map_received = False
 
         # Site-bundle (WP-C) state. `~bundle_site` forces a site; otherwise the
@@ -170,7 +170,10 @@ class Node:
         # Latched; every message starts with a DELETEALL marker, so a client just
         # feeds it to a MarkerArray client. Cleared on cancel/remove/site change.
         self.zone_preview_pub = rospy.Publisher("/web_plan/zone_preview_marker", MarkerArray, latch=True, queue_size=1)
-        self.marker_program_paths_pub = rospy.Publisher("/web_plan/program_marker", MarkerArray, queue_size=0)
+        # Latched, every message is the whole picture (run_path.py): one is enough
+        # for a client that connects later, and only the newest one matters.
+        self.marker_program_paths_pub = rospy.Publisher("/web_plan/program_marker", MarkerArray, latch=True, queue_size=1)
+        self.program_marker_state_pub = rospy.Publisher("/web_plan/program_marker_state", String, latch=True, queue_size=1)
         self.map_edited_pub = rospy.Publisher("/web_plan/map_edited", OccupancyGrid, queue_size=1)
         self.program_list_pub = rospy.Publisher("/web_plan/program_list", PlannerProgramList, latch=True, queue_size=10)
         self.program_active_pub = rospy.Publisher("/web_plan/program_active", PlannerProgram, queue_size=1)
@@ -188,6 +191,13 @@ class Node:
         self._mission_program = ''
         self._mission_status = ''
         self._mission_node = rospy.get_param('~mission_node', '/node_mower_smach')
+        # What the program markers show (see _program_markers_sync).
+        self._marker_lock = threading.RLock()
+        self._shown_paths = run_path.ShownPaths()
+        self._run_path_busy = None
+        self._run_path_drawn = None     # what the last publish drew
+        self._run_path_fresh = False    # a new Run: last_result not read yet
+        self._run_path_old_result = None
 
         # ---- subscribers / services
         self.site_map_sub = rospy.Subscriber("/mapping_manager/site_map",
@@ -229,6 +239,8 @@ class Node:
         # program is not removed under the robot.
         self.mission_program_sub = rospy.Subscriber("/mower_smach/active_program", String, self.callback_mission_program)
         self.mission_status_sub = rospy.Subscriber("/mower_smach/status", String, self.callback_mission_status)
+        self.run_path_busy_sub = rospy.Subscriber("/mower_smach/busy", Bool, self.callback_run_path_busy)
+        self.run_path_show_sub = rospy.Subscriber("/web_plan/run_path_show", Bool, self.callback_run_path_show)
 
         self.save_map_srv = rospy.Service("/web_plan/save_map", Save_map, self.save_map)
 
@@ -1123,9 +1135,51 @@ class Node:
     def zone_path_lines_publisher(self):
         pass   # AUDIT dead-code: publisher removed (no consumers)
 
-    def program_marker_publisher(self):
-        if self.current_program_marker_array is not None:
-            self.marker_program_paths_pub.publish(self.current_program_marker_array)
+    def _running_program_msg(self, name):
+        """The listed program the mission runs; None while the list in memory is
+        not the served site's (map change) - it is drawn once it is."""
+        if not name or self.permanent_program_list_msg is None or not self._programs_usable():
+            return None
+        for program in self.permanent_program_list_msg.program_list:
+            if program.name == name and self._on_current_map(program):
+                return program
+        return None
+
+    def _program_markers_sync(self, force=False):
+        """Publish the picture when it differs from the published one. Called on
+        every mission / Show change and from the main loop: it is a function of
+        the state, so a late list or a planner restart in mid-run ends the same.
+        The checkpoint (last_result) comes in at least every 60 s with the
+        mission's write-back; the state of a new Run still holds the last run's."""
+        with self._marker_lock:
+            shown = self._shown_paths
+            if shown.set_run(run_path.running_program(
+                    self._run_path_busy, self._mission_program, self._mission_status)):
+                self._run_path_old_result = None
+            program = self._running_program_msg(shown.run)
+            result = None
+            if program is not None:
+                if self._run_path_fresh:
+                    self._run_path_fresh = False
+                    self._run_path_old_result = program.last_result
+                if program.last_result != self._run_path_old_result:
+                    result = program.last_result
+            checkpoint = run_path.parse_checkpoint(result)
+            draw_run = program is not None and not shown.run_hidden
+            drawn = (shown.run, draw_run, checkpoint, shown.manual, shown.manual_waits)
+            if drawn == self._run_path_drawn and not force:
+                return
+            self._run_path_drawn = drawn
+            marker_array = self._deleteall_marker_array()
+            done_m = total_m = 0.0
+            if program is not None:
+                markers, done_m, total_m = run_path.build_markers(
+                    program, rospy.Time.now(), checkpoint)
+                if draw_run:
+                    marker_array.markers.extend(markers)
+            marker_array.markers.extend(shown.manual_visible())
+            self.marker_program_paths_pub.publish(marker_array)
+            self.program_marker_state_pub.publish(String(shown.state_json(done_m, total_m)))
 
     def _deleteall_marker_array(self):
         """MarkerArray holding a single DELETEALL marker (frame 'map')."""
@@ -1157,9 +1211,11 @@ class Node:
         """The served site / active map changed: whatever program or zone was
         shown belongs to the OLD map. Forget the shown program, tell every open
         client to drop its program markers (one DELETEALL on
-        /web_plan/program_marker) and clear the zone preview."""
-        self.current_program_marker_array = None
-        self.marker_program_paths_pub.publish(self._deleteall_marker_array())
+        /web_plan/program_marker) and clear the zone preview. A running program
+        comes back by itself when the list of its map is in (main loop)."""
+        with self._marker_lock:
+            self._shown_paths.hide_manual()
+            self._program_markers_sync(force=True)
         with self._workspace_lock:   # current_zone is shared with the zone regen
             self.current_zone = None
             self._clear_zone_preview()
@@ -1228,59 +1284,20 @@ class Node:
         zone.zone_path_lines_marker_array = marker_array
 
     def callback_program_to_show_marker(self, program):
-        if program.name == "":
-            self.current_program_marker_array = None
-            self.marker_program_paths_pub.publish(self._deleteall_marker_array())
-        else:
-            marker_array = MarkerArray()
-            points = []
-            i = 0
-            for zone in program.zone_list:
-                # Zone border
-                for ip in range(0, len(zone.polygon.polygon.points)-1):
-                    points.append(Point32(zone.polygon.polygon.points[ip].x,
-                                          zone.polygon.polygon.points[ip].y,
-                                          zone.polygon.polygon.points[ip].z))
-                    points.append(Point32(zone.polygon.polygon.points[ip+1].x,
-                                          zone.polygon.polygon.points[ip+1].y,
-                                          zone.polygon.polygon.points[ip+1].z))
-                # Last to first point line of zone border
-                points.append(Point32(zone.polygon.polygon.points[len(zone.polygon.polygon.points)-1].x,
-                                      zone.polygon.polygon.points[len(zone.polygon.polygon.points)-1].y,
-                                      zone.polygon.polygon.points[len(zone.polygon.polygon.points)-1].z))
-                points.append(Point32(zone.polygon.polygon.points[0].x,
-                                      zone.polygon.polygon.points[0].y,
-                                      zone.polygon.polygon.points[0].z))
-                marker = self.marker_line_list_from_points(points, "{}_border_polygon".format(zone.name), i, color=[0, 1, 0, 1], scale=0.01)
-                marker_array.markers.append(marker)
+        """Manual Show / Hide. The UI's Hide sends the name 'none'."""
+        with self._marker_lock:
+            if program.name in ('', 'none'):
+                self._shown_paths.hide_manual()
+            else:
+                self._shown_paths.show_manual(program.name, run_path.build_markers(
+                    program, rospy.Time.now(), prefix='manual')[0])
+            self._program_markers_sync(force=True)
 
-                # Zone paths
-                path_i = 0
-                print("len(zone.paths): {}".format(len(zone.paths)))
-                print(zone.paths)
-                for path in zone.paths:
-                    print("path_i: {}".format(path_i))
-
-                    points = []
-                    for pose_i in range(len(path.poses)-1):
-                        points.append(Point32(path.poses[pose_i].pose.position.x,
-                                              path.poses[pose_i].pose.position.y,
-                                              path.poses[pose_i].pose.position.z))
-                        points.append(Point32(path.poses[pose_i+1].pose.position.x,
-                                              path.poses[pose_i+1].pose.position.y,
-                                              path.poses[pose_i+1].pose.position.z))
-                    if path.poses[0].pose.position.x == path.poses[-1].pose.position.x and path.poses[0].pose.position.y == path.poses[-1].pose.position.y:
-                        marker = self.marker_line_list_from_points(points, "{}_path_{}".format(zone.name, path_i), i, color=[0, 0, 1, 1], scale=0.05)
-                        marker_array.markers.append(marker)
-                    else:
-                        marker = self.marker_line_list_from_points(points, "{}_path_{}".format(zone.name, path_i), i, color=[0.5, 0, 0.5, 1], scale=0.05)
-                        marker_array.markers.append(marker)
-                    path_i += 1
-                i += 1
-            self.current_program_marker_array = marker_array
-            self.program_marker_publisher()
-
-
+    def callback_run_path_show(self, msg):
+        """Show / Hide of the running program, valid for this run."""
+        with self._marker_lock:
+            self._shown_paths.set_run_visible(msg.data)
+            self._program_markers_sync(force=True)
 
     # AUDIT dead-code: zone_outline_poly_publisher removed (publisher deleted, uncalled)
 
@@ -2983,9 +3000,17 @@ class Node:
 
     def callback_mission_program(self, msg):
         self._mission_program = (msg.data or '').strip()
+        self._program_markers_sync()
 
     def callback_mission_status(self, msg):
         self._mission_status = (msg.data or '').strip()
+        if self._mission_status in run_path.STARTING_STATUS:
+            self._run_path_fresh = self._mission_status == run_path.FRESH_STATUS
+        self._program_markers_sync()
+
+    def callback_run_path_busy(self, msg):
+        self._run_path_busy = msg.data
+        self._program_markers_sync()
 
     def _program_is_running(self, name):
         if not name or name != self._mission_program:
@@ -3167,6 +3192,7 @@ if __name__ == '__main__':
             node.map_show_publisher()
             if slow_r == slow_id:
                 node.map_edited_publisher()
+                node._program_markers_sync()
                 slow_id = 0
             slow_id += 1
             r.sleep()

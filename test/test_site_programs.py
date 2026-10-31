@@ -28,7 +28,7 @@ os.environ['HOME'] = _HOME          # BEFORE the planner / bundle modules load
 try:
     import yaml
     import rospy
-    from std_msgs.msg import String
+    from std_msgs.msg import Bool, String
     from nav_msgs.msg import OccupancyGrid
     from geometry_msgs.msg import Point32
     from vitulus_msgs.msg import MapEditZone, PlannerProgram
@@ -235,6 +235,24 @@ class SiteProgramsTest(unittest.TestCase):
         return n
 
     # ------------------------------------------------------------ normal path
+    def test_running_program_comes_back_after_a_map_change(self):
+        n = self._site_a_with_mowall()
+        n.callback_run_path_busy(Bool(True))
+        n.callback_mission_status(String('Mowing started'))
+        n.callback_mission_program(String('MowAll'))
+        self.assertTrue(any(k.action == 0 for k in last('/web_plan/program_marker').markers))
+        n.callback_program_to_show_marker(program('Other', zone_msgs(n, 'Near')))
+        self.assertEqual(n._shown_paths.manual, 'Other')
+
+        serve(n, 'B')       # the list in memory is B's now: MowAll is not there
+        self.assertEqual([k.action for k in last('/web_plan/program_marker').markers], [3])
+        self.assertIsNone(n._shown_paths.manual)
+        self.assertEqual(json.loads(last('/web_plan/program_marker_state').data)['run'], 'MowAll')
+
+        serve(n, 'A')
+        n._program_markers_sync()
+        self.assertTrue(any(k.action == 0 for k in last('/web_plan/program_marker').markers))
+
     def test_switch_a_b_none_a(self):
         n = self._site_a_with_mowall()
         n.callback_program_to_show_marker(program('MowAll', zone_msgs(n, 'Near')))
@@ -244,7 +262,7 @@ class SiteProgramsTest(unittest.TestCase):
         serve(n, 'B')
         marker_msgs = [m for t, m in EVENTS if t == '/web_plan/program_marker']
         self.assertEqual([[k.action for k in m.markers] for m in marker_msgs], [[3]])
-        self.assertIsNone(n.current_program_marker_array)
+        self.assertIsNone(n._shown_paths.manual)
         self.assertEqual([k.action for k in last('/web_plan/zone_preview_marker').markers], [3])
         self.assertEqual(listed_zones(), [])
         self.assertEqual(listed_programs(), [])
