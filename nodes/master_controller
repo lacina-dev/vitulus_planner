@@ -410,7 +410,7 @@ class MasterController(object):
         # that is on; a slot may belong to another map. {site: [{name, ...}]}
         self.site_programs = None
         self.start_state = None     # last /web_plan/program_start_state
-        self._start_sent_t = 0.0
+        self.start_state_t = 0.0
         self.programs_loaded = False
         self.battery_capacity = 0
         self.supply_status = "UNKNOWN"
@@ -747,6 +747,7 @@ class MasterController(object):
             return
         with self.lock:
             self.start_state = state
+            self.start_state_t = self._t()
 
     def power_callback(self, msg):
         with self.lock:
@@ -923,7 +924,7 @@ class MasterController(object):
             self.stop_reason = ""
             self.active_program_name = ""
             self.mission_started_name = ""
-        self._start_sent_t = self._t()
+            self.start_state = None     # only the word on THIS start counts
         pub.publish(String(prog_name))
         self._mission_seen = False
         self._mission_start_deadline = self._t() + 60.0
@@ -984,9 +985,15 @@ class MasterController(object):
             agent = self.agent_status
             agent_age = self._t() - self.agent_status_t
             agent_mission = self.agent_mission_active
+            start = self.start_state or {}
+            start_age = self._t() - self.start_state_t
         if busy is None:
             return 'mission_unknown'
         if busy:
+            return 'mission'
+        # A start that loads its map is a mission already, just not in the SMACH
+        # yet (vitulus-field#46). Bounded: a dead planner must not block for ever.
+        if start.get('state') == 'switching' and start_age < 200.0:
             return 'mission'
         if dock in (1, 2):
             return 'dock'
@@ -1571,8 +1578,7 @@ class MasterController(object):
         handled here, the mission has nothing to pick up yet."""
         with self.lock:
             state = self.start_state
-        if (not state or state.get('program') != prog
-                or float(state.get('t') or 0.0) < self._start_sent_t - 1.0):
+        if not state or state.get('program') != prog:
             return False
         if state.get('state') == 'switching':
             # The planner's own timeout bounds this.

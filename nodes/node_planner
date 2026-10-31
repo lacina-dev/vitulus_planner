@@ -245,7 +245,7 @@ class Node:
         # before the mission (and with it the undock) gets the program.
         self._map_gate = program_map.MapGate(
             self,
-            timeout_s=rospy.get_param('~program_map_timeout_s', 120.0),
+            timeout_s=rospy.get_param('~program_map_timeout_s', 180.0),
             pose_tol_m=rospy.get_param('~program_map_pose_tol_m', 0.5))
         self.program_start_state_pub = rospy.Publisher(
             "/web_plan/program_start_state", String, queue_size=5, latch=True)
@@ -2026,7 +2026,7 @@ class Node:
         if self._map_gate.busy():
             # Nothing may start under a map that is changing.
             running = self._map_gate.busy()
-            site, name = program_map.parse_ref(ref)
+            name = program_map.parse_ref(ref)[1]
             if running and running['ref'] != ref:
                 self._map_gate.refuse(verb, ref, name, running['site'], 'switching',
                                       busy=running['program'])
@@ -2053,9 +2053,6 @@ class Node:
             if ok:
                 self._map_gate.ready(verb, ref, plan.name, plan.site)
             elif reason is not None:
-                text = "Program '{}' not started: {}.".format(plan.name, reason)
-                self.log_publisher(text)
-                rospy.logwarn("[{}] {}".format(rospy.get_caller_id(), text))
                 self._map_gate.refuse(verb, ref, plan.name, plan.site,
                                       'program_unusable', detail=reason)
             else:
