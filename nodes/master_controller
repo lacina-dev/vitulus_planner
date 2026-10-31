@@ -406,6 +406,11 @@ class MasterController(object):
         # ---- runtime state -------------------------------------------------
         self.is_in_dock = False
         self.program_list = []
+        # vitulus-field#46: the planner's list holds the programs of the map
+        # that is on; a slot may belong to another map. {site: [{name, ...}]}
+        self.site_programs = None
+        self.start_state = None     # last /web_plan/program_start_state
+        self._start_sent_t = 0.0
         self.programs_loaded = False
         self.battery_capacity = 0
         self.supply_status = "UNKNOWN"
@@ -530,6 +535,10 @@ class MasterController(object):
                          self.dock_callback)
         rospy.Subscriber('/web_plan/program_list', PlannerProgramList,
                          self.programs_callback)
+        rospy.Subscriber('/mapping_manager/status', String,
+                         self.mapping_status_callback)
+        rospy.Subscriber('/web_plan/program_start_state', String,
+                         self.start_state_callback)
         rospy.Subscriber('/pm/power_status', Power_status,
                          self.power_callback)
         rospy.Subscriber('/mower_smach/status', String,
@@ -674,6 +683,7 @@ class MasterController(object):
         return {
             'event_id': ev['id'],
             'program': ev.get('program_name', ''),
+            'site': ev.get('site') or None,   # map of the slot, None = old event
             'slot': slot_dt.strftime("%Y-%m-%dT%H:%M") if slot_dt else None,
             'created': self._t(),
             'started': False,     # the mission really got past its start checks
@@ -715,6 +725,28 @@ class MasterController(object):
         with self.lock:
             self.program_list = msg.program_list
             self.programs_loaded = True
+
+    def mapping_status_callback(self, msg):
+        try:
+            sites = json.loads(msg.data).get('sites')
+        except (ValueError, AttributeError):
+            return
+        if not isinstance(sites, list):
+            return
+        with self.lock:
+            self.site_programs = {
+                s['name']: list(s.get('programs_info') or
+                                [{'name': n} for n in s.get('programs') or []])
+                for s in sites if isinstance(s, dict) and s.get('name')}
+            self.programs_loaded = True
+
+    def start_state_callback(self, msg):
+        try:
+            state = json.loads(msg.data)
+        except ValueError:
+            return
+        with self.lock:
+            self.start_state = state
 
     def power_callback(self, msg):
         with self.lock:
@@ -865,19 +897,33 @@ class MasterController(object):
     # =====================================================================
     # FSM helpers
     # =====================================================================
-    def _program_on_map(self, prog_name):
-        """False when the planner's program list is loaded and lacks prog_name
-        (a calendar event of another site, a deleted or renamed program)."""
+    def _program_on_map(self, prog_name, site=None):
+        """False when no map has the program (deleted, renamed). The planner's
+        list is only the map that is on: another map's program is started too,
+        the planner loads its map first (vitulus-field#46)."""
         with self.lock:
             if not self.programs_loaded:
                 return True
-            return any(p.name == prog_name for p in self.program_list)
+            if not site and any(p.name == prog_name for p in self.program_list):
+                return True
+            if self.site_programs is None:
+                return bool(site)   # no status yet: the planner decides
+            owners = [s for s, progs in self.site_programs.items()
+                      if any(p.get('name') == prog_name for p in progs)]
+            return site in owners if site else bool(owners)
+
+    @staticmethod
+    def _program_ref(run):
+        """What goes on the select topics: the site, when the slot names it."""
+        name = run.get('program', '')
+        return '%s|||%s' % (run['site'], name) if run.get('site') else name
 
     def _start_program(self, prog_name, pub):
         with self.lock:
             self.stop_reason = ""
             self.active_program_name = ""
             self.mission_started_name = ""
+        self._start_sent_t = self._t()
         pub.publish(String(prog_name))
         self._mission_seen = False
         self._mission_start_deadline = self._t() + 60.0
@@ -1162,13 +1208,25 @@ class MasterController(object):
                     checkpoint=run.get('checkpoint'), **detail)
         self._clear_interrupted()
 
-    def _program_checkpoint(self, prog_name):
-        """The planner's copy of the mission's last_result for prog_name."""
+    def _program_checkpoint(self, prog_name, site=None):
+        """The planner's copy of the mission's last_result for prog_name; when
+        another map is on now, the copy in the program's site bundle."""
         with self.lock:
-            for p in self.program_list:
-                if p.name == prog_name:
-                    return getattr(p, 'last_result', None)
+            if not site or self._site_on_list(site):
+                for p in self.program_list:
+                    if p.name == prog_name:
+                        return getattr(p, 'last_result', None)
+            for owner, progs in (self.site_programs or {}).items():
+                if site and owner != site:
+                    continue
+                for p in progs:
+                    if p.get('name') == prog_name:
+                        return p.get('last_result')
         return None
+
+    def _site_on_list(self, site):
+        """The planner's list is the list of `site` (lock held)."""
+        return any(getattr(p, 'map_name', '') == site for p in self.program_list)
 
     # =====================================================================
     # state: IDLE
@@ -1319,7 +1377,8 @@ class MasterController(object):
 
         # Finished meanwhile (Run by hand while the run waited, this node down
         # at its end): nothing is left to resume.
-        if run.get('started') and self._program_checkpoint(prog) == 'succeeded':
+        if (run.get('started')
+                and self._program_checkpoint(prog, run.get('site')) == 'succeeded'):
             self.log("[Master] %s is already finished." % prog)
             self._clear_interrupted()
             return
@@ -1353,7 +1412,7 @@ class MasterController(object):
             self._sleep_to_charge(prog)
             return
 
-        if not self._program_on_map(prog):
+        if not self._program_on_map(prog, run.get('site')):
             self._after_rejected(run, 'not_on_map')
             return
 
@@ -1371,7 +1430,8 @@ class MasterController(object):
             self.persistent.pop('charge_sleep', None)
         self._update_run(following=True, no_charging_told=False)
         self._publish_run_active(True)
-        self._start_program(prog, self.program_select_resume_pub if resume
+        self._start_program(self._program_ref(run),
+                            self.program_select_resume_pub if resume
                             else self.program_select_pub)
         self._set_status("Mowing", 'starting', program=prog)
 
@@ -1467,6 +1527,8 @@ class MasterController(object):
         if not self._mission_seen:
             if smach_status not in ("Ready", "") or active_program or stop_reason:
                 self._mission_seen = True
+            elif self._map_gate_says(prog):
+                return
             elif self._t() > self._mission_start_deadline:
                 self.log("[Master] Program did not start (see the planner log).")
                 run = self._run()
@@ -1503,6 +1565,39 @@ class MasterController(object):
                 self._mission_lost(in_dock)
         else:
             self._ready_no_reason_since = None
+
+    def _map_gate_says(self, prog):
+        """The planner is loading this program's map, or gave up on it. True =
+        handled here, the mission has nothing to pick up yet."""
+        with self.lock:
+            state = self.start_state
+        if (not state or state.get('program') != prog
+                or float(state.get('t') or 0.0) < self._start_sent_t - 1.0):
+            return False
+        if state.get('state') == 'switching':
+            # The planner's own timeout bounds this.
+            self._mission_start_deadline = self._t() + 60.0
+            self._set_status("Mowing (Loading the map of %s)" % prog,
+                             'loading_map', program=prog, site=state.get('site'))
+            return True
+        if state.get('state') != 'failed':
+            return False
+        code = state.get('code') or 'not_started'
+        self.log("[Master] %s not started: %s" % (prog, state.get('text_en') or code))
+        self._mission_seen = True
+        run = self._run()
+        if code == 'cancelled':
+            # Stop pressed while the map was loading: same as a user stop.
+            with self.lock:
+                self.stop_reason = 'stopped:user_stop'
+            return False
+        if run is None:
+            self._transition(self.STATE_IDLE)
+        else:
+            with self.lock:
+                in_dock = self.is_in_dock
+            self._after_rejected(run, 'map:' + code, in_dock)
+        return True
 
     def _confirm_started(self, started_name):
         """The mission left its start checks: only now the slot has run."""
@@ -1636,7 +1731,7 @@ class MasterController(object):
     def _after_interrupt(self, run, reason):
         """A mission that really ran has stopped early. Count it, cap it, and
         leave the run waiting for its resume."""
-        checkpoint = self._program_checkpoint(run.get('program'))
+        checkpoint = self._program_checkpoint(run.get('program'), run.get('site'))
         resumes = run.get('resumes', 0) + 1
         no_progress = run.get('no_progress', 0)
         if reason not in ('weather', 'window') and checkpoint is not None:

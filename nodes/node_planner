@@ -8,7 +8,7 @@ from shapely import affinity
 from shapely import ops
 import random
 from geometry_msgs.msg import Pose, Point, Quaternion, PoseStamped
-from std_msgs.msg import String, Bool
+from std_msgs.msg import String, Bool, Int8
 from vitulus_planner.srv import Save_map, Save_mapResponse
 import numpy as np
 import cv2
@@ -31,6 +31,7 @@ import shutil
 from node_planner.planner_data import MapData, MapSpec, PathPolygon, Zone
 from node_planner import planner_io
 from node_planner import run_path
+from node_planner import program_map
 
 # Planner state lives under ~/.vitulus (created on first boot, see Node.__init__).
 _VITULUS_DIR = os.path.join(os.path.expanduser('~'), '.vitulus')
@@ -113,6 +114,16 @@ class Node:
         # None until a site is served. Drives planner_data key + bundle site in
         # site-native mode; a change triggers a planner-data reload for that site.
         self._served_site = None
+        # vitulus-field#46: what the map gate reads (see program_map.MapGate).
+        self._site_catalog = None      # {site: [program names]} of all maps
+        self._mapping_running = False
+        self._serve_error = None
+        self._serve_error_t = 0.0
+        self._mission_busy = None
+        self._dock_status = None
+        self._in_dock = None
+        self._navi_ready = None
+        self._planner_loaded = None
         # Site the in-memory raster (map_data) was built for. A load for a
         # DIFFERENT site must not carry the old site's zones over.
         self._raster_site = None
@@ -230,6 +241,22 @@ class Node:
         self.republish_sub = rospy.Subscriber("/web_plan/republish", Bool, self.callback_republish)
         # self.new_map_sub = rospy.Subscriber("/web_plan/new_map", String, self.callback_new_map)
 
+        # vitulus-field#46: a program starts on its own map, loaded and verified
+        # before the mission (and with it the undock) gets the program.
+        self._map_gate = program_map.MapGate(
+            self,
+            timeout_s=rospy.get_param('~program_map_timeout_s', 120.0),
+            pose_tol_m=rospy.get_param('~program_map_pose_tol_m', 0.5))
+        self.program_start_state_pub = rospy.Publisher(
+            "/web_plan/program_start_state", String, queue_size=5, latch=True)
+        self.serve_site_pub = rospy.Publisher("/mapping_manager/serve_site", String, queue_size=1)
+        self.load_map_pub = rospy.Publisher("/navi_manager/load_map", String, queue_size=1)
+        self.load_map_rtabmap_pub = rospy.Publisher("/navi_manager/load_map_rtabmap", String, queue_size=1)
+        self.mission_busy_sub = rospy.Subscriber("/mower_smach/busy", Bool, self.callback_mission_busy)
+        self.mission_stop_sub = rospy.Subscriber("/mower_smach/stop", Bool, self.callback_mission_stop)
+        self.dock_status_sub = rospy.Subscriber("/dock_smach/dock_status", Int8, self.callback_dock_status)
+        self.in_dock_sub = rospy.Subscriber("/dock_manager/is_in_dock", Bool, self.callback_in_dock)
+        self.navi_ready_sub = rospy.Subscriber("/navi_manager/map_ready", String, self.callback_navi_ready)
         self.program_select_sub = rospy.Subscriber("/web_plan/program_select", String, self.callback_program_select)
         self.program_select_resume_sub = rospy.Subscriber("/web_plan/program_select_resume", String, self.callback_program_select_resume)
         self.program_new_sub = rospy.Subscriber("/web_plan/program_new", PlannerProgram, self.callback_program_new)
@@ -365,6 +392,7 @@ class Node:
                 self.map_zone_list_publisher()
                 self.map_poly_list_publisher()
                 self.program_list_publisher()
+            self._planner_loaded = key
             self.planner_loaded_pub.publish(String(key))
             return
         # ---- legacy path (legacy_maps=True): keyed on active navi map name ----
@@ -383,6 +411,7 @@ class Node:
                 # Bundle-wins: if the site bundle is newer than the just-loaded
                 # pickles, rebuild zones/programs from it (UTM -> map, regen).
                 self._bundle_import_if_newer()
+                self._planner_loaded = self.current_navi_map_name
                 self.planner_loaded_pub.publish(String(self.current_navi_map_name))
         else:
             self.log_publisher("Not loaded!!! It's a new map. Save it in Navi Manager first.")
@@ -1974,22 +2003,121 @@ class Node:
         program.length = min(int(sum(z.length for z in zones)), 32767)
         return program, None
 
-    def _select_program(self, name, verb, pub):
+    def _select_on_map(self, name, verb, pub):
+        """Hand a program of the map that is on to the mission. (True, None), or
+        (False, reason) when it cannot run; (False, None) = no such program."""
         if self.permanent_program_list_msg is not None and self._programs_usable():
             for program_msg in self.permanent_program_list_msg.program_list:
                 if program_msg.name == name:
                     program, reason = self._program_with_current_zones(program_msg)
                     if program is None:
-                        text = "Program '{}' not started: {}.".format(name, reason)
-                        self.log_publisher(text)
-                        rospy.logwarn("[{}] {}".format(rospy.get_caller_id(), text))
-                        return
+                        return False, reason
                     self.program_active = program
                     self.log_publisher("Program selected to {}: {}".format(verb, name))
                     rospy.loginfo("[{}] Program selected to {}: {}".format(rospy.get_caller_id(), verb, name))
                     pub.publish(self.program_active)
-                    return
-        self._program_not_found(name)
+                    return True, None
+        return False, None
+
+    def _select_program(self, ref, verb, pub):
+        """Every start of a program comes through here (UI, calendar, agent,
+        resume). Its map goes on first, verified; the mission - and the undock -
+        gets the program only afterwards (vitulus-field#46)."""
+        if self._map_gate.busy():
+            # Nothing may start under a map that is changing.
+            running = self._map_gate.busy()
+            site, name = program_map.parse_ref(ref)
+            if running and running['ref'] != ref:
+                self._map_gate.refuse(verb, ref, name, running['site'], 'switching',
+                                      busy=running['program'])
+            return
+        legacy = self._legacy_maps()
+        plan = program_map.plan_start(
+            ref, legacy, self._served_site, self.current_navi_map_name,
+            self._usable_programs(), self._site_catalog)
+        if (plan.kind == plan.DIRECT and plan.site and not legacy
+                and program_map.needs_verify(self._navi_ready, plan.site, self._dock_status,
+                                             self._map_gate.pose_tol_m)):
+            plan.kind, plan.verify_only = plan.SWITCH, True
+        if plan.kind == plan.REFUSE:
+            self._map_gate.refuse(verb, ref, plan.name, plan.site, plan.code, **plan.params)
+        elif plan.kind == plan.SWITCH:
+            def start(name, verb_):
+                ok, reason = self._select_on_map(name, verb_, pub)
+                if not ok and reason is None:
+                    reason = "it is not on the map after loading it"
+                return ok, reason
+            self._map_gate.submit(plan, ref, verb, legacy, start)
+        else:
+            ok, reason = self._select_on_map(plan.name, verb, pub)
+            if ok:
+                self._map_gate.ready(verb, ref, plan.name, plan.site)
+            elif reason is not None:
+                text = "Program '{}' not started: {}.".format(plan.name, reason)
+                self.log_publisher(text)
+                rospy.logwarn("[{}] {}".format(rospy.get_caller_id(), text))
+                self._map_gate.refuse(verb, ref, plan.name, plan.site,
+                                      'program_unusable', detail=reason)
+            else:
+                self._program_not_found(plan.name)
+
+    def _usable_programs(self):
+        """{name: map_name} of the list in memory, when it may be used."""
+        if self.permanent_program_list_msg is None or not self._programs_usable():
+            return {}
+        return {p.name: p.map_name for p in self.permanent_program_list_msg.program_list}
+
+    # ---- env of program_map.MapGate ----------------------------------------
+    def now(self):
+        return time.time()
+
+    def sleep(self, seconds):
+        time.sleep(seconds)
+
+    def log(self, text):
+        self.log_publisher(text)
+        rospy.logwarn("[{}] {}".format(rospy.get_caller_id(), text))
+
+    def report(self, state):
+        self.program_start_state_pub.publish(String(program_map.dumps(state)))
+
+    def robot_state(self):
+        return (self._dock_status, self._in_dock, self._mission_status,
+                self._mission_busy, self._mapping_running)
+
+    def status_seen(self):
+        return self._site_catalog is not None
+
+    def request_map(self, site, legacy_mode):
+        """Ask for the map; returns the time stamp serve_error() compares with."""
+        stamp = time.time()
+        pub = self.serve_site_pub
+        if legacy_mode:
+            pub = (self.load_map_rtabmap_pub if program_map.legacy_is_indoor(site)
+                   else self.load_map_pub)
+        deadline = time.time() + 3.0
+        while pub.get_num_connections() == 0 and time.time() < deadline:
+            time.sleep(0.05)
+        pub.publish(String(site))
+        return stamp
+
+    def serve_error(self, stamp):
+        return self._serve_error if self._serve_error_t >= stamp else None
+
+    def map_on(self, site, legacy_mode):
+        if legacy_mode:
+            return self.current_navi_map_name == site
+        return self._served_site == site
+
+    def planner_ready(self, site, legacy_mode):
+        if legacy_mode:
+            return self._planner_loaded == site and self.data_loaded
+        # No lock: a load holds it for its whole length and Stop must get through.
+        return (self._workspace_site == site and self._planner_loaded == site
+                and self._programs_usable())
+
+    def navi_state(self):
+        return self._navi_ready
 
     def callback_program_select(self, msg):
         self._select_program(msg.data, "run", self.program_active_pub)
@@ -2726,6 +2854,12 @@ class Node:
             data = json.loads(msg.data)
         except Exception:
             return
+        catalog = program_map.catalog_from_status(data)
+        if catalog is not None:
+            self._site_catalog = catalog
+        self._mapping_running = bool(data.get('running'))
+        self._serve_error = data.get('serve_error')
+        self._serve_error_t = float(data.get('serve_error_t') or 0.0)
         serving = data.get('serving') or {}
         site = serving.get('site') if isinstance(serving, dict) else None
         if site == self._served_site:
@@ -3011,6 +3145,25 @@ class Node:
     def callback_run_path_busy(self, msg):
         self._run_path_busy = msg.data
         self._program_markers_sync()
+
+    def callback_mission_busy(self, msg):
+        self._mission_busy = bool(msg.data)
+
+    def callback_mission_stop(self, msg):
+        if msg.data:
+            self._map_gate.cancel()
+
+    def callback_dock_status(self, msg):
+        self._dock_status = msg.data
+
+    def callback_in_dock(self, msg):
+        self._in_dock = bool(msg.data)
+
+    def callback_navi_ready(self, msg):
+        try:
+            self._navi_ready = json.loads(msg.data)
+        except ValueError:
+            pass
 
     def _program_is_running(self, name):
         if not name or name != self._mission_program:
