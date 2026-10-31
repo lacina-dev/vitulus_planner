@@ -1,0 +1,7 @@
+# PROPOSAL, not installed. Lets the calendar sleep shut the OS down cleanly
+# (nodes/sleep_shutdown). Install:
+#   sudo install -m 0440 -o root -g root config/sudoers-vitulus-sleep /etc/sudoers.d/vitulus-sleep
+#   sudo visudo -cf /etc/sudoers.d/vitulus-sleep
+# Install ONLY after bench test step B passed: if the BIOS does not boot after a
+# clean poweroff, this entry is what turns a sleep into a robot that stays off.
+vitulus ALL=(root) NOPASSWD: /usr/bin/systemctl poweroff

@@ -90,6 +90,9 @@ catkin_install_python(PROGRAMS
   nodes/master_controller
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
+install(PROGRAMS nodes/sleep_shutdown
+  DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
 
 ################################################################################
 # Test

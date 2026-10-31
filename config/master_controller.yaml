@@ -4,10 +4,11 @@
 # rospy.get_param('~<name>', ...). Durations suffixed _h are hours, _s seconds,
 # _min minutes.
 
-# Master switch: set to false to put the master controller into a fully
-# passive "bypass" (DISABLED) mode - no auto-start, no auto-sleep. Useful for
-# purely manual operation. A softer, runtime toggle is /scheduler/inhibit.
-automation_enabled: false
+# The master switch is NOT here: it is persisted in ~/.vitulus/scheduler_state.json
+# ("automation_enabled", default false), set from the UI (Calendar card) or
+# /scheduler/set_enabled (std_msgs/Bool topic, std_srvs/SetBool service), and
+# reported on the latched /scheduler/enabled. Off = fully passive: no start, no
+# sleep. On releases Hold (/scheduler/inhibit, the pause of a robot that is on).
 
 # Short settle delay (seconds) before the FSM leaves STATE_INIT.
 startup_delay_s: 10.0
@@ -30,23 +31,91 @@ boot_time_buffer_s: 120.0
 idle_sleep_threshold_s: 1200.0    # 20 min
 
 # After a program ends with the robot off-dock, wait this long for it to
-# return before triggering an emergency sleep.
+# return. Then it reports and, if the automation left it outside, is sent home
+# once. It never sleeps off the dock.
 off_dock_wait_s: 1200.0           # 20 min
 
-# Battery capacity (%, 0-100) required to resume an interrupted program.
-# Matches the smach pre-start hysteresis (reject below 40%).
+# --- Sleep (node_planner/sleep_manager.py). The NUC is off, the PM wakes it. ---
+# PM waits this long after the sleep command before it cuts 19 V; the OS
+# shutdown has to fit in. Stored in PM EEPROM, written only when it differs.
+# Also applies to Sleep now in the UI.
+sleep_wait_before_standby_s: 180.0
+# 19 V stays off at least this long, shorter sleeps are refused (sleep_min_s).
+sleep_min_off_s: 120.0
+sleep_min_s: 900.0
+# A longer sleep ends here and the master decides again from the NUC clock.
+sleep_max_segment_h: 12.0
+# PM clock tolerance (ceramic resonator): wake this share earlier. Measure it.
+sleep_timer_drift: 0.005
+# Between PM armed and OS shutdown: last check of person/mission/switch.
+sleep_final_grace_s: 20.0
+# After a failed attempt no new attempt for this long.
+sleep_fail_cooldown_s: 1800.0
+# Any ssh/terminal session (not the desktop autologin) keeps the robot awake.
+sleep_check_logins: true
+# An open web UI (rosbridge client) keeps the robot awake too: somebody may be
+# working in it, and being awake costs nothing in the dock.
+sleep_check_ui: true
+
+# Charge sleep. 'timed': a charge time from the battery deficit, it ends even
+# without contact. 'until_charged': ends only on CHARGED, so without contact it
+# never ends: ONLY with the patched PM firmware (sleep cap).
+charge_sleep_mode: timed
+charge_full_h: 6.0            # 0 -> 100 % in standby; not measured yet
+charge_sleep_min_h: 0.5
+charge_sleep_max_h: 6.0
+# Charge sleeps in a row without battery gain before it asks for a person.
+charge_sleep_max_no_gain: 2
+
+# Battery capacity (%, 0-100) below which nothing is started. Keep it equal to
+# battery_min_start_pct in mower_smach.yaml (the mission refuses below that).
 battery_recovery_min_capacity: 40
+# After a low-battery return the program resumes only at this level, so one
+# charge really is worth a trip out of the dock. CHARGED on the power module
+# counts as reached.
+battery_resume_after_low_pct: 80
 
 # Recovery sleep durations (hours) by interrupt reason. Each is capped so the
 # robot still wakes before the next scheduled program.
-weather_sleep_duration_h: 4.0
+# Also the wait between two tries after rain (the mission refuses a start for
+# 60 min after the last RAIN frame, see PreStartCheck).
+weather_sleep_duration_h: 2.0
 temp_sleep_duration_h: 1.0
 critical_error_sleep_duration_h: 0.5
 
-# Terminal-error handling: wait this long (minutes) before resetting SMACH,
-# then sleep this long (hours).
+# Terminal error of a run in the dock (undock failed): wait this long (minutes),
+# reset SMACH and retry within critical_retry_max. Off the dock it stays for a
+# person. terminal_error_long_sleep_h is the off-dock wait of the sleep side.
 terminal_error_short_wait_min: 20.0
 terminal_error_long_sleep_h: 8.0
+
+# --- Slots and runs ---------------------------------------------------------
+# A slot that could not start (robot asleep, busy, stack down, clock change)
+# stays due for this long, then it is reported as missed. Never run twice.
+catchup_max_h: 4.0
+# No start with less than this much of the allowed window left.
+start_min_window_left_min: 30.0
+# An unfinished run (rain, battery...) is dropped and reported after this long.
+run_max_age_h: 48.0
+# A refused start (no map yet after a cold boot, no undock program...).
+reject_retry_min: 5.0
+reject_retry_max: 6
+# critical:* failures of one run before it is given up and reported. A receiver
+# that was not ready (critical:gps_not_ready) retries awake after gps_retry_min:
+# a sleep would be one more cold start.
+critical_retry_max: 3
+gps_retry_min: 5.0
+# Interruptions of one run; and in a row without the checkpoint moving.
+resume_max_attempts: 12
+resume_no_progress_max: 3
+# Window closed while mowing: finish the path, go home, resume in the next
+# window. If the path does not end within this, go home at once.
+window_overrun_max_min: 30.0
+# The mission ended without a stop_reason (stack restart): how long Ready + not
+# busy must hold before the run counts as lost and gets resumed.
+mission_lost_grace_s: 20.0
+# Age of /vitulus_test/supervisor_status that still counts (agent phase running).
+agent_status_max_age_s: 15.0
 
 # Global allowed time-window ("don't mow at night"). Outside it the manager
 # never starts/resumes and sleeps until the window opens. Set enabled=false to

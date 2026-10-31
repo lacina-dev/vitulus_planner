@@ -59,6 +59,7 @@ if _NAVI_SRC not in sys.path:
 try:
     from vitulus_mapping import bundle as vbundle
     from vitulus_mapping import geo as vgeo
+    from vitulus_mapping import objnames
     from node_planner import bundle_sync
     _BUNDLE_OK = True
 except Exception as _bundle_err:
@@ -201,6 +202,9 @@ class Node:
         self.map_remove_poly_sub = rospy.Subscriber("/web_plan/remove_polygon", String, self.callback_map_remove_poly)
         self.zone_save_sub = rospy.Subscriber("/web_plan/save_zone", MapEditZone, self.callback_map_save_zone)
         self.zone_remove_sub = rospy.Subscriber("/web_plan/remove_zone", String, self.callback_zone_remove)
+        if _BUNDLE_OK:
+            self.rename_result_pub = rospy.Publisher(objnames.RENAME_RESULT_TOPIC, String, queue_size=10)
+            self.zone_rename_sub = rospy.Subscriber("/web_plan/rename_zone", String, self.callback_zone_rename)
         self.zone_selected_sub = rospy.Subscriber("/web_plan/selected_zone", String, self.callback_zone_selected)
         self.navi_active_map_sub = rospy.Subscriber("/navi_manager/active_map", String, self.callback_navi_active_map)
         # Currently served mapping-v3 site (delegacy 2026-07-19). In site-native
@@ -843,6 +847,72 @@ class Node:
             # Mirror the workspace zones into the site bundle (UTM, bundle-wins).
             self._bundle_export_zones()
         return True, "Zone {} saved.".format(zone.msg.name)
+
+    def callback_zone_rename(self, msg):
+        """Payload JSON {from, to}; exactly one result on the rename result topic."""
+        old, new, code = '', '', 'failed'
+        try:
+            old, new = objnames.parse_request(msg.data)
+            code = self._rename_zone(old, new)
+        except ValueError:
+            code = 'bad_request'
+        except Exception as e:
+            rospy.logerr("[{}] Zone '{}' rename failed: {}".format(
+                rospy.get_caller_id(), old, e))
+            code = 'failed'
+        finally:
+            self.rename_result_pub.publish(String(
+                objnames.result_json('zone', old, new, code)))
+
+    def _rename_zone(self, old, new):
+        """Rename in the workspace, the bundle and every program that uses the zone
+        (programs join zones by name). Returns a rename result code."""
+        if not self._has_workspace():
+            return 'no_site'
+        if not self._programs_usable():
+            return 'busy'           # programs of another site, a swap is pending
+        with self._workspace_lock:
+            site = self._bundle_site()
+            if site and not self._workspace_is_of(site, "zone '{}' NOT renamed".format(old)):
+                return 'busy'
+            bundled = (vbundle.load_zones(site) or []) if site else []
+            names = {z.msg.name for z in self.map_data.zones}
+            names.update(z.get('name') for z in bundled)
+            code = objnames.check_rename(old, new, list(names))
+            if code:
+                return code
+            programs = (self.permanent_program_list_msg.program_list
+                        if self.permanent_program_list_msg is not None else [])
+            users = [p for p in programs
+                     if self._on_current_map(p) and any(z.name == old for z in p.zone_list)]
+            if any(self._program_is_running(p.name) for p in users):
+                return 'busy'
+            for z in self.map_data.zones:
+                if z.msg.name == old:
+                    z.msg.name = new
+            if self.current_zone is not None and self.current_zone.msg.name == old:
+                self.current_zone.msg.name = new
+            # The bundle first: the programs export keeps a stored zone name only
+            # while zones.geojson still holds it.
+            if any(z.get('name') == old for z in bundled):
+                for z in bundled:
+                    if z.get('name') == old:
+                        z['name'] = new
+                vbundle.save_zones(site, bundled)
+                self._touch_bundle_stamp(site, 'zones')
+            for p in users:
+                for z in p.zone_list:
+                    if z.name == old:
+                        z.name = new
+            self.map_zone_list_publisher()
+            self.save_running_data()
+            if users:
+                self.save_programs()
+                self.program_list_publisher()
+                self._bundle_export_programs()
+            self._bundle_export_zones()
+        self.log_publisher("Zone '{}' renamed to '{}'.".format(old, new))
+        return 'ok'
 
     def callback_zone_remove(self, msg):
         ok = False

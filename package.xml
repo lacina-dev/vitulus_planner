@@ -14,5 +14,7 @@
   <depend>std_msgs</depend>
   <exec_depend>rosserial_python</exec_depend>
   <exec_depend>message_runtime</exec_depend>
+  <exec_depend>weather_alert</exec_depend>
+  <exec_depend>std_srvs</exec_depend>
   <build_depend>message_generation</build_depend>
 </package>

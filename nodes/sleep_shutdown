@@ -1,0 +1,25 @@
+#!/bin/bash
+# Clean OS stop before the power module cuts 19 V. Started by master_controller
+# AFTER the PM confirmed the armed sleep.
+#
+# `systemctl poweroff` is the ROS-write stop as well: systemd stops
+# vitulus.service (SIGTERM, then TimeoutStopSec), docker, syncs and unmounts, in
+# order. Stopping the stack from here first would not work: this script lives
+# in vitulus.service's cgroup and would be killed with it.
+#
+# Needs config/sudoers-vitulus-sleep. Without it: exit 3, the stack stays up,
+# master_controller can still cancel, and the PM cuts a synced running system.
+set -u
+# Tests run on a private roscore: never the real machine.
+case "${ROS_MASTER_URI:-}" in
+    *:11311*) ;;
+    *) exit 3 ;;
+esac
+sync
+if sudo -n /usr/bin/systemctl poweroff; then
+    logger -t vitulus-sleep "poweroff accepted" 2>/dev/null
+    exit 0
+fi
+logger -t vitulus-sleep "poweroff refused: hard cut of a synced system" 2>/dev/null
+sync
+exit 3

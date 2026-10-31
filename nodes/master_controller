@@ -15,30 +15,53 @@ concurrent monitors). They are reported here through ``/mower_smach/stop_reason`
 and this node reacts to them:
 
   - succeeded                  -> clear interrupt, idle / wait-for-dock
-  - interrupted:battery        -> sleep until charged, then resume
+  - interrupted:battery        -> charge sleep, then resume
   - interrupted:weather        -> sleep weather_sleep_duration_h, then resume
   - interrupted:temp           -> sleep temp_sleep_duration_h, then resume
   - rejected:rain|recent_rain|forecast (at scheduled start)
                                -> treat like weather interrupt (keep & retry)
-  - rejected:battery           -> sleep until charged, then resume
+  - rejected:battery           -> charge sleep, then resume
   - critical:*                 -> sleep critical_error_sleep_duration_h
   - terminal:* / stopped:*     -> clear interrupt, no auto-sleep (manual/terminal)
 
 Recovery is capped so the robot always wakes before the next scheduled
-program (the interrupted event is abandoned once a new scheduled program
-becomes due). A global allowed time-window ("don't mow at night") gates all
+program. A global allowed time-window ("don't mow at night") gates all
 starts/resumes.
+
+Activation: one persisted switch (scheduler_state.json "automation_enabled",
+default OFF; /scheduler/set_enabled topic + service, /scheduler/enabled
+latched). OFF = state DISABLED: nothing is started, nothing sleeps.
+
+A calendar slot goes:  pending -> run (persisted, "run" in the state file) ->
+really started (last_run_by_event, only when the mission reports it left the
+start checks) -> finished. A slot nobody could start stays pending for
+catchup_max_h, then it is reported as missed (see _scan_slots). A run lives
+until it finishes, whatever waits it goes through: battery, rain, temperature,
+window end, a crash; every wait ends in a resume at the mission's checkpoint.
+Failures are capped (see _run_cap_reached) and reported on /scheduler/report.
 """
 
 import datetime
 import json
 import os
+import sys
 import threading
 import time
 
 import rospy
-from std_msgs.msg import Bool, String, UInt64
-from vitulus_msgs.msg import PlannerProgramList, Power_status
+from std_msgs.msg import Bool, Int8, Int32, String, UInt64
+from std_srvs.srv import SetBool, SetBoolResponse
+from vitulus_msgs.msg import DockProgram, PlannerProgramList, Power_status
+try:
+    from weather_alert.msg import RainAlert
+except ImportError:                 # optional: only the report needs it
+    RainAlert = None
+
+_PKG_SRC = os.path.join(os.path.dirname(os.path.dirname(
+    os.path.realpath(__file__))), 'src')
+if _PKG_SRC not in sys.path:
+    sys.path.insert(0, _PKG_SRC)
+from node_planner import sleep_manager  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -168,7 +191,7 @@ class MowerScheduler(object):
         return None
 
     @classmethod
-    def get_next_event(cls, calendar_events, now=None, horizon_days=8):
+    def get_next_event(cls, calendar_events, now=None, horizon_days=400):
         """Find closest upcoming event.
 
         Returns (next_datetime, event_dict) or (None, None).
@@ -193,6 +216,35 @@ class MowerScheduler(object):
                     best_dt = cand
                     best_ev = ev
         return best_dt, best_ev
+
+    @classmethod
+    def slots_between(cls, calendar_events, after, until):
+        """Every (slot_datetime, event) with after < slot <= until, oldest
+        first. Slots are wall-clock times of a date, so a DST change does not
+        move them; a date is walked only once whatever the clock did."""
+        out = []
+        day = after.date()
+        while day <= until.date():
+            for ev in calendar_events:
+                if not cls._event_runs_on(ev, day):
+                    continue
+                hm = cls._parse_hhmm(ev.get('start_time', ''))
+                if hm is None:
+                    continue
+                cand = datetime.datetime.combine(
+                    day, datetime.time(hour=hm[0], minute=hm[1]))
+                if after < cand <= until:
+                    out.append((cand, ev))
+            day += datetime.timedelta(days=1)
+        out.sort(key=lambda x: x[0])
+        return out
+
+    @staticmethod
+    def real_seconds(a, b):
+        """Real seconds from local time a to local time b. Plain b - a is an
+        hour off across a DST change (27. 3. 2027: the wake-up came an hour
+        late and the slot was gone)."""
+        return time.mktime(b.timetuple()) - time.mktime(a.timetuple())
 
     # --- allowed time-window ("don't mow at night") --------------------------
     @staticmethod
@@ -223,6 +275,15 @@ class MowerScheduler(object):
             cand += datetime.timedelta(days=1)
         return cand
 
+    @staticmethod
+    def window_end_after(now, end_hm):
+        """Next datetime at which the allowed window closes (> now)."""
+        cand = now.replace(hour=end_hm[0], minute=end_hm[1],
+                           second=0, microsecond=0)
+        if cand <= now:
+            cand += datetime.timedelta(days=1)
+        return cand
+
 
 # ---------------------------------------------------------------------------
 # Master Controller
@@ -240,7 +301,6 @@ class MasterController(object):
         rospy.init_node('master_controller')
 
         # ---- parameters ----------------------------------------------------
-        self.automation_enabled = rospy.get_param('~automation_enabled', True)
         self.startup_delay_s = rospy.get_param('~startup_delay_s', 10.0)
         self.boot_grace_period_s = rospy.get_param(
             '~boot_grace_period_s', 300.0)
@@ -254,9 +314,33 @@ class MasterController(object):
         self.off_dock_wait_s = rospy.get_param(
             '~off_dock_wait_s', 1200.0)            # 20 min
 
-        # Battery: resume threshold == smach recovery hysteresis (40%).
+        # Battery: below battery_recovery_min_capacity the mission refuses to
+        # start (same value as its battery_min_start_pct). After a low-battery
+        # return the program resumes only at battery_resume_after_low_pct, so
+        # it does not come back after a few minutes of mowing.
         self.battery_resume_min = rospy.get_param(
             '~battery_recovery_min_capacity', 40)
+        self.battery_resume_low = rospy.get_param(
+            '~battery_resume_after_low_pct', 80)
+
+        # Slots and runs (see the module docstring).
+        self.catchup_max_s = rospy.get_param('~catchup_max_h', 4.0) * 3600.0
+        self.start_min_left_s = rospy.get_param(
+            '~start_min_window_left_min', 30.0) * 60.0
+        self.run_max_age_s = rospy.get_param('~run_max_age_h', 48.0) * 3600.0
+        self.reject_retry_s = rospy.get_param('~reject_retry_min', 5.0) * 60.0
+        self.reject_max = rospy.get_param('~reject_retry_max', 6)
+        self.critical_max = rospy.get_param('~critical_retry_max', 3)
+        self.gps_retry_s = rospy.get_param('~gps_retry_min', 5.0) * 60.0
+        self.resume_max = rospy.get_param('~resume_max_attempts', 12)
+        self.no_progress_max = rospy.get_param('~resume_no_progress_max', 3)
+        self.window_overrun_s = rospy.get_param(
+            '~window_overrun_max_min', 30.0) * 60.0
+        self.mission_lost_grace_s = rospy.get_param(
+            '~mission_lost_grace_s', 20.0)
+        self.agent_status_max_age_s = rospy.get_param(
+            '~agent_status_max_age_s', 15.0)
+        self.tick_hz = rospy.get_param('~tick_hz', 1.0)
 
         # Recovery sleep durations.
         self.weather_sleep_duration_s = rospy.get_param(
@@ -281,6 +365,35 @@ class MasterController(object):
         # Lead time used when computing timed wake-ups.
         self.wake_lead_s = self.wake_before_program_s + self.boot_time_buffer_s
 
+        # Sleep sequence (node_planner/sleep_manager.py).
+        self.sleep_cfg = sleep_manager.SleepConfig(
+            wait_before_standby_s=rospy.get_param(
+                '~sleep_wait_before_standby_s', 180.0),
+            min_off_s=rospy.get_param('~sleep_min_off_s', 120.0),
+            min_sleep_s=rospy.get_param('~sleep_min_s', 900.0),
+            max_segment_s=rospy.get_param('~sleep_max_segment_h', 12.0) * 3600.0,
+            timer_drift=rospy.get_param('~sleep_timer_drift', 0.005),
+            final_grace_s=rospy.get_param('~sleep_final_grace_s', 20.0),
+            retry_s=rospy.get_param('~sleep_retry_s', 3.0),
+            cut_margin_s=rospy.get_param('~sleep_cut_margin_s', 60.0),
+            fail_cooldown_s=rospy.get_param('~sleep_fail_cooldown_s', 1800.0),
+            charged_offset_s=rospy.get_param('~sleep_charged_offset_s', 300.0),
+            charge_full_h=rospy.get_param('~charge_full_h', 6.0),
+            charge_min_h=rospy.get_param('~charge_sleep_min_h', 0.5),
+            charge_max_h=rospy.get_param('~charge_sleep_max_h', 6.0))
+        # 'timed' is the only charge sleep that surely ends with the current
+        # firmware; 'until_charged' needs the patched one (docs in the yaml).
+        self.charge_sleep_mode = rospy.get_param(
+            '~charge_sleep_mode', sleep_manager.MODE_TIMED)
+        self.charge_sleep_max_no_gain = rospy.get_param(
+            '~charge_sleep_max_no_gain', 2)
+        self.sleep_check_logins = rospy.get_param('~sleep_check_logins', True)
+        self.sleep_check_ui = rospy.get_param('~sleep_check_ui', True)
+        self.boot_id_file = rospy.get_param(
+            '~boot_id_file', '/proc/sys/kernel/random/boot_id')
+        sleep_cmd = rospy.get_param('~sleep_shutdown_cmd', os.path.join(
+            os.path.dirname(os.path.realpath(__file__)), 'sleep_shutdown'))
+
         # ---- persistence ---------------------------------------------------
         self.state_dir = os.path.expanduser('~/.vitulus')
         if not os.path.exists(self.state_dir):
@@ -296,14 +409,41 @@ class MasterController(object):
         self.programs_loaded = False
         self.battery_capacity = 0
         self.supply_status = "UNKNOWN"
-        self.smach_status = "Ready"
+        self.charger_status = "UNKNOWN"
+        # "" = not heard from mower_smach yet: nothing starts until it speaks.
+        self.smach_status = ""
+        self.mission_busy = None
+        self.mission_started_name = ""
+        self.dock_status = None
+        self.mux_active = ""
+        self.agent_status = None
+        self.agent_status_t = 0.0
+        self.agent_mission_active = False
+        self.weather = None
         self.stop_reason = ""
         self.active_program_name = ""
-        self.sleep_confirmed = False
+        self.pm_status = None
+        self.pm_status_time = 0.0
+        self.dock_program = None
+        self.ui_clients = 0
+
+        # sleep
+        self.sleep_seq = sleep_manager.SleepSequencer(
+            self.sleep_cfg, self, self._pm_status,
+            sleep_manager.ShutdownHelper(sleep_cmd), log=self.log,
+            clock=self._t)
+        self.sleep_block = None
+        self.last_wake = None
+        self._sleep_cooldown_until = 0.0
+        self._sleep_cooldown_reason = None
+        self._sleep_start_checked = False
+        self._sleep_last_refusal = None
+        self._home_sent = False
+        self._logins_cache = (0.0, [])
 
         # FSM
         self.state = self.STATE_INIT
-        self.node_start_time = time.time()
+        self.node_start_time = self._t()
         self.off_dock_since = None
         self.terminal_error_since = None
         self._mowing_grace_until = 0.0
@@ -313,10 +453,20 @@ class MasterController(object):
         self._mission_start_deadline = 0.0
         self._last_idle_eval = 0.0
         self._pending_recovery_reason = None
-        self._sleep_confirmed_logged = False
+        self._ready_no_reason_since = None
+        self._window_end_sent = 0.0
+        self._window_end_first = 0.0
+        self._attached = False
+        self._code = 'init'
+        self._code_detail = {}
+        self._status_text = ""
+        self._pending_view = []
+        self._report_last = None
+        self._report_t = 0.0
 
         # ---- persistent state ----------------------------------------------
         self.persistent = self._load_state()
+        self.automation_on = bool(self.persistent.get('automation_enabled'))
         self.is_inhibited = bool(
             self.persistent.get('inhibit', self.default_inhibit))
         self.calendar = MowerScheduler.validate_calendar(
@@ -333,6 +483,18 @@ class MasterController(object):
             '/scheduler/inhibit_status', Bool, latch=True, queue_size=1)
         self.calendar_pub = rospy.Publisher(
             '/scheduler/calendar', String, latch=True, queue_size=1)
+        self.enabled_pub = rospy.Publisher(
+            '/scheduler/enabled', Bool, latch=True, queue_size=1)
+        self.report_pub = rospy.Publisher(
+            '/scheduler/report', String, latch=True, queue_size=1)
+        # True while a calendar run is out: mower_smach then keeps the rain
+        # checks on even with weather_rain_bypass (a manual-run override).
+        self.run_active_pub = rospy.Publisher(
+            '/scheduler/run_active', Bool, latch=True, queue_size=1)
+        self.finish_after_path_pub = rospy.Publisher(
+            '/mower_smach/finish_after_path', Bool, queue_size=1)
+        self.return_home_pub = rospy.Publisher(
+            '/mower_smach/return_home', String, queue_size=1)
 
         self.program_select_pub = rospy.Publisher(
             '/web_plan/program_select', String, queue_size=1)
@@ -352,6 +514,10 @@ class MasterController(object):
             '/pm/set_sleep_until_charged', Bool, queue_size=1)
         self.set_sleep_wait_before_standby_pub = rospy.Publisher(
             '/pm/set_sleep_wait_before_standby', UInt64, queue_size=1)
+        self.set_sleep_wait_charged_offset_pub = rospy.Publisher(
+            '/pm/set_sleep_wait_charged_offset', UInt64, queue_size=1)
+        self.start_docking_pub = rospy.Publisher(
+            '/dock_smach/start_docking', DockProgram, queue_size=1)
 
         # logging
         self.lcd_log_pub = rospy.Publisher(
@@ -372,20 +538,42 @@ class MasterController(object):
                          self.stop_reason_callback)
         rospy.Subscriber('/mower_smach/active_program', String,
                          self.active_program_callback)
+        rospy.Subscriber('/mower_smach/busy', Bool, self.busy_callback)
+        rospy.Subscriber('/mower_smach/mission_started', String,
+                         self.mission_started_callback)
+        rospy.Subscriber('/dock_smach/dock_status', Int8,
+                         self.dock_status_callback)
+        rospy.Subscriber('/cmd_vel_mux/active', String, self.mux_callback)
+        rospy.Subscriber('/vitulus_test/supervisor_status', String,
+                         self.agent_status_callback)
+        rospy.Subscriber('/vitulus_agent/mission_active', Bool,
+                         self.agent_mission_callback)
         rospy.Subscriber('/scheduler/inhibit', Bool,
                          self.inhibit_callback)
+        rospy.Subscriber('/scheduler/set_enabled', Bool,
+                         self.set_enabled_callback)
+        rospy.Subscriber('/scheduler/clear_issues', Bool,
+                         self.clear_issues_callback)
+        if RainAlert is not None:
+            rospy.Subscriber('/weather_alert/rain_alert', RainAlert,
+                             self.weather_callback)
+        self.enabled_srv = rospy.Service('/scheduler/set_enabled', SetBool,
+                                         self.set_enabled_service)
         rospy.Subscriber('/scheduler/set_calendar', String,
                          self.set_calendar_callback)
-        rospy.Subscriber('/pm/sleep_confirmed', Bool,
-                         self.sleep_confirmed_callback)
+        rospy.Subscriber('/dock_manager/dock_program', DockProgram,
+                         self.dock_program_callback)
+        rospy.Subscriber('/client_count', Int32, self.client_count_callback)
 
         # initial publishes
         self.inhibit_status_pub.publish(Bool(self.is_inhibited))
         self.calendar_pub.publish(String(json.dumps(self.calendar)))
+        self.enabled_pub.publish(Bool(self.automation_on))
+        self.run_active_pub.publish(Bool(False))
 
         rospy.loginfo("Master Controller initialised.")
         self.log("[Master] Init. automation=%s window=%s-%s" % (
-            self.automation_enabled,
+            self.automation_on,
             rospy.get_param('~allowed_window_start', '07:00'),
             rospy.get_param('~allowed_window_end', '21:00')))
 
@@ -402,31 +590,58 @@ class MasterController(object):
     # =====================================================================
     def _default_state(self):
         return {
+            "automation_enabled": False,
             "calendar": [],
-            "last_run_by_event": {},
+            "last_run_by_event": {},      # event id -> date really started
+            "closed_slot_by_event": {},   # event id -> date given up
+            "scan_from": None,            # slots before this are resolved
+            "run": None,
+            "issues": [],
             "interrupted_event_id": None,
             "interrupted_reason": None,
             "inhibit": self.default_inhibit,
         }
 
     def _load_state(self):
-        if os.path.exists(self.state_file):
+        for path in (self.state_file, self.state_file + '.prev'):
+            if not os.path.exists(path):
+                continue
             try:
-                with open(self.state_file, 'r') as f:
+                with open(path, 'r') as f:
                     data = json.load(f)
+                if not isinstance(data, dict):
+                    raise ValueError("not an object")
                 defaults = self._default_state()
                 for k, v in defaults.items():
                     data.setdefault(k, v)
-                rospy.loginfo("Loaded state from %s", self.state_file)
+                rospy.loginfo("Loaded state from %s", path)
                 return data
             except Exception as e:
-                rospy.logerr("Failed to load state: %s", str(e))
+                rospy.logerr("Failed to load state %s: %s", path, str(e))
+        # Nothing readable: the default is OFF, so a broken file cannot start
+        # anything. (The broken file stays until the next good save.)
         return self._default_state()
 
     def _save_state(self):
+        """Atomic and durable: power can be cut at any moment, a half written
+        state file must never replace the good one."""
+        tmp = self.state_file + '.tmp'
         try:
-            with open(self.state_file, 'w') as f:
+            with open(tmp, 'w') as f:
                 json.dump(self.persistent, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            if os.path.exists(self.state_file):
+                try:
+                    os.replace(self.state_file, self.state_file + '.prev')
+                except OSError:
+                    pass
+            os.replace(tmp, self.state_file)
+            fd = os.open(self.state_dir, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
         except Exception as e:
             rospy.logerr("Failed to save state: %s", str(e))
 
@@ -440,6 +655,53 @@ class MasterController(object):
         with self.lock:
             self.persistent['interrupted_event_id'] = None
             self.persistent['interrupted_reason'] = None
+            self.persistent['run'] = None
+            self._save_state()
+
+    def _run(self):
+        """The persisted run, also for a state file from before runs existed."""
+        with self.lock:
+            run = self.persistent.get('run')
+            eid = self.persistent.get('interrupted_event_id')
+            if run is None and eid is not None:
+                ev = self._find_event(eid)
+                run = self._new_run(ev or {'id': eid, 'program_name': ''}, None)
+                run['started'] = True
+                self.persistent['run'] = run
+            return run
+
+    def _new_run(self, ev, slot_dt):
+        return {
+            'event_id': ev['id'],
+            'program': ev.get('program_name', ''),
+            'slot': slot_dt.strftime("%Y-%m-%dT%H:%M") if slot_dt else None,
+            'created': self._t(),
+            'started': False,     # the mission really got past its start checks
+            'following': False,   # a mission of this run is out now
+            'reason': None,       # why it waits
+            'wait_until': 0.0,
+            'resumes': 0,
+            'no_progress': 0,
+            'critical': 0,
+            'rejects': 0,
+            'checkpoint': None,
+        }
+
+    def _update_run(self, **fields):
+        with self.lock:
+            run = self.persistent.get('run')
+            if run is None:
+                return
+            run.update(fields)
+            self._save_state()
+
+    def _issue(self, code, program='', **detail):
+        """Something the owner should see. Kept (last 20), shown until cleared."""
+        self.log("[Master] %s %s %s" % (code, program, detail or ''))
+        with self.lock:
+            self.persistent['issues'] = (self.persistent.get('issues') or [])[-19:] + [{
+                't': self._now().strftime("%Y-%m-%dT%H:%M"),
+                'code': code, 'program': program, 'detail': detail}]
             self._save_state()
 
     # =====================================================================
@@ -458,6 +720,9 @@ class MasterController(object):
         with self.lock:
             self.battery_capacity = msg.battery_capacity
             self.supply_status = msg.supply_status
+            self.charger_status = msg.charger_status
+            self.pm_status = msg
+            self.pm_status_time = self._t()
 
     def smach_status_callback(self, msg):
         with self.lock:
@@ -471,9 +736,104 @@ class MasterController(object):
         with self.lock:
             self.active_program_name = msg.data
 
-    def sleep_confirmed_callback(self, msg):
+    def dock_program_callback(self, msg):
         with self.lock:
-            self.sleep_confirmed = bool(msg.data)
+            self.dock_program = msg
+
+    def client_count_callback(self, msg):
+        with self.lock:
+            self.ui_clients = msg.data
+
+    def busy_callback(self, msg):
+        with self.lock:
+            self.mission_busy = bool(msg.data)
+
+    def mission_started_callback(self, msg):
+        with self.lock:
+            self.mission_started_name = msg.data.strip()
+
+    def dock_status_callback(self, msg):
+        with self.lock:
+            self.dock_status = msg.data
+
+    def weather_callback(self, msg):
+        with self.lock:
+            self.weather = {'t': msg.time.to_sec() or self._t(),
+                            'rain_now': bool(msg.rain_now),
+                            'status': msg.status_now}
+
+    def mux_callback(self, msg):
+        with self.lock:
+            self.mux_active = msg.data
+
+    def agent_status_callback(self, msg):
+        try:
+            data = json.loads(msg.data)
+        except ValueError:
+            return
+        with self.lock:
+            self.agent_status = data
+            self.agent_status_t = self._t()
+
+    def agent_mission_callback(self, msg):
+        with self.lock:
+            self.agent_mission_active = bool(msg.data)
+
+    # ---- activation switch -------------------------------------------------
+    def set_enabled_callback(self, msg):
+        self.set_automation(bool(msg.data))
+
+    def set_enabled_service(self, req):
+        self.set_automation(bool(req.data))
+        return SetBoolResponse(success=True, message=(
+            "automation %s" % ("on" if self.automation_on else "off")))
+
+    def set_automation(self, on):
+        """The one switch. ON starts counting slots from now: nothing missed
+        while it was off is caught up, and it also releases Hold, so one switch
+        really is enough. OFF forgets the run (the mission's own checkpoint
+        stays for a manual Resume) and leaves a program that is out alone."""
+        with self.lock:
+            if on == self.automation_on:
+                changed = False
+            else:
+                changed = True
+                self.automation_on = on
+                self.persistent['automation_enabled'] = on
+                self.persistent['scan_from'] = self._now().isoformat()
+                self.persistent['closed_slot_by_event'] = {}
+                self.persistent['run'] = None
+                self.persistent['interrupted_event_id'] = None
+                self.persistent['interrupted_reason'] = None
+                release_hold = on and self.is_inhibited
+                if release_hold:
+                    self.is_inhibited = False
+                    self.persistent['inhibit'] = False
+                self._save_state()
+        if not changed:
+            self.enabled_pub.publish(Bool(on))
+            return
+        if on and release_hold:
+            self.inhibit_status_pub.publish(Bool(False))
+        self.enabled_pub.publish(Bool(on))
+        self.run_active_pub.publish(Bool(False))
+        self.log("[Master] Automation %s." % ("ON" if on else "OFF"))
+        self._pending_recovery_reason = None
+        self._attached = False
+        if on:
+            self.node_start_time = min(self.node_start_time,
+                                       self._t() - self.startup_delay_s)
+        # A sleep on its way is the sleep side's to cancel, not to orphan.
+        if self.state != self.STATE_PREPARE_SLEEP:
+            self._transition(self.STATE_INIT if on else self.STATE_DISABLED)
+        self._publish_report(force=True)
+
+    def clear_issues_callback(self, msg):
+        if msg.data:
+            with self.lock:
+                self.persistent['issues'] = []
+                self._save_state()
+            self._publish_report(force=True)
 
     def inhibit_callback(self, msg):
         with self.lock:
@@ -495,6 +855,9 @@ class MasterController(object):
         with self.lock:
             self.calendar = valid
             self.persistent['calendar'] = valid
+            # A slot that is added for a time already past is not "missed".
+            if self.persistent.get('scan_from') is None:
+                self.persistent['scan_from'] = self._now().isoformat()
             self._save_state()
         self.calendar_pub.publish(String(json.dumps(valid)))
         self.log("[Master] Calendar updated (%d events)" % len(valid))
@@ -514,11 +877,28 @@ class MasterController(object):
         with self.lock:
             self.stop_reason = ""
             self.active_program_name = ""
+            self.mission_started_name = ""
         pub.publish(String(prog_name))
         self._mission_seen = False
-        self._mission_start_deadline = time.time() + 60.0
-        self._mowing_grace_until = time.time() + 5.0
+        self._mission_start_deadline = self._t() + 60.0
+        self._mowing_grace_until = self._t() + 5.0
+        self._ready_no_reason_since = None
+        self._window_end_sent = 0.0
+        self._window_end_first = 0.0
         self._transition(self.STATE_MOWING)
+
+    def _t(self):
+        return time.time()
+
+    def _now(self):
+        return datetime.datetime.now()
+
+    def _set_status(self, text, code, **detail):
+        """Legacy status line + the code the UI translates."""
+        self.status_pub.publish(String(text))
+        self._status_text = text
+        self._code = code
+        self._code_detail = detail
 
     def _transition(self, new_state):
         if new_state != self.state:
@@ -535,36 +915,151 @@ class MasterController(object):
         if not self.window_enabled:
             return True
         if now is None:
-            now = datetime.datetime.now()
+            now = self._now()
         return MowerScheduler.within_window(
             now, self.window_start, self.window_end)
+
+    def _start_allowed(self, now):
+        """In the window and with enough of it left to do something."""
+        if not self.window_enabled:
+            return True
+        if not self._in_allowed_window(now):
+            return False
+        end = MowerScheduler.window_end_after(now, self.window_end)
+        return MowerScheduler.real_seconds(now, end) >= self.start_min_left_s
+
+    def _mission_blocked(self):
+        """Who else is using the robot right now: None or a code. Nothing is
+        started (and no sleep is taken) over any of these."""
+        with self.lock:
+            busy = self.mission_busy
+            dock = self.dock_status
+            mux = self.mux_active
+            agent = self.agent_status
+            agent_age = self._t() - self.agent_status_t
+            agent_mission = self.agent_mission_active
+        if busy is None:
+            return 'mission_unknown'
+        if busy:
+            return 'mission'
+        if dock in (1, 2):
+            return 'dock'
+        if mux in ('ds4', 'teleop', 'primitive'):
+            return 'manual'
+        if agent_mission:
+            return 'agent'
+        if agent is not None and agent_age <= self.agent_status_max_age_s:
+            if (agent.get('run_id') or agent.get('mow_program')
+                    or agent.get('state') not in ('READY', None)):
+                return 'agent'
+        return None
+
+    def _mux_hold(self):
+        """cmd_vel_mux hold (gnss_watchdog, also escalated: the hold stays): no
+        start and no sleep over it. Separate from _mission_blocked because a
+        robot left outside is still sent home: dock_smach waits the hold out."""
+        with self.lock:
+            return 'mux_hold' if self.mux_active == 'hold' else None
 
     # =====================================================================
     # main loop
     # =====================================================================
     def run(self):
-        rate = rospy.Rate(1.0)
+        rate = rospy.Rate(self.tick_hz)
         while not rospy.is_shutdown():
             try:
                 self._step()
+                self._publish_report()
             except Exception as e:
                 rospy.logerr("FSM exception: %s", str(e))
             rate.sleep()
 
+    def _publish_report(self, force=False):
+        """Everything the UI needs, as data: /scheduler/report (JSON, latched).
+        Texts are the UI's job (the codes are translated there)."""
+        t = self._t()
+        if not force and (t - self._report_t) < 2.0:
+            return
+        self._report_t = t
+        now = self._now()
+        with self.lock:
+            calendar = list(self.calendar)
+            run = dict(self.persistent.get('run') or {})
+            issues = list(self.persistent.get('issues') or [])
+            pending = list(self._pending_view)
+            battery = self.battery_capacity
+            weather = dict(self.weather) if self.weather else None
+        next_dt, next_ev = MowerScheduler.get_next_event(calendar, now)
+        outside = []
+        if self.window_enabled:
+            for ev in calendar:
+                hm = MowerScheduler._parse_hhmm(ev.get('start_time', ''))
+                if hm and not MowerScheduler.within_window(
+                        now.replace(hour=hm[0], minute=hm[1], second=0, microsecond=0),
+                        self.window_start, self.window_end):
+                    outside.append(ev['id'])
+        rep = {
+            'enabled': self.automation_on,
+            'held': self.is_inhibited,
+            'state': self.state,
+            'code': self._code,
+            'detail': self._code_detail,
+            'status': self._status_text,
+            'battery': battery,
+            'next': ({'program': next_ev['program_name'],
+                      'at': next_dt.strftime("%Y-%m-%dT%H:%M")}
+                     if next_dt is not None else None),
+            'pending': pending,
+            'issues': issues[-5:],
+            'outside_window': outside,
+            'window': ({'start': "%02d:%02d" % self.window_start,
+                        'end': "%02d:%02d" % self.window_end}
+                       if self.window_enabled else None),
+            'limits': {'resumes': self.resume_max, 'critical': self.critical_max},
+            'weather': ({'age_min': int((t - weather['t']) / 60.0),
+                         'rain_now': weather['rain_now'],
+                         'status': weather['status']} if weather else None),
+            'run': None,
+        }
+        if run:
+            wait = run.get('wait_until') or 0.0
+            rep['run'] = {
+                'program': run.get('program'),
+                'slot': run.get('slot'),
+                'started': run.get('started'),
+                'reason': run.get('reason'),
+                'wait_s': max(0, int(wait - t)),
+                'resumes': run.get('resumes'),
+                'critical': run.get('critical'),
+                'checkpoint': run.get('checkpoint'),
+            }
+        if hasattr(self, 'sleep_report'):
+            rep['sleep'] = self.sleep_report()
+        data = json.dumps(rep, sort_keys=True)
+        if data != self._report_last or force:
+            self._report_last = data
+            self.report_pub.publish(String(data))
+
     def _step(self):
+        if not self._sleep_start_checked:
+            self._sleep_start_check()
+
+        # Switched off in another thread while this tick was on its way.
+        if (not self.automation_on and self.state not in
+                (self.STATE_DISABLED, self.STATE_PREPARE_SLEEP)):
+            self._transition(self.STATE_DISABLED)
+
+        self._publish_run_active()
+
         # --- DISABLED ---
         if self.state == self.STATE_DISABLED:
-            self.status_pub.publish(String("Disabled"))
+            self._set_status("Disabled", 'off')
             return
 
         # --- INIT ---
         if self.state == self.STATE_INIT:
-            if not self.automation_enabled:
-                self.log("[Master] Automation DISABLED via parameter.")
-                self._transition(self.STATE_DISABLED)
-                return
-            self.status_pub.publish(String("Initialising"))
-            if (time.time() - self.node_start_time) >= self.startup_delay_s:
+            self._set_status("Initialising", 'init')
+            if (self._t() - self.node_start_time) >= self.startup_delay_s:
                 self._transition(self.STATE_IDLE)
             return
 
@@ -579,7 +1074,7 @@ class MasterController(object):
 
         # --- INHIBITED ---
         if self.state == self.STATE_INHIBITED:
-            self.status_pub.publish(String("Inhibited"))
+            self._set_status("Inhibited", 'held')
             if not self.is_inhibited:
                 self._transition(self.STATE_IDLE)
             return
@@ -592,6 +1087,11 @@ class MasterController(object):
         # --- WAIT_OFF_DOCK ---
         if self.state == self.STATE_WAIT_OFF_DOCK:
             self._handle_wait_off_dock()
+            run = self._run()
+            if (run is not None and self.state == self.STATE_WAIT_OFF_DOCK
+                    and self._code != 'off_dock_stuck'):
+                self._code = 'run_off_dock'
+                self._code_detail = {'program': run.get('program', '')}
             return
 
         # --- MOWING ---
@@ -605,142 +1105,332 @@ class MasterController(object):
             return
 
     # =====================================================================
+    # slots
+    # =====================================================================
+    def _scan_slots(self, now):
+        """Resolve every slot since scan_from. Returns the pending ones, oldest
+        first: (slot_dt, event). A slot is pending until it is started or until
+        catchup_max_h has passed; that rule covers a robot that slept through
+        it, a stack that was down, a busy robot and a changed clock alike.
+        Nothing runs twice: a started slot has last_run_by_event, a given up
+        one closed_slot_by_event, and both are per date."""
+        with self.lock:
+            calendar = list(self.calendar)
+            last_run = dict(self.persistent.get('last_run_by_event', {}))
+            closed = self.persistent.setdefault('closed_slot_by_event', {})
+            run = self.persistent.get('run')
+            scan_from = self.persistent.get('scan_from')
+        base = now
+        if scan_from:
+            try:
+                base = datetime.datetime.strptime(
+                    scan_from[:19], "%Y-%m-%dT%H:%M:%S")
+            except ValueError:
+                base = now
+        # The scan starts before a run that has not closed its slot yet.
+        base = max(base, now - datetime.timedelta(days=8))
+        keep, missed = [], []
+        for slot_dt, ev in MowerScheduler.slots_between(calendar, base, now):
+            day = slot_dt.strftime("%Y-%m-%d")
+            eid = ev['id']
+            if last_run.get(eid) == day or closed.get(eid) == day:
+                continue
+            if run is not None and run.get('event_id') == eid:
+                closed[eid] = day     # the same event's open run covers this slot
+                continue
+            if MowerScheduler.real_seconds(slot_dt, now) > self.catchup_max_s:
+                closed[eid] = day
+                missed.append((slot_dt, ev))
+                continue
+            keep.append((slot_dt, ev))
+        new_from = (keep[0][0] - datetime.timedelta(seconds=1)) if keep else now
+        with self.lock:
+            self.persistent['scan_from'] = new_from.strftime("%Y-%m-%dT%H:%M:%S")
+            self._pending_view = [
+                {'program': ev['program_name'],
+                 'slot': dt.strftime("%Y-%m-%dT%H:%M")} for dt, ev in keep]
+            self._save_state()
+        for slot_dt, ev in missed:
+            self._issue('slot_missed', ev['program_name'],
+                        slot=slot_dt.strftime("%Y-%m-%dT%H:%M"), blocked_by=self._code)
+        return keep
+
+    def _give_up(self, run, code, **detail):
+        """The run ends without finishing: report it, keep the checkpoint for a
+        manual Resume, free the calendar for the next slot."""
+        self._issue(code, run.get('program', ''), slot=run.get('slot'),
+                    checkpoint=run.get('checkpoint'), **detail)
+        self._clear_interrupted()
+
+    def _program_checkpoint(self, prog_name):
+        """The planner's copy of the mission's last_result for prog_name."""
+        with self.lock:
+            for p in self.program_list:
+                if p.name == prog_name:
+                    return getattr(p, 'last_result', None)
+        return None
+
+    # =====================================================================
     # state: IDLE
     # =====================================================================
+    def _sleep_for(self, reason, seconds):
+        """Every idle decision to sleep comes here. Sleeping needs a reason to
+        wake up (the caller has one), and a refused sleep just means waiting
+        awake."""
+        if self._execute_sleep(duration_ms=int(seconds * 1000)) is not False:
+            self.log("[Master] Sleep (%s) for %.0fm." % (reason, seconds / 60.0))
+
+    def _sleep_to_charge(self, program):
+        accepted = self._execute_sleep(charged=True)
+        block = getattr(self, 'sleep_block', None)
+        if accepted is False and block in ('no_charging', 'charge_no_gain'):
+            run = self._run()
+            if run is not None and not run.get('no_charging_told'):
+                self._update_run(no_charging_told=True)
+                self._issue('not_charging', program, block=block)
+
+    def _sleep_until_window(self, now, label):
+        win_start = MowerScheduler.next_window_start(now, self.window_start)
+        sleep_s = (MowerScheduler.real_seconds(now, win_start) - self.wake_lead_s)
+        # Woken up before the window: stay awake, a short sleep is a cold start.
+        if sleep_s < self.idle_sleep_threshold_s:
+            return
+        self._sleep_for('window %s, %s' % (win_start.strftime("%H:%M"), label), sleep_s)
+
     def _handle_idle(self):
         """In-dock idle. Evaluate calendar, sleep or start programs."""
+        self._attach_after_restart()
+        if self.state != self.STATE_IDLE:
+            return
 
         # Not in dock -> no actions, behave like inhibit
         with self.lock:
             in_dock = self.is_in_dock
         if not in_dock:
-            self.status_pub.publish(String("Idle (Not in dock)"))
+            run = self._run()
+            self._set_status("Idle (Not in dock)",
+                             'run_off_dock' if run else 'not_in_dock',
+                             program=(run or {}).get('program', ''))
             return
 
         if not self.programs_loaded:
-            self.status_pub.publish(String("Waiting for programs"))
+            self._set_status("Waiting for programs", 'wait_programs')
             return
 
         # Mandatory boot grace: no start / no sleep right after boot.
-        boot_elapsed = time.time() - self.node_start_time
+        boot_elapsed = self._t() - self.node_start_time
         if boot_elapsed < self.boot_grace_period_s:
-            self.status_pub.publish(
-                String("Idle (Boot grace %.0fs)"
-                       % (self.boot_grace_period_s - boot_elapsed)))
+            left = self.boot_grace_period_s - boot_elapsed
+            self._set_status("Idle (Boot grace %.0fs)" % left, 'boot_grace',
+                             left_s=int(left))
             return
 
         # Throttle heavy calendar evaluation to check_interval_s.
-        if (time.time() - self._last_idle_eval) < self.check_interval_s:
+        if (self._t() - self._last_idle_eval) < self.check_interval_s:
             return
-        self._last_idle_eval = time.time()
+        self._last_idle_eval = self._t()
 
+        now = self._now()
         with self.lock:
-            calendar = list(self.calendar)
-            last_run = dict(self.persistent.get('last_run_by_event', {}))
-            interrupted_id = self.persistent.get('interrupted_event_id')
-            interrupted_reason = self.persistent.get('interrupted_reason')
-            battery = self.battery_capacity
             smach_status = self.smach_status
+            battery = self.battery_capacity
 
-        # Don't start/resume if SMACH isn't ready
-        if smach_status not in ("Ready", ""):
-            self.status_pub.publish(
-                String("Idle (SMACH: %s)" % smach_status))
+        pending = self._scan_slots(now)
+
+        # STOP / TERMINAL wait for a person: say so, a green "Active" here
+        # used to hide that every slot was being lost.
+        if smach_status == "Stopped":
+            self._set_status("Idle (SMACH: Stopped)", 'blocked_stopped')
+            return
+        if smach_status == "TERMINAL ERROR":
+            self._set_status("Idle (SMACH: TERMINAL ERROR)", 'blocked_terminal')
+            return
+        # Somebody else is using the robot: no start, no sleep.
+        blocked = self._mission_blocked() or self._mux_hold()
+        if blocked is not None:
+            self._set_status("Idle (Busy: %s)" % blocked, 'blocked_' + blocked)
+            return
+        if smach_status not in ("Ready",):
+            self._set_status("Idle (SMACH: %s)" % smach_status,
+                             'blocked_mission', smach=smach_status)
             return
 
-        now = datetime.datetime.now()
-
-        # --- Time-window gate: don't mow outside the allowed window --------
-        if not self._in_allowed_window(now):
-            win_start = MowerScheduler.next_window_start(now, self.window_start)
-            sleep_s = (win_start - now).total_seconds() - self.wake_lead_s
-            self.log("[Master] Outside allowed window. Sleeping until %s."
-                     % win_start.strftime("%H:%M"))
-            self._execute_sleep(duration_ms=int(max(60.0, sleep_s) * 1000))
+        # --- A run that has not finished goes first -------------------------
+        run = self._run()
+        if run is not None:
+            self._idle_run(run, now, battery)
             return
 
-        # --- Priority 1: A freshly scheduled program is due NOW ------------
-        # A new scheduled event that differs from the interrupted one wins:
-        # the interrupted event is abandoned (give up before next program).
-        active_ev = MowerScheduler.get_active_event(calendar, last_run, now)
-        if active_ev is not None and active_ev.get('id') != interrupted_id:
-            prog_name = active_ev['program_name']
-            if not self._program_on_map(prog_name):
-                self.log("[Master] Scheduled program '%s' is not on the active "
-                         "map - skipped today." % prog_name)
-                with self.lock:
-                    self.persistent['last_run_by_event'][active_ev['id']] = \
-                        now.strftime("%Y-%m-%d")
-                    self._save_state()
-                return
-            if interrupted_id is not None:
-                self.log("[Master] New scheduled program due; abandoning "
-                         "interrupted event.")
-            self.log("[Master] Starting scheduled program: %s" % prog_name)
-            today = now.strftime("%Y-%m-%d")
+        # --- A slot that is due (on time or caught up) ----------------------
+        if pending and self._start_allowed(now):
+            slot_dt, ev = pending[0]
+            run = self._new_run(ev, slot_dt)
             with self.lock:
-                self.persistent['last_run_by_event'][active_ev['id']] = today
-                self.persistent['interrupted_event_id'] = active_ev['id']
+                self.persistent['run'] = run
+                self.persistent['interrupted_event_id'] = ev['id']
                 self.persistent['interrupted_reason'] = None
+                # Whatever becomes of the run, this slot has been dealt with.
+                self.persistent['closed_slot_by_event'][ev['id']] = \
+                    slot_dt.strftime("%Y-%m-%d")
                 self._save_state()
-            self._start_program(prog_name, self.program_select_pub)
+            self._idle_run(run, now, battery)
             return
 
-        # --- Priority 2: Resume interrupted program ------------------------
-        if interrupted_id is not None:
-            ev = self._find_event(interrupted_id)
-            if ev is None or not ev.get('enabled', False):
-                # Event removed or disabled - clear
-                self._clear_interrupted()
-            else:
-                prog_name = ev['program_name']
-                # Battery interrupt or simply too low -> wait for charge.
-                if (interrupted_reason == 'battery'
-                        or battery < self.battery_resume_min):
-                    if battery < self.battery_resume_min:
-                        self.log(
-                            "[Master] Battery %d%% < %d%%. Sleep until charged "
-                            "for resume of %s."
-                            % (battery, self.battery_resume_min, prog_name))
-                        self._execute_sleep(charged=True)
-                        return
-                # Resume; smach re-runs pre-checks (weather/battery) and will
-                # re-reject if conditions are still bad -> self-correcting.
-                self.log("[Master] Resuming program: %s (reason=%s)"
-                         % (prog_name, interrupted_reason))
-                if not self._program_on_map(prog_name):
-                    self.log("[Master] Interrupted program '%s' is not on the "
-                             "active map - not resumed." % prog_name)
-                    self._clear_interrupted()
-                    return
-                self._start_program(prog_name, self.program_select_resume_pub)
-                return
-
-        # --- Priority 3: Next scheduled event -> wait or sleep -------------
-        next_dt, next_ev = MowerScheduler.get_next_event(calendar, now)
+        # --- Nothing to do now: wait or sleep -------------------------------
+        next_dt, next_ev = MowerScheduler.get_next_event(
+            list(self.calendar), now)
         if next_dt is None:
-            self.status_pub.publish(String("Idle (No schedule)"))
+            self._set_status("Idle (No schedule)", 'no_schedule')
             self.next_run_pub.publish(String("None"))
             return
 
-        time_until_s = (next_dt - now).total_seconds()
+        time_until_s = MowerScheduler.real_seconds(now, next_dt)
         self.next_run_pub.publish(
             String("%s in %.0fm" % (next_ev['program_name'],
                                     time_until_s / 60.0)))
 
-        if time_until_s <= self.idle_sleep_threshold_s:
+        if not self._in_allowed_window(now):
+            self._set_status("Idle (Outside window)", 'outside_window')
+            self._sleep_until_window(now, "nothing to do")
+        elif time_until_s <= self.idle_sleep_threshold_s:
             # Within threshold -> stay awake, wait
-            self.status_pub.publish(
-                String("Idle (Wait %.0fm for %s)"
-                       % (time_until_s / 60.0, next_ev['program_name'])))
+            self._set_status("Idle (Wait %.0fm for %s)"
+                             % (time_until_s / 60.0, next_ev['program_name']),
+                             'waiting_slot', program=next_ev['program_name'])
         else:
             # Sleep, wake wake_lead before the program
-            sleep_s = time_until_s - self.wake_lead_s
-            self.log(
-                "[Master] Next %s in %.0fm. Sleeping for %.0fm."
-                % (next_ev['program_name'],
-                   time_until_s / 60.0, sleep_s / 60.0))
-            self._execute_sleep(duration_ms=int(max(60.0, sleep_s) * 1000))
+            self._set_status("Idle (Next %s in %.0fm)"
+                             % (next_ev['program_name'], time_until_s / 60.0),
+                             'waiting_slot', program=next_ev['program_name'])
+            self._sleep_for('next ' + next_ev['program_name'],
+                            time_until_s - self.wake_lead_s)
+
+    def _idle_run(self, run, now, battery):
+        """The robot is free, in the dock, and a run is open: go or say why not."""
+        prog = run.get('program', '')
+        t = self._t()
+        ev = self._find_event(run.get('event_id'))
+        if ev is None or not ev.get('enabled', False):
+            self._give_up(run, 'run_event_removed')
+            return
+        if t - run.get('created', t) > self.run_max_age_s:
+            self._give_up(run, 'run_expired', reason=run.get('reason'))
+            return
+
+        # Finished meanwhile (Run by hand while the run waited, this node down
+        # at its end): nothing is left to resume.
+        if run.get('started') and self._program_checkpoint(prog) == 'succeeded':
+            self.log("[Master] %s is already finished." % prog)
+            self._clear_interrupted()
+            return
+
+        reason = run.get('reason')
+        wait_left = (run.get('wait_until') or 0.0) - t
+        if wait_left > 0:
+            self._set_status("Idle (Wait %.0fm: %s, then %s)"
+                             % (wait_left / 60.0, reason, prog),
+                             'waiting_' + str(reason), program=prog,
+                             left_s=int(wait_left))
+            return
+
+        if not self._start_allowed(now):
+            self._set_status("Idle (Outside window, then %s)" % prog,
+                             'outside_window', program=prog)
+            if not self._in_allowed_window(now):
+                self._sleep_until_window(now, prog)
+            return
+
+        need = self.battery_resume_low if reason == 'battery' else self.battery_resume_min
+        with self.lock:
+            charger = self.charger_status
+        # A full pack that reads below the target must not wait for ever.
+        if battery < need and not (reason == 'battery' and charger == 'CHARGED'
+                                   and battery >= self.battery_resume_min):
+            self._set_status("Idle (Battery %d%% < %d%%, then %s)"
+                             % (battery, need, prog),
+                             'waiting_battery', program=prog,
+                             battery=battery, need=need)
+            self._sleep_to_charge(prog)
+            return
+
+        if not self._program_on_map(prog):
+            self._after_rejected(run, 'not_on_map')
+            return
+
+        self._go(run)
+
+    def _go(self, run):
+        if not self.automation_on:
+            return
+        prog = run['program']
+        resume = bool(run.get('started'))
+        self.log("[Master] %s program: %s (%s)" % (
+            "Resuming" if resume else "Starting scheduled", prog,
+            run.get('reason') or 'slot'))
+        with self.lock:
+            self.persistent.pop('charge_sleep', None)
+        self._update_run(following=True, no_charging_told=False)
+        self._publish_run_active(True)
+        self._start_program(prog, self.program_select_resume_pub if resume
+                            else self.program_select_pub)
+        self._set_status("Mowing", 'starting', program=prog)
+
+    def _publish_run_active(self, value=None):
+        if value is None:
+            run = self.persistent.get('run') if self.automation_on else None
+            value = bool(run and run.get('following'))
+        if value != getattr(self, '_run_active_last', None):
+            self._run_active_last = value
+            self.run_active_pub.publish(Bool(value))
+            # The flag has to be in mower_smach before the program is.
+            if value:
+                rospy.sleep(0.2)
+
+    def _attach_after_restart(self):
+        """This node restarted while a run was out: find out what became of it
+        (the mission ran on, or ended, or died with the stack) before anything
+        else. Without this a finished program was started again."""
+        if self._attached:
+            return
+        with self.lock:
+            busy = self.mission_busy
+            status = self.smach_status
+            stop_reason = self.stop_reason
+            in_dock = self.is_in_dock
+        run = self._run()
+        if run is None or not run.get('following'):
+            self._attached = True
+            return
+        if busy is None or not status:
+            self._set_status("Idle (Waiting for the mission)", 'wait_mission')
+            return
+        self._attached = True
+        self._mission_seen = True
+        self._mowing_grace_until = 0.0
+        self._confirm_started(self.mission_started_name)
+        run = self._run()
+        ours = run.get('started') or stop_reason.startswith('rejected:')
+        if busy or status in ("Stopped", "TERMINAL ERROR"):
+            self.log("[Master] Following the program that is out: %s" % run['program'])
+            self._ready_no_reason_since = None
+            self._transition(self.STATE_MOWING)
+        elif stop_reason and ours:
+            self.log("[Master] Program ended while restarting: %s" % stop_reason)
+            self._handle_program_end(stop_reason, in_dock)
+        else:
+            self._mission_lost(in_dock)
+
+    def _mission_lost(self, in_dock):
+        """The mission is gone without a stop_reason (stack restart, crash)."""
+        run = self._run()
+        self.log("[Master] Mission of %s was lost." % (run or {}).get('program'))
+        if run is None:
+            self._route_after_program(None, in_dock)
+            return
+        if not in_dock:
+            self._issue('run_stranded', run.get('program', ''))
+        self._after_interrupt(run, 'lost')
+        self._route_after_program('lost' if self._run() else None, in_dock)
 
     # =====================================================================
     # state: MOWING
@@ -752,60 +1442,123 @@ class MasterController(object):
             stop_reason = self.stop_reason
             in_dock = self.is_in_dock
             active_program = self.active_program_name.strip()
+            started_name = self.mission_started_name
+            busy = self.mission_busy
 
-        if smach_status in ("Stopped", "TERMINAL ERROR"):
-            self.status_pub.publish(String("Mowing (%s - press Reset)" % smach_status))
+        prog = (self._run() or {}).get('program', '')
+        if smach_status == "Stopped":
+            self._set_status("Mowing (Stopped - press Reset)",
+                             'blocked_stopped', program=prog)
+        elif smach_status == "TERMINAL ERROR":
+            self._set_status("Mowing (TERMINAL ERROR - press Reset)",
+                             'blocked_terminal', program=prog)
         else:
-            self.status_pub.publish(String("Mowing"))
+            self._set_status("Mowing", 'mowing', program=prog)
+
+        self._confirm_started(started_name)
 
         # Grace period after start - ignore Ready for a few seconds
-        if time.time() < self._mowing_grace_until:
+        if self._t() < self._mowing_grace_until:
             return
 
         # Not picked up by the SMACH (planner refused the program, SMACH busy):
-        # give up instead of waiting forever or taking an old stop_reason.
+        # say so and retry instead of waiting forever or taking an old
+        # stop_reason.
         if not self._mission_seen:
             if smach_status not in ("Ready", "") or active_program or stop_reason:
                 self._mission_seen = True
-            elif time.time() > self._mission_start_deadline:
-                self.log("[Master] Program did not start (see the planner "
-                         "log) - back to idle.")
-                self._clear_interrupted()
-                self._transition(self.STATE_IDLE)
+            elif self._t() > self._mission_start_deadline:
+                self.log("[Master] Program did not start (see the planner log).")
+                run = self._run()
+                if run is None:
+                    self._transition(self.STATE_IDLE)
+                else:
+                    self._after_rejected(run, 'not_started')
                 return
             else:
                 return
 
-        # Terminal error: wait short, reset SMACH, then long sleep.
+        # Terminal error: a person's call off the dock. In the dock (undock
+        # failed) it is reset after a while and retried, up to the cap.
         if smach_status == "TERMINAL ERROR":
-            if self.terminal_error_since is None:
-                self.terminal_error_since = time.time()
-            elif ((time.time() - self.terminal_error_since)
-                  > self.terminal_short_wait_s):
-                self.log("[Master] Terminal error timeout. Resetting SMACH "
-                         "and sleeping.")
-                self.smach_reset_pub.publish(Bool(True))
-                self.terminal_error_since = None
-                self._clear_interrupted()
-                rospy.sleep(3.0)
-                self._pending_recovery_reason = 'terminal'
-                with self.lock:
-                    in_dock = self.is_in_dock
-                if in_dock:
-                    self._begin_recovery()
-                else:
-                    self.off_dock_since = time.time()
-                    self._transition(self.STATE_WAIT_OFF_DOCK)
+            self._handle_terminal(in_dock)
             return
 
         self.terminal_error_since = None
 
+        self._check_window_end()
+
         # SMACH returned to "Ready" -> program ended (with a reason)
-        if smach_status == "Ready" and stop_reason:
-            self._handle_program_end(stop_reason, in_dock)
+        if smach_status == "Ready":
+            if stop_reason:
+                self._ready_no_reason_since = None
+                self._handle_program_end(stop_reason, in_dock)
+            elif busy:
+                self._ready_no_reason_since = None
+            elif self._ready_no_reason_since is None:
+                self._ready_no_reason_since = self._t()
+            elif (self._t() - self._ready_no_reason_since
+                  > self.mission_lost_grace_s):
+                self._ready_no_reason_since = None
+                self._mission_lost(in_dock)
+        else:
+            self._ready_no_reason_since = None
+
+    def _confirm_started(self, started_name):
+        """The mission left its start checks: only now the slot has run."""
+        run = self._run()
+        if run is None or run.get('started') or started_name != run.get('program'):
+            return
+        day = (run.get('slot') or self._now().strftime("%Y-%m-%d"))[:10]
+        with self.lock:
+            self.persistent['last_run_by_event'][run['event_id']] = day
+            run['started'] = True
+            self._save_state()
+
+    def _check_window_end(self):
+        """The window closed while mowing: finish the path, then go home;
+        mower_smach keeps the checkpoint and the run resumes in the next
+        window. window_overrun_max_min caps a path that does not end."""
+        if self._in_allowed_window(self._now()):
+            return
+        t = self._t()
+        if not self._window_end_first:
+            self._window_end_first = t
+            self.log("[Master] Window closed: going home after this path.")
+        if (t - self._window_end_sent) >= 30.0:
+            self._window_end_sent = t
+            self.finish_after_path_pub.publish(Bool(True))
+        if (t - self._window_end_first) > self.window_overrun_s:
+            self.return_home_pub.publish(String("window"))
+
+    def _handle_terminal(self, in_dock):
+        if self.terminal_error_since is None:
+            self.terminal_error_since = self._t()
+            return
+        if not in_dock:
+            return          # stays visible; nothing here can help the robot
+        if (self._t() - self.terminal_error_since) <= self.terminal_short_wait_s:
+            return
+        self.terminal_error_since = None
+        run = self._run()
+        if run is None or run.get('critical', 0) + 1 >= self.critical_max:
+            if run is not None:
+                self._give_up(run, 'run_failed', reason='terminal')
+            self._transition(self.STATE_IDLE)
+            return
+        self.log("[Master] Terminal error in the dock. Resetting SMACH, "
+                 "the run retries.")
+        with self.lock:
+            self.stop_reason = ""
+        self.smach_reset_pub.publish(Bool(True))
+        self._after_interrupt(run, 'critical')
+        self._pending_recovery_reason = 'critical' if self._run() else None
+        self._begin_recovery()
 
     def _handle_program_end(self, stop_reason, in_dock):
         """Decide what to do after a program reached a terminal stop_reason."""
+        run = self._run()
+        program = (run or {}).get('program', '')
 
         # --- Success: clear and idle ---------------------------------------
         if stop_reason == "succeeded":
@@ -814,38 +1567,95 @@ class MasterController(object):
             self._route_after_program(None, in_dock)
             return
 
-        # --- Recoverable interrupts: keep event, schedule recovery sleep ---
         recovery = None
-        if stop_reason == "interrupted:battery" or stop_reason == "rejected:battery":
+        if stop_reason in ("interrupted:battery", "rejected:battery"):
             recovery = 'battery'
         elif stop_reason == "interrupted:weather" or stop_reason in (
                 "rejected:rain", "rejected:recent_rain", "rejected:forecast"):
             recovery = 'weather'
         elif stop_reason == "interrupted:temp":
             recovery = 'temp'
+        elif stop_reason == "interrupted:window":
+            recovery = 'window'
         elif stop_reason.startswith("critical:"):
-            recovery = 'critical'
+            recovery = 'gps' if stop_reason == "critical:gps_not_ready" else 'critical'
+
+        if run is None:
+            self.log("[Master] Program end %s, no run to resume." % stop_reason)
+            self._route_after_program(None, in_dock)
+            return
 
         if recovery is not None:
             self.log("[Master] Program %s -> recovery '%s'."
                      % (stop_reason, recovery))
-            # Persist reason against the still-interrupted event.
-            with self.lock:
-                eid = self.persistent.get('interrupted_event_id')
-                self.persistent['interrupted_reason'] = recovery
-                self._save_state()
-            if eid is None and recovery != 'critical':
-                # No event to resume (e.g. manual run) - just idle.
-                self._route_after_program(None, in_dock)
-                return
-            self._route_after_program(recovery, in_dock)
+            if stop_reason.startswith("rejected:"):
+                self._after_wait_rejected(run, recovery)
+            else:
+                self._after_interrupt(run, recovery)
+            self._route_after_program(recovery if self._run() else None, in_dock)
             return
 
-        # --- Terminal / user stop: clear, no auto-sleep --------------------
-        # terminal:*, stopped:*, or anything else.
+        if stop_reason.startswith("rejected:"):
+            self._after_rejected(run, stop_reason.split(':', 1)[1], in_dock)
+            return
+
+        # --- Terminal / user stop: the run ends here, nothing automatic ----
+        # The mission checkpoint stays for a manual Resume.
         self.log("[Master] Program stopped: %s (no auto-sleep)" % stop_reason)
+        if stop_reason.startswith("terminal:"):
+            self._issue('run_terminal', program, reason=stop_reason)
         self._clear_interrupted()
         self._route_after_program(None, in_dock)
+
+    def _after_wait_rejected(self, run, reason):
+        """Refused at the start by rain or battery: nothing moved, nothing to
+        cap; it is retried after the same wait as an interruption."""
+        self._update_run(following=False, reason=reason,
+                         wait_until=self._t() + self._wait_s(reason))
+
+    def _after_rejected(self, run, code, in_dock=True):
+        """Refused for another reason (no map yet after a cold boot, no undock
+        program, dock state...): retry shortly, up to the cap, then report."""
+        rejects = run.get('rejects', 0) + 1
+        if rejects >= self.reject_max:
+            self._give_up(run, 'run_rejected', reason=code)
+            self._route_after_program(None, in_dock)
+            return
+        self._update_run(following=False, rejects=rejects, reason='rejected',
+                         reject=code, wait_until=self._t() + self.reject_retry_s)
+        self.log("[Master] %s refused (%s), retry %d/%d."
+                 % (run.get('program'), code, rejects, self.reject_max))
+        self._route_after_program(None, in_dock)
+
+    def _wait_s(self, reason):
+        return {'weather': self.weather_sleep_duration_s,
+                'temp': self.temp_sleep_duration_s,
+                'critical': self.critical_sleep_duration_s,
+                'gps': self.gps_retry_s}.get(reason, 0.0)
+
+    def _after_interrupt(self, run, reason):
+        """A mission that really ran has stopped early. Count it, cap it, and
+        leave the run waiting for its resume."""
+        checkpoint = self._program_checkpoint(run.get('program'))
+        resumes = run.get('resumes', 0) + 1
+        no_progress = run.get('no_progress', 0)
+        if reason not in ('weather', 'window') and checkpoint is not None:
+            no_progress = no_progress + 1 if checkpoint == run.get('checkpoint') else 0
+        critical = run.get('critical', 0) + (1 if reason in ('critical', 'gps') else 0)
+        if critical >= self.critical_max:
+            self._give_up(run, 'run_failed', reason=reason)
+        elif no_progress >= self.no_progress_max:
+            self._give_up(run, 'run_no_progress', reason=reason)
+        elif resumes >= self.resume_max:
+            self._give_up(run, 'run_too_many_resumes', reason=reason)
+        else:
+            self._update_run(following=False, reason=reason, resumes=resumes,
+                             no_progress=no_progress, critical=critical,
+                             checkpoint=checkpoint,
+                             wait_until=self._t() + self._wait_s(reason))
+            with self.lock:
+                self.persistent['interrupted_reason'] = reason
+                self._save_state()
 
     def _route_after_program(self, recovery_reason, in_dock):
         """Common routing: go idle, or wait for dock then recover."""
@@ -856,131 +1666,333 @@ class MasterController(object):
             else:
                 self._transition(self.STATE_IDLE)
         else:
-            self.off_dock_since = time.time()
+            self.off_dock_since = self._t()
             self._transition(self.STATE_WAIT_OFF_DOCK)
 
     # =====================================================================
     # state: WAIT_OFF_DOCK
     # =====================================================================
     def _handle_wait_off_dock(self):
-        """Robot off-dock after program ended. Wait for dock, then act."""
+        """Robot off-dock after program ended. Wait for dock, then act.
+
+        Never sleeps here: a robot cut off on the grass stays there, in the
+        rain, with nobody told. After the wait it reports and, when the
+        automation itself brought it here, sends it home once.
+        """
         with self.lock:
             in_dock = self.is_in_dock
 
         if in_dock:
             self.log("[Master] Robot returned to dock.")
             self.off_dock_since = None
+            self._home_sent = False
             if self._pending_recovery_reason is not None:
                 self._begin_recovery()
             else:
                 self._transition(self.STATE_IDLE)
             return
 
-        elapsed = time.time() - (self.off_dock_since or time.time())
+        elapsed = self._t() - (self.off_dock_since or self._t())
         remaining = self.off_dock_wait_s - elapsed
-        self.status_pub.publish(
-            String("Off-dock (%.0fm left)" % max(0, remaining / 60.0)))
+        if remaining > 0:
+            self._set_status("Off-dock (%.0fm left)" % (remaining / 60.0),
+                             'off_dock', left_s=int(remaining))
+            return
 
-        if remaining <= 0:
-            self.log("[Master] Off-dock timeout. Emergency sleep.")
-            self._execute_sleep(
-                duration_ms=int(self.terminal_long_sleep_s * 1000))
+        self._set_status("Off-dock (needs attention)", 'off_dock_stuck')
+        if not self._home_sent:
+            self._home_sent = True
+            self._go_home_or_report()
+
+    def _go_home_or_report(self):
+        """One docking attempt, only for a robot the automation left outside.
+
+        A stopped or manually driven robot stays where its owner left it.
+        """
+        why = None
+        if self._pending_recovery_reason is None and self._run() is None:
+            why = "no automatic reason to move it"
+        elif not self.automation_on:
+            why = "automation off"
+        elif self.is_inhibited:
+            why = "Hold on"
+        else:
+            why = self._mission_blocked()
+        with self.lock:
+            program = self.dock_program
+        if why is None and program is None:
+            why = "no dock program"
+        if why is not None:
+            self.log("[Master] Robot is off the dock and not returning (%s). "
+                     "It stays awake; needs a person." % why)
+            return
+        self.log("[Master] Robot is off the dock: sending it home.")
+        self.start_docking_pub.publish(program)
 
     # =====================================================================
     # recovery sleep
     # =====================================================================
     def _begin_recovery(self):
-        """Sleep according to the pending recovery reason (robot in dock)."""
+        """Sleep according to the pending recovery reason (robot in dock).
+        The wait itself is in the run (wait_until): the sleep only shortens it
+        for the electricity, a refused sleep changes nothing."""
         reason = self._pending_recovery_reason
         self._pending_recovery_reason = None
+        self._transition(self.STATE_IDLE)
         if reason is not None and self.is_inhibited:
             # Hold: no recovery sleep (nobody asked the robot to wait for
             # its next start). The interrupted event and its reason stay;
             # IDLE resumes them once Hold is released.
             self.log("[Master] Hold is on: no recovery sleep (%s); the "
                      "program resumes after Hold is released." % reason)
-            self._transition(self.STATE_IDLE)
             return
         if reason == 'battery':
-            self.log("[Master] Recovery: sleep until charged, then resume.")
-            self._execute_sleep(charged=True)
-        elif reason == 'weather':
-            self._timed_recovery_sleep(self.weather_sleep_duration_s, "weather")
-        elif reason == 'temp':
-            self._timed_recovery_sleep(self.temp_sleep_duration_s, "temp")
-        elif reason == 'critical':
-            self._timed_recovery_sleep(self.critical_sleep_duration_s,
-                                       "critical")
-        elif reason == 'terminal':
-            self._timed_recovery_sleep(self.terminal_long_sleep_s, "terminal")
-        else:
-            self._transition(self.STATE_IDLE)
+            self.log("[Master] Recovery: charge, then resume.")
+            self._sleep_to_charge((self._run() or {}).get('program', ''))
+        elif reason in ('weather', 'temp', 'critical'):
+            self._timed_recovery_sleep(self._wait_s(reason), reason)
+        # 'gps' stays awake: a sleep would be another cold start of the
+        # receivers, the very thing that made the fix late.
 
     def _timed_recovery_sleep(self, desired_s, label):
         """Timed sleep, capped so the robot wakes before the next program."""
-        now = datetime.datetime.now()
+        now = self._now()
         sleep_s = desired_s
         next_dt, _ = MowerScheduler.get_next_event(list(self.calendar), now)
         if next_dt is not None:
-            cap = (next_dt - now).total_seconds() - self.wake_lead_s
+            cap = MowerScheduler.real_seconds(now, next_dt) - self.wake_lead_s
             if cap < sleep_s:
                 sleep_s = cap
-        sleep_s = max(60.0, sleep_s)
-        self.log("[Master] Recovery sleep (%s) for %.0fm."
-                 % (label, sleep_s / 60.0))
-        self._execute_sleep(duration_ms=int(sleep_s * 1000))
+        self._sleep_for(label, sleep_s)
 
     # =====================================================================
     # state: PREPARE_SLEEP
     # =====================================================================
     def _handle_prepare_sleep(self):
-        """Sleep commands sent to the power module; wait for it to cut power.
+        """Drive the sleep sequence: read-back, retries, clean OS stop.
 
-        The power module (vitulus_ups) performs the actual power-off and sets
-        the wake timer. We do NOT shut the OS down ourselves - this mirrors the
-        webui power-module controls, which only publish the /pm/ sleep topics.
-        If the PM publishes a confirmation we log it once; otherwise we simply
-        stay passive until power is cut (a safe failure mode if the PM is
-        unavailable: the robot just stays awake rather than wrongly powering
-        off with no wake timer).
+        Everything has a bound: a sequence that fails ends cancelled and awake,
+        never stuck here. The way out is IDLE (or DISABLED); the PM flag state
+        decides nothing here, sleep_manager has dealt with it.
         """
-        with self.lock:
-            confirmed = self.sleep_confirmed
-        if confirmed and not self._sleep_confirmed_logged:
-            self.log("[Master] Sleep confirmed by power module.")
-            self._sleep_confirmed_logged = True
-        self.status_pub.publish(String("Sleeping (waiting for power off)"))
+        seq = self.sleep_seq
+        block = None if seq.past_return else self._sleep_gate()
+        seq.tick(block)
+        if seq.active:
+            if seq.state == sleep_manager.WAIT_CUT:
+                self._set_status("Sleeping (powering off)", 'sleep_cut')
+            else:
+                self._set_status("Preparing sleep", 'sleep_prepare')
+            return
+        reason = seq.result
+        self._clear_sleep_intent()
+        self.sleep_block = reason
+        self.log("[Master] Sleep not done: %s." % reason)
+        if reason not in ('disabled', 'hold', 'off_dock'):
+            self._sleep_cooldown_until = (
+                self._t() + self.sleep_cfg.fail_cooldown_s)
+            self._sleep_cooldown_reason = reason
+        self._leave_sleep()
+
+    def _leave_sleep(self):
+        self._transition(self.STATE_IDLE if self.automation_on
+                         else self.STATE_DISABLED)
 
     # =====================================================================
     # sleep execution
     # =====================================================================
-    def _execute_sleep(self, duration_ms=None, charged=False):
-        """Initiate sleep handshake with power module, then PREPARE_SLEEP."""
-        with self.lock:
-            self.sleep_confirmed = False
+    def _logins(self):
+        now = self._t()
+        if now - self._logins_cache[0] > 5.0:
+            self._logins_cache = (now, sleep_manager.active_logins())
+        return self._logins_cache[1]
 
-        self.set_sleep_wait_before_standby_pub.publish(UInt64(15000))
-        rospy.sleep(1.0)
+    def _sleep_gate(self):
+        """Why the power must not be cut right now, or None."""
+        with self.lock:
+            in_dock = self.is_in_dock
+        if not self.automation_on:
+            return 'disabled'
+        if self.is_inhibited:
+            return 'hold'
+        if not in_dock:
+            return 'off_dock'
+        if self.smach_status in ('Stopped', 'TERMINAL ERROR'):
+            return 'busy:%s' % self.smach_status    # waits for a person
+        blocked = self._mission_blocked() or self._mux_hold()
+        if blocked:
+            return 'busy:%s' % blocked
+        if self.sleep_check_logins:
+            logins = self._logins()
+            if logins:
+                return 'login:%s' % ','.join(logins)
+        if self.sleep_check_ui and self.ui_clients > 0:
+            return 'ui:%d' % self.ui_clients
+        return None
+
+    def _pm_status(self):
+        with self.lock:
+            return self.pm_status, self._t() - self.pm_status_time
+
+    def send_wait(self, ms):
+        self.set_sleep_wait_before_standby_pub.publish(UInt64(ms))
+
+    def send_time(self, ms):
+        self.set_sleep_time_pub.publish(UInt64(ms))
+
+    def send_offset(self, ms):
+        self.set_sleep_wait_charged_offset_pub.publish(UInt64(ms))
+
+    def arm(self, mode):
+        # One command each: the two flags clear one another in the firmware.
+        if mode == sleep_manager.MODE_CHARGED:
+            self.set_sleep_until_charged_pub.publish(Bool(True))
+        else:
+            self.set_robot_sleep_pub.publish(Bool(True))
+
+    def cancel(self):
+        self.set_robot_sleep_pub.publish(Bool(False))
+        self.set_sleep_until_charged_pub.publish(Bool(False))
+
+    def _sleep_refused(self, reason):
+        """Stay awake. No log flood: IDLE may ask again every check_interval."""
+        self.sleep_block = reason
+        if reason != self._sleep_last_refusal:
+            self._sleep_last_refusal = reason
+            self.log("[Master] Staying awake: %s." % reason)
+        self._leave_sleep()
+        return False
+
+    def _next_program_s(self):
+        now = self._now()
+        next_dt, _ = MowerScheduler.get_next_event(list(self.calendar), now)
+        if next_dt is None:
+            return None
+        return MowerScheduler.real_seconds(now, next_dt)
+
+    def _plan_charge(self):
+        """(mode, sleep_ms) of a charge sleep, or a refusal string."""
+        with self.lock:
+            st = self.pm_status
+        if st is None:
+            return 'pm_no_status'
+        if st.charger_status == 'CHARGED':
+            return 'charged'
+        if st.supply_status != 'ONLINE':
+            return 'no_charging'
+        if self.charge_sleep_mode == sleep_manager.MODE_CHARGED:
+            return sleep_manager.MODE_CHARGED, 0
+
+        # Charge sleeps in a row that gained nothing (_sleep_start_check): a
+        # dead contact or a charger that does not charge.
+        charge = self.persistent.get('charge_sleep') or {}
+        if charge.get('no_gain', 0) >= self.charge_sleep_max_no_gain:
+            return 'charge_no_gain'
+        capacity = st.battery_capacity
+        with self.lock:
+            self.persistent['charge_sleep'] = {
+                'capacity': capacity, 'no_gain': charge.get('no_gain', 0)}
+            self._save_state()
+
+        sleep_s = sleep_manager.plan_charge_s(capacity, self.sleep_cfg)
+        until = self._next_program_s()
+        if until is not None:
+            sleep_s = min(sleep_s, until - self.wake_lead_s)
+        ms = sleep_manager.plan_timed_ms(sleep_s, self.sleep_cfg)
+        return (sleep_manager.MODE_TIMED, ms) if ms else 'too_short'
+
+    def _execute_sleep(self, duration_ms=None, charged=False):
+        """Start the sleep sequence. False: refused, the robot stays awake."""
+        block = self._sleep_gate()
+        if block:
+            return self._sleep_refused(block)
+        if self._t() < self._sleep_cooldown_until:
+            return self._sleep_refused(self._sleep_cooldown_reason)
 
         if charged:
-            self.log("[Master] Sleep until charged.")
-            self.set_sleep_until_charged_pub.publish(Bool(True))
-            rospy.sleep(1.0)
-            self.set_robot_sleep_pub.publish(Bool(True))
+            plan = self._plan_charge()
+            if not isinstance(plan, tuple):
+                return self._sleep_refused(plan)
+            mode, sleep_ms = plan
         elif duration_ms is not None:
-            if duration_ms < 60000:
-                duration_ms = 60000
-            self.log("[Master] Timed sleep %.0fm."
-                     % (duration_ms / 60000.0))
-            self.set_sleep_time_pub.publish(UInt64(duration_ms))
-            rospy.sleep(1.0)
-            self.set_robot_sleep_pub.publish(Bool(True))
+            mode = sleep_manager.MODE_TIMED
+            sleep_ms = sleep_manager.plan_timed_ms(
+                duration_ms / 1000.0, self.sleep_cfg)
+            if sleep_ms is None:
+                return self._sleep_refused('too_short')
         else:
             rospy.logwarn("[Master] _execute_sleep called with no params.")
-            return
+            return self._sleep_refused('no_params')
 
-        self._sleep_confirmed_logged = False
+        self.sleep_block = None
+        self._sleep_last_refusal = None
+        self.log("[Master] Sleep (%s, %.0f min)." % (mode, sleep_ms / 60000.0))
+        with self.lock:
+            self.persistent['sleep_intent'] = {
+                'mode': mode,
+                'boot_id': sleep_manager.read_boot_id(self.boot_id_file),
+                'started': self._t(),
+                'planned_wake': self._t() + sleep_ms / 1000.0}
+            self._save_state()
+        self.sleep_seq.start(mode, sleep_ms)
         self._transition(self.STATE_PREPARE_SLEEP)
+        return True
+
+    def _clear_sleep_intent(self):
+        with self.lock:
+            self.persistent.pop('sleep_intent', None)
+            self._save_state()
+
+    def _sleep_start_check(self):
+        """First ticks: a new boot after a sleep, or a restart in the middle.
+
+        A sleep armed by a previous run of this node with nobody driving it
+        any more would cut the power under a running system: cancel it. A
+        sleep from the UI has no intent and is left alone.
+        """
+        intent = self.persistent.get('sleep_intent')
+        if not intent:
+            self._sleep_start_checked = True
+            return
+        st, age = self._pm_status()
+        if st is None or age > self.sleep_cfg.stale_s:
+            if self._t() - self.node_start_time < 30.0:
+                return
+        elif st.sleep_status or st.sleep_charged_status:
+            self.log("[Master] Unfinished sleep of a previous run: cancelled.")
+            self.cancel()
+            return      # until the PM reads back clear
+        self._sleep_start_checked = True
+        if intent.get('boot_id') != sleep_manager.read_boot_id(
+                self.boot_id_file):
+            now = self._t()
+            planned = intent.get('planned_wake') or now
+            self.last_wake = {'mode': intent.get('mode'),
+                              'planned_epoch': planned, 'actual_epoch': now,
+                              'late_s': now - planned}
+            with self.lock:
+                self.persistent['last_wake'] = self.last_wake
+            self.log("[Master] Awake after sleep (%+.0f min against plan)."
+                     % ((now - planned) / 60.0))
+            self._rate_charge_sleep(st)
+        self._clear_sleep_intent()
+
+    def _rate_charge_sleep(self, st):
+        """Did the charge sleep that just ended gain anything?"""
+        charge = self.persistent.get('charge_sleep') or {}
+        if st is None or 'capacity' not in charge:
+            return
+        gained = st.battery_capacity - charge['capacity']
+        with self.lock:
+            self.persistent['charge_sleep'] = {
+                'no_gain': charge.get('no_gain', 0) + 1 if gained <= 2 else 0}
+            self._save_state()
+
+    def sleep_report(self):
+        report = self.sleep_seq.report()
+        report['block'] = self.sleep_block
+        report['last_wake'] = self.last_wake or self.persistent.get('last_wake')
+        return report
 
 
 # ---------------------------------------------------------------------------
