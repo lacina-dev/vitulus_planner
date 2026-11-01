@@ -97,16 +97,16 @@ REASONS = {
         "navigace nepřevzala mapu {site} do {timeout} s"),
     'pose_mismatch': (
         "after loading map '{site}' the robot is {error} m away from the dock of "
-        "that map - check its docked point",
+        "that map - check its DOCKED point",
         "po načtení mapy {site} je robot {error} m od doku té mapy; zkontroluj "
-        "její bod docked"),
+        "její bod DOCKED"),
     'no_dock_point': (
         "map '{site}' has no DOCK point, the robot could not get home - add it first",
         "mapa {site} nemá bod DOCK, robot by se nevrátil domů; nejdřív ho přidej"),
     'no_docked_point': (
-        "map '{site}' has no docked point, the robot cannot place itself on it in "
+        "map '{site}' has no DOCKED point, the robot cannot place itself on it in "
         "the dock - dock it on that map and save the point first",
-        "mapa {site} nemá bod docked, robot se na ní v doku neumístí; zadokuj ho "
+        "mapa {site} nemá bod DOCKED, robot se na ní v doku neumístí; zadokuj ho "
         "na té mapě a bod ulož"),
     'cancelled': (
         "start of program '{program}' cancelled",
@@ -307,16 +307,19 @@ class MapGate(object):
             if self._busy:
                 self._cancel.set()
 
-    def _report(self, state, verb, ref, program, site, code=None, **params):
+    def _report(self, state, verb, ref, program, site, code=None, notes=None, **params):
         self._seq += 1
         params = dict(params, program=program, site=site)
-        self.env.report({
+        report = {
             'seq': self._seq, 't': self.env.now(), 'verb': verb, 'ref': ref,
             'program': program, 'site': site, 'state': state, 'code': code,
             'params': {k: v for k, v in params.items() if k not in ('program', 'site')},
             'text_en': reason_text(code, 'en', **params) if code else '',
             'text_cs': reason_text(code, 'cs', **params) if code else '',
-        })
+        }
+        if notes:
+            report['notes'] = notes     # what this start does differently, by zone
+        self.env.report(report)
 
     def refuse(self, verb, ref, program, site, code, **params):
         self._report(FAILED, verb, ref, program, site, code, **params)
@@ -331,7 +334,8 @@ class MapGate(object):
                      running['site'])
 
     def ready(self, verb, ref, program, site):
-        self._report(READY, verb, ref, program, site)
+        notes = self.env.start_notes() if hasattr(self.env, 'start_notes') else None
+        self._report(READY, verb, ref, program, site, notes=notes)
 
     def submit(self, plan, ref, verb, legacy_mode, start):
         """Start the worker for a Plan.SWITCH. `start` = the caller's hand-over,

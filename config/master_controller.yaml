@@ -81,6 +81,9 @@ battery_resume_after_low_pct: 80
 # 60 min after the last RAIN frame, see PreStartCheck).
 weather_sleep_duration_h: 2.0
 temp_sleep_duration_h: 1.0
+# Temperature sensor spikes sent the mission home (temp_watch.py). The motor is
+# cold: no sleep, resume after this many minutes.
+temp_spike_wait_min: 5.0
 critical_error_sleep_duration_h: 0.5
 
 # Terminal error of a run in the dock (undock failed): wait this long (minutes),

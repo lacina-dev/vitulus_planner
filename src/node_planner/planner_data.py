@@ -45,6 +45,7 @@ class Zone:
         self.path_msg_outline.header.frame_id = "map"
         self.start_point = None  # first clicked point of zone polygon (ROS map frame)
         self.multilines_by_pass = []  # raw coverage LineStrings per pass (no connectors)
+        self.rules_fp = ''  # map rules the paths were generated under (coverage_rules)
 
 
 class MapData:

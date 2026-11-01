@@ -28,7 +28,7 @@ __all__ = [
     "resolve_site",
     "polygon_map_to_utm", "polygon_utm_to_map",
     "zone_to_bundle", "bundle_to_polygon_map",
-    "program_to_bundle", "rel_mismatch",
+    "program_to_bundle", "apply_effective", "rel_mismatch",
 ]
 
 # MapEditZone scalar fields carried into zones.geojson props ('name' is stored
@@ -100,6 +100,36 @@ def program_to_bundle(name, zone_names, scalars):
     out = {"name": name, "zone_names": list(zone_names)}
     out.update(scalars)
     return out
+
+
+def apply_effective(bzones, programs):
+    """Write props.effective into bundle zone dicts, from programs.yaml dicts:
+    [{program, cut_height, rpm}], one per program with override_zone whose values
+    differ from the zone's own, by the mission's rule (<= 0 = not set, the zone's
+    value stands). No such program: no key. Computed, never read back on import.
+    Returns True when a zone changed."""
+    changed = False
+    for z in bzones:
+        props = z.setdefault("props", {})
+        own = (int(props.get("cut_height") or 0), int(props.get("rpm") or 0))
+        rows = []
+        for p in programs:
+            if not p.get("override_zone") or z.get("name") not in (p.get("zone_names") or []):
+                continue
+            height = int(p.get("cut_height") or 0)
+            rpm = int(p.get("rpm") or 0)
+            values = (height if height > 0 else own[0], rpm if rpm > 0 else own[1])
+            if values != own:
+                rows.append({"program": p.get("name"), "cut_height": values[0],
+                             "rpm": values[1]})
+        rows.sort(key=lambda r: r["program"] or "")
+        if rows != props.get("effective", []):
+            changed = True
+            if rows:
+                props["effective"] = rows
+            else:
+                props.pop("effective", None)
+    return changed
 
 
 # --------------------------------------------------------------------------

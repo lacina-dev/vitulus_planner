@@ -33,6 +33,7 @@ from node_planner import planner_io
 from node_planner import run_path
 from node_planner import program_chain
 from node_planner import program_map
+from node_planner import coverage_rules
 
 # Planner state lives under ~/.vitulus (created on first boot, see Node.__init__).
 _VITULUS_DIR = os.path.join(os.path.expanduser('~'), '.vitulus')
@@ -164,6 +165,25 @@ class Node:
         # bundle import) and is itself called from paths that may hold it.
         self._workspace_lock = threading.RLock()
         self._site_map_rerun = False        # a grid arrived mid-run -> run again
+        self._site_map_rules_dirty = False  # rules moved: zones behind them regen
+        self._site_map_deferred = False     # a refresh waits for the mission's end
+
+        # Active nogo / noblade of /map_objects/rules: (site, rules), see
+        # coverage_rules. A running mission keeps its copy of the program; what
+        # changes meanwhile waits (see _mission_running).
+        self._map_rules = (None, [])
+        self._nogo_extra_m = rospy.get_param('~nogo_extra_margin_m',
+                                             coverage_rules.NOGO_EXTRA_M)
+        # Path generation on a private view of this node (_zone_generator).
+        self._start_notes = []              # coverage_rules.start_note of a start
+        self._run_paths = self._run_paths_read()
+        self._gen_cancelled = None          # callable: stop this generation?
+        self._gen_dry = False               # paths only, nothing to draw
+        # /web_plan/zone_check: newest request only, one worker at a time.
+        self._zone_check_lock = threading.Lock()
+        self._zone_check_seq = 0
+        self._zone_check_next = None        # (seq, request) waiting for the worker
+        self._zone_check_active = False
 
         # ---- publishers FIRST: subscriber callbacks can fire as soon as a
         # subscriber exists (latched active_map / status / site_map), and they
@@ -178,6 +198,8 @@ class Node:
         # instead of closing the form blindly. NOT latched (a stale result must
         # never answer a new request).
         self.zone_result_pub = rospy.Publisher("/web_plan/zone_result", String, queue_size=10)
+        self.zone_check_result_pub = rospy.Publisher("/web_plan/zone_check_result", String, queue_size=5)
+        self.zone_op_result_pub = rospy.Publisher("/web_plan/zone_op_result", String, queue_size=10)
         # Mowing-path preview of the SELECTED / just saved zone (frame 'map').
         # Latched; every message starts with a DELETEALL marker, so a client just
         # feeds it to a MarkerArray client. Cleared on cancel/remove/site change.
@@ -227,6 +249,8 @@ class Node:
         self.map_remove_poly_sub = rospy.Subscriber("/web_plan/remove_polygon", String, self.callback_map_remove_poly)
         self.zone_save_sub = rospy.Subscriber("/web_plan/save_zone", MapEditZone, self.callback_map_save_zone)
         self.zone_remove_sub = rospy.Subscriber("/web_plan/remove_zone", String, self.callback_zone_remove)
+        self.zone_check_sub = rospy.Subscriber("/web_plan/zone_check", String, self.callback_zone_check, queue_size=5)
+        self.zone_op_sub = rospy.Subscriber("/web_plan/zone_op", String, self.callback_zone_op, queue_size=5)
         if _BUNDLE_OK:
             self.rename_result_pub = rospy.Publisher(objnames.RENAME_RESULT_TOPIC, String, queue_size=10)
             self.zone_rename_sub = rospy.Subscriber("/web_plan/rename_zone", String, self.callback_zone_rename)
@@ -272,6 +296,7 @@ class Node:
         self.mission_status_sub = rospy.Subscriber("/mower_smach/status", String, self.callback_mission_status)
         self.run_path_busy_sub = rospy.Subscriber("/mower_smach/busy", Bool, self.callback_run_path_busy)
         self.run_path_show_sub = rospy.Subscriber("/web_plan/run_path_show", Bool, self.callback_run_path_show)
+        self.map_rules_sub = rospy.Subscriber("/map_objects/rules", String, self.callback_map_rules, queue_size=1)
 
         self.save_map_srv = rospy.Service("/web_plan/save_map", Save_map, self.save_map)
 
@@ -328,6 +353,7 @@ class Node:
         # shared self.current_zone / self.map_data.
         with self._workspace_lock:
             self._load_planner_data_locked()
+        self._check_rules_behind()      # a pickle may hold zones of older rules
 
     def _load_planner_data_locked(self):
         if not self._legacy_maps():
@@ -707,14 +733,57 @@ class Node:
             self.map_poly_list_pub.publish(msg)
 
     def _regenerate_zone(self, msg):
-        """Build a Zone (mask layers + outline/coverage paths) from a
-        MapEditZone msg and store it in map_data.zones (add or replace by
-        name). Sets self.current_zone. Returns the Zone.
+        """Build a Zone from a MapEditZone msg and store it in map_data.zones (add
+        or replace by name). Sets self.current_zone. Returns the Zone.
 
-        This is the geometry-generation core shared by the live save_zone
-        handler and the site-bundle import path — regeneration MUST go through
-        this single code path so imported zones get identical coverage.
+        Shared by the live save_zone handler and the site-bundle import path —
+        regeneration MUST go through this single code path so imported zones get
+        identical coverage.
         """
+        self._generate_zone(msg)
+
+        # Save or update current zone
+        zone_exist = False
+        zone_exist_id = -1
+        i = 0
+        for z in self.map_data.zones:
+            if z.msg.name == msg.name:
+                zone_exist = True
+                zone_exist_id = i
+            i += 1
+        if not zone_exist:
+            self.map_data.zones.append(self.current_zone)
+        else:
+            self.map_data.zones[zone_exist_id] = self.current_zone
+        return self.current_zone
+
+    def _rule_px(self, x, y):
+        """Map metres -> (col, row), the way a zone polygon is rasterized."""
+        return (self.map_data.x_origin + int(x / self.map_data.resolution),
+                self.map_data.y_origin + int(y / self.map_data.resolution))
+
+    def _coverage_rules(self):
+        """Active nogo / noblade of the map the workspace holds. A list from
+        another site (site switch in progress) shapes nothing."""
+        site, rules = self._map_rules
+        if site is None or site in (self._raster_site, self._bundle_site()):
+            return rules
+        return []
+
+    def _zone_rules(self, zmsg):
+        """The rules that bear on a zone (MapEditZone)."""
+        return coverage_rules.rules_of_zone(
+            self._coverage_rules(),
+            [(p.x, p.y) for p in zmsg.polygon.polygon.points])
+
+    def _gen_check(self):
+        """Between the steps of a generation: stop a superseded dry run."""
+        if self._gen_cancelled is not None and self._gen_cancelled():
+            raise coverage_rules.Cancelled()
+
+    def _generate_zone(self, msg):
+        """Mask layers + outline/coverage paths of a MapEditZone msg, stored
+        nowhere but self.current_zone. Returns the Zone."""
         polygon = []
         for point in msg.polygon.polygon.points:
             x_point = int(point.x / self.map_data.resolution)
@@ -736,6 +805,12 @@ class Node:
         cv2.fillPoly(np_zone, pts=[np_polygon_mow], color=MapSpec.OBSTACLE)
         np_zone = np.where(np_zone == MapSpec.OBSTACLE, self.map_data.np_assembled, MapSpec.OBSTACLE)
 
+        # Map rules: coverage only. np_zone_navi below stays, noblade is passable.
+        rules = self._zone_rules(msg)
+        coverage_rules.stamp(
+            np_zone, rules, self._rule_px, self.map_data.obstacle_margin_px,
+            int(round(self._nogo_extra_m / self.map_data.resolution)), MapSpec.OBSTACLE)
+
         # make zone polygon bigger by obstacle margin and draw zone map for navi
         shape_poly = geometry.Polygon(np_polygon)
         shape_poly = shape_poly.buffer(self.map_data.obstacle_margin_px, cap_style='flat', join_style='mitre')
@@ -749,6 +824,7 @@ class Node:
         cv2.fillPoly(np_zone_navi, pts=[np_polygon_navi], color=MapSpec.OBSTACLE)
         np_zone_navi = np.where(np_zone_navi == MapSpec.OBSTACLE, self.map_data.np_semi_assembled, MapSpec.OBSTACLE)
         zone = Zone(np_zone, np_zone_navi, msg)
+        zone.rules_fp = coverage_rules.fingerprint(rules)
         # Store first clicked point as start reference (ROS map frame, metres)
         if len(msg.polygon.polygon.points) > 0:
             zone.start_point = geometry.Point(msg.polygon.polygon.points[0].x,
@@ -757,27 +833,15 @@ class Node:
         # Create paths around zone and coverage paths
         self.current_zone = zone
         self.create_paths_around()
+        self._gen_check()
         self.current_zone.msg.paths = []
         self.current_zone.msg.length = 0
         self.create_outline_path_msg()
         self.create_coverage_paths()
+        self._gen_check()
         self.create_coverage_path_msg()
         self.current_zone.msg.length = int(round(self.current_zone.msg.length))
         # print("Zone path length: {}".format(self.current_zone.msg.length))
-
-        # Save or update current zone
-        zone_exist = False
-        zone_exist_id = -1
-        i = 0
-        for z in self.map_data.zones:
-            if z.msg.name == msg.name:
-                zone_exist = True
-                zone_exist_id = i
-            i += 1
-        if not zone_exist:
-            self.map_data.zones.append(self.current_zone)
-        else:
-            self.map_data.zones[zone_exist_id] = self.current_zone
         return self.current_zone
 
     def _has_workspace(self):
@@ -868,13 +932,20 @@ class Node:
         if not self._programs_usable():
             return ("Zone '{}' NOT saved: the programs of the active map are not "
                     "loaded yet — try again in a moment.".format(name))
+        program = self._running_program_on(name)
+        if program:
+            return ("Zone '{}' NOT saved: program '{}' is running on it — stop "
+                    "it first.".format(name, program))
+        return None
+
+    def _running_program_on(self, name):
+        """Name of the running program that mows zone `name`, or None."""
         programs = (self.permanent_program_list_msg.program_list
                     if self.permanent_program_list_msg is not None else [])
         for p in programs:
             if (self._on_current_map(p) and self._program_is_running(p.name)
                     and any(z.name == name for z in p.zone_list)):
-                return ("Zone '{}' NOT saved: program '{}' is running on it — stop "
-                        "it first.".format(name, p.name))
+                return p.name
         return None
 
     def _save_zone(self, msg):
@@ -890,6 +961,10 @@ class Node:
             refusal = self._zone_save_refusal(msg.name)
             if refusal:
                 return False, refusal, 0
+            if not coverage_rules.cut_height_ok(msg.cut_height):
+                return False, ("Zone '{}' NOT saved: cut height {} mm is outside "
+                               "{}.".format(msg.name, msg.cut_height,
+                                            coverage_rules.cut_height_text())), 0
             before = list(self.map_data.zones)
             try:
                 zone = self._regenerate_zone(msg)
@@ -1030,6 +1105,415 @@ class Node:
             self._bundle_export_zones()
         return True, "Zone {} removed.".format(name)
 
+    # ---- /web_plan/zone_check: dry run ------------------------------------
+    def _zone_generator(self, cancelled=None, dry=False):
+        """A private view of this node for generating zones: the real path code,
+        with its own current_zone and a frozen view of the raster layers, so
+        nothing a generation does can reach the workspace or the UI log. Call
+        with the workspace lock held; use it without."""
+        gen = copy.copy(self)
+        gen.map_data = copy.copy(self.map_data)
+        gen.current_zone = None
+        gen.log_publisher = lambda text: None
+        gen._gen_cancelled = cancelled
+        gen._gen_dry = dry
+        return gen
+
+    def callback_zone_check(self, msg):
+        """Only hands over: path generation takes seconds. Every request gets one
+        result; a newer one supersedes it, before or during its run."""
+        try:
+            req = json.loads(msg.data)
+            if not isinstance(req, dict):
+                raise ValueError('expected a JSON object')
+        except ValueError:
+            self._zone_check_publish(self._zone_check_out(
+                {}, [coverage_rules.problem('bad_request')]))
+            return
+        with self._zone_check_lock:
+            self._zone_check_seq += 1
+            dropped = self._zone_check_next
+            self._zone_check_next = (self._zone_check_seq, req)
+            start = not self._zone_check_active
+            self._zone_check_active = True
+        if dropped is not None:
+            self._zone_check_publish(self._zone_check_cancelled(dropped[1]))
+        if start:
+            t = threading.Thread(target=self._zone_check_worker, name="zone_check")
+            t.daemon = True
+            t.start()
+
+    def _zone_check_worker(self):
+        while True:
+            with self._zone_check_lock:
+                item = self._zone_check_next
+                self._zone_check_next = None
+                if item is None:
+                    self._zone_check_active = False
+                    return
+            seq, req = item
+            try:
+                out = self._zone_check(
+                    req, lambda: seq != self._zone_check_seq)
+            except coverage_rules.Cancelled:
+                out = self._zone_check_cancelled(req)
+            except Exception as e:
+                rospy.logerr("[{}] Zone check failed: {}".format(rospy.get_caller_id(), e))
+                out = self._zone_check_out(req, [coverage_rules.problem('internal')])
+            try:
+                self._zone_check_publish(out)
+            except Exception as e:
+                rospy.logerr("[{}] Zone check result lost: {}".format(
+                    rospy.get_caller_id(), e))
+
+    def _zone_check_publish(self, out):
+        self.zone_check_result_pub.publish(String(json.dumps(out)))
+
+    def _zone_check_out(self, req, problems):
+        return {"req": req.get("req"), "ok": not coverage_rules.has_errors(problems),
+                "mowable_m2": 0.0, "unreachable_m2": 0.0, "length_m": 0.0,
+                "minutes": 0, "preview": [], "problems": problems}
+
+    def _zone_check_cancelled(self, req):
+        out = self._zone_check_out(req, [])
+        out.update(ok=False, cancelled=True)
+        return out
+
+    def _zone_check_props(self, settings):
+        """Zone props of a request; what it leaves out as the editor's defaults."""
+        props = {'type': 'normal', 'border_paths': 2, 'coverage_angle': 0,
+                 'paths_distance': 0.2, 'simplify': 0.1, 'cut_height': 0, 'rpm': 0}
+        for key in ('border_paths', 'coverage_angle', 'cut_height', 'rpm'):
+            if settings.get(key) is not None:
+                props[key] = int(settings[key])
+        for key in ('paths_distance', 'simplify'):
+            if settings.get(key) is not None:
+                props[key] = float(settings[key])
+        if settings.get('type'):
+            props['type'] = str(settings['type'])
+        return props
+
+    def _zone_check_runs(self):
+        """Past runs of the programs of this map, for the minutes estimate."""
+        programs = (self.permanent_program_list_msg.program_list
+                    if self.permanent_program_list_msg is not None else [])
+        return [{'length': p.length, 'minutes': p.last_duration_minutes,
+                 'speed': (p.speed or 'mid').lower(), 'result': p.last_result,
+                 'zones': [z.name for z in p.zone_list]}
+                for p in programs if self._on_current_map(p)]
+
+    def _zone_check_home(self):
+        """Where the robot starts from, map frame, or None: UNDOCK (the dock
+        itself may lie inside the obstacle margin), else DOCK."""
+        try:
+            site = self._bundle_site()
+            datum = self._active_map_datum() if site else None
+            if datum is None:
+                return None
+            points = {(w.get('name') or '').upper(): w
+                      for w in vbundle.load_waypoints(site) or []}
+            w = points.get('UNDOCK') or points.get('DOCK')
+            return vgeo.utm_to_map(w['e'], w['n'], datum) if w else None
+        except Exception as e:
+            rospy.logwarn("[{}] Zone check: no start point ({}).".format(
+                rospy.get_caller_id(), e))
+            return None
+
+    def _zone_check(self, req, cancelled):
+        """Everything a save of this zone would do, up to the save. Result of
+        /web_plan/zone_check; problems see coverage_rules.problem()."""
+        problem = coverage_rules.problem
+        settings = req.get('settings') if isinstance(req.get('settings'), dict) else {}
+        name = str(req.get('name') or settings.get('name') or '').strip()
+        points, shape, problems = coverage_rules.read_shape(req.get('points'))
+        try:
+            props = self._zone_check_props(settings)
+        except (TypeError, ValueError):
+            problems.append(problem('bad_settings'))
+            return self._zone_check_out(req, problems)
+        problems.extend(coverage_rules.settings_problems(props))
+        with self._workspace_lock:
+            if not self._has_workspace():
+                problems.append(problem('no_map'))
+                return self._zone_check_out(req, problems)
+            if not self._programs_usable():
+                problems.append(problem('programs_not_loaded'))
+            elif name and self._running_program_on(name):
+                problems.append(problem('program_running',
+                                        program=self._running_program_on(name)))
+            zones = [(z.msg.name, [(p.x, p.y) for p in z.msg.polygon.polygon.points])
+                     for z in self.map_data.zones if z.msg.name != name]
+            if _BUNDLE_OK and name:
+                code = objnames.check_name(name, [z[0] for z in zones])
+                if code:
+                    problems.append(problem('name_' + code, name=name))
+            rules = self._coverage_rules()
+            runs = self._zone_check_runs()
+            gen = self._zone_generator(cancelled, dry=True)
+        if coverage_rules.has_errors(problems) or shape is None:
+            return self._zone_check_out(req, problems)
+
+        zmsg = self._bundle_build_zone_msg(name, points, props)
+        data = gen.map_data
+        try:
+            zone = gen._generate_zone(zmsg)
+        except coverage_rules.Cancelled:
+            raise
+        except Exception as e:
+            rospy.loginfo("[{}] Zone check: no paths for this shape ({}).".format(
+                rospy.get_caller_id(), e))
+            problems.append(problem('no_path'))
+            return self._zone_check_out(req, problems)
+        if not zone.msg.paths:
+            problems.append(problem('no_path'))
+
+        rows, cols = data.np_assembled.shape
+        x1 = data.origin_x + cols * data.resolution
+        y1 = data.origin_y + rows * data.resolution
+        if (shape.bounds[0] < data.origin_x or shape.bounds[1] < data.origin_y
+                or shape.bounds[2] > x1 or shape.bounds[3] > y1):
+            problems.append(problem('outside_map', 'warning'))
+        for rule in rules:
+            over = coverage_rules.overlap_area(shape, rule['points'])
+            if over >= 0.01:
+                problems.append(problem('overlaps_' + rule['type'], 'warning',
+                                        name=rule['name'], area_m2=round(over, 2)))
+        for other, outline in zones:
+            if len(outline) >= 3:
+                over = coverage_rules.overlap_area(shape, outline)
+                if over >= 0.01:
+                    problems.append(problem('overlaps_zone', 'warning', name=other,
+                                            area_m2=round(over, 2)))
+
+        # Parts of the zone the path code really uses, and whether the robot gets
+        # there: nogo blocks driving, noblade does not.
+        parts = gen.filter_list_of_polygons(gen.get_first_level_outline_poly())
+        if len(parts) > 1:
+            problems.append(problem('zone_split', 'warning', parts=len(parts)))
+        navi = np.copy(data.np_assembled)
+        coverage_rules.stamp(navi, [r for r in rules if r['type'] == 'nogo'],
+                             gen._rule_px, data.obstacle_margin_px, 0, MapSpec.OBSTACLE)
+        cut_off = coverage_rules.cut_off_parts(
+            parts, navi == MapSpec.FREE, gen._rule_px, self._zone_check_home())
+        radius = MapSpec.COVERAGE_DIAMETER / 2
+        mowable = 0.0
+        for i, part in enumerate(parts):
+            area = part.buffer(radius).intersection(shape).area
+            if i in cut_off:
+                problems.append(problem('part_unreachable', 'warning',
+                                        area_m2=round(area, 2)))
+            else:
+                mowable += area
+        gen._gen_check()
+
+        speed = settings.get('speed')
+        if not speed:
+            speed = next((r['speed'] for r in runs if name and name in r['zones']), 'mid')
+        minutes, source = coverage_rules.estimate_minutes(zone.msg.length, str(speed),
+                                                          runs, name)
+        out = self._zone_check_out(req, problems)
+        out.update(
+            mowable_m2=round(mowable, 1),
+            unreachable_m2=round(max(0.0, shape.area - mowable), 1),
+            length_m=zone.msg.length, minutes=minutes, minutes_source=source,
+            preview=coverage_rules.thin_preview(
+                [[(q.pose.position.x, q.pose.position.y) for q in path.poses]
+                 for path in zone.msg.paths]))
+        return out
+
+    # ---- /web_plan/zone_op: split / merge / duplicate ----------------------
+    def callback_zone_op(self, msg):
+        """Exactly one result on /web_plan/zone_op_result for every attempt:
+        {"req","op","ok","code","reason","names","removed","programs"}. code is
+        'ok' or the machine form of the refusal; on a refusal nothing changed."""
+        out = {"req": None, "op": None, "ok": False, "code": "failed",
+               "reason": "Zone operation failed: internal planner error.",
+               "names": [], "removed": [], "programs": 0}
+        try:
+            req = json.loads(msg.data)
+            if not isinstance(req, dict):
+                raise ValueError('expected a JSON object')
+            out.update(req=req.get('req'), op=req.get('op'))
+            out.update(self._zone_op(req))
+        except ValueError:
+            out.update(code='bad_request', reason="Zone operation: bad request.")
+        except Exception as e:
+            rospy.logerr("[{}] Zone operation failed: {}".format(rospy.get_caller_id(), e))
+        finally:
+            self.log_publisher(out['reason'])
+            if not out['ok']:
+                rospy.logerr("[{}] {}".format(rospy.get_caller_id(), out['reason']))
+            self.zone_op_result_pub.publish(String(json.dumps(out)))
+
+    _ZONE_OP_TEXT = {
+        'bad_request': "the request is not complete",
+        'no_map': "no map is active — activate or record a map first",
+        'programs_not_loaded': "the programs of the active map are not loaded yet "
+                               "— try again in a moment",
+        'not_found': "zone '{zone}' is not on the active map",
+        'program_running': "program '{program}' is running on zone '{zone}' — stop "
+                           "it first",
+        'other_map': "the planner still holds another map — try again in a moment",
+        'cut_height_range': "cut height {value} mm of zone '{zone}' is outside {range}",
+        'bad_line': "the line is not usable",
+        'line_misses_zone': "the line does not cross the zone",
+        'split_not_two_parts': "the line cuts the zone in more than two parts",
+        'self_intersecting': "the outline crosses itself",
+        'not_adjacent': "the zones do not touch",
+        'merge_has_hole': "the zones enclose a hole, and a zone cannot have one",
+        'name': "name '{zone}' cannot be used ({detail})",
+        'no_path': "zone '{zone}' would have no mowing path — it is too small or "
+                   "lies outside the free space of the map",
+    }
+
+    def _zone_op_refuse(self, op, code, **params):
+        return {"ok": False, "code": code, "reason": "Zone {} refused: {}.".format(
+            op, self._ZONE_OP_TEXT[code].format(**params))}
+
+    def _zone_op_names(self, req, op):
+        if op == 'merge':
+            names = req.get('names')
+            if not isinstance(names, list):
+                return []
+            names = [str(n) for n in names]
+            return names if len(names) >= 2 and len(set(names)) == len(names) else []
+        return [str(req['name'])] if req.get('name') else []
+
+    def _zone_op_plan(self, req, op, names, outlines, taken):
+        """(spec, code): spec = {'parts': [(name, outline)], 'replaced': [names]}.
+        Every part takes the settings of the first zone."""
+        first = names[0]
+        if op == 'duplicate':
+            new = str(req.get('new_name') or '').strip()
+            return {'parts': [(new or coverage_rules.unique_name(first + ' copy', taken),
+                               outlines[first])], 'replaced': []}, None
+        if op == 'merge':
+            shape, code = coverage_rules.merge_zones([outlines[n] for n in names])
+            if code:
+                return None, code
+            new = str(req.get('new_name') or '').strip() or first
+            return {'parts': [(new, shape)], 'replaced': names}, None
+        parts, code = coverage_rules.split_zone(outlines[first], req.get('line'))
+        if code:
+            return None, code
+        wanted = [str(n).strip() for n in req.get('new_names') or [] if str(n).strip()]
+        if len(wanted) >= 2:
+            pair = wanted[:2]
+        else:
+            pair = [first, wanted[0] if wanted
+                    else coverage_rules.unique_name(first + ' 2', taken)]
+        return {'parts': list(zip(pair, parts)), 'replaced': [first]}, None
+
+    def _zone_op(self, req):
+        op = req.get('op')
+        if op not in ('split', 'merge', 'duplicate'):
+            return {"code": "bad_request", "reason": "Zone operation: unknown op."}
+        names = self._zone_op_names(req, op)
+        if not names:
+            return self._zone_op_refuse(op, 'bad_request')
+        if not self._ensure_workspace("Zone {}".format(op), report=False):
+            return self._zone_op_refuse(op, 'no_map')
+        # Same rules as a zone save, for every zone it touches, and everything is
+        # generated before anything changes.
+        with self._workspace_lock:
+            if not self._programs_usable():
+                return self._zone_op_refuse(op, 'programs_not_loaded')
+            site = self._bundle_site()
+            if site and not self._workspace_is_of(site, "zone {} refused".format(op)):
+                return self._zone_op_refuse(op, 'other_map')
+            zones = {z.msg.name: z for z in self.map_data.zones}
+            for name in names:
+                if name not in zones:
+                    return self._zone_op_refuse(op, 'not_found', zone=name)
+                program = self._running_program_on(name)
+                if program:
+                    return self._zone_op_refuse(op, 'program_running', zone=name,
+                                                program=program)
+                height = zones[name].msg.cut_height
+                if not coverage_rules.cut_height_ok(height):
+                    return self._zone_op_refuse(
+                        op, 'cut_height_range', zone=name, value=height,
+                        range=coverage_rules.cut_height_text())
+            taken = list(zones)
+            if site:
+                taken += [z.get('name') for z in (vbundle.load_zones(site) or [])]
+            outlines = {n: [(p.x, p.y) for p in zones[n].msg.polygon.polygon.points]
+                        for n in names}
+            spec, code = self._zone_op_plan(req, op, names, outlines, taken)
+            if code:
+                return self._zone_op_refuse(op, code)
+            free_names = [n for n in taken if n not in spec['replaced']]
+            built = []
+            gen = self._zone_generator()
+            for name, shape in spec['parts']:
+                if _BUNDLE_OK:
+                    code = objnames.check_name(name, free_names)
+                    if code:
+                        return self._zone_op_refuse(op, 'name', zone=name, detail=code)
+                free_names.append(name)
+                zmsg = copy.deepcopy(zones[names[0]].msg)
+                zmsg.name = name
+                zmsg.polygon.polygon.points = [Point32(float(x), float(y), 0.0)
+                                               for x, y in shape]
+                try:
+                    zone = gen._generate_zone(zmsg)
+                except Exception as e:
+                    rospy.logwarn("[{}] Zone {}: '{}' regeneration failed: {}".format(
+                        rospy.get_caller_id(), op, name, e))
+                    return self._zone_op_refuse(op, 'no_path', zone=name)
+                if not zone.msg.paths:
+                    return self._zone_op_refuse(op, 'no_path', zone=name)
+                built.append(zone)
+            return self._zone_op_commit(op, spec, built)
+
+    def _zone_op_commit(self, op, spec, built):
+        """Workspace, bundle, programs, lists. Caller holds the workspace lock."""
+        new_names = [z.msg.name for z in built]
+        removed = [n for n in spec['replaced'] if n not in new_names]
+        self.map_data.zones = [z for z in self.map_data.zones
+                               if z.msg.name not in spec['replaced']] + built
+        self.current_zone = None
+        self._clear_zone_preview()
+        self.np_show = self.map_data.np_assembled
+        self.map_zone_list_publisher()
+        self.save_running_data()
+        # The bundle first: the programs export keeps a stored zone name only while
+        # zones.geojson still holds it, and the merge export keeps what it finds.
+        for name in removed:
+            self._bundle_remove_zone(name)
+        self._bundle_export_zones()
+        programs = self._zone_op_programs(spec, built)
+        text = "Zone {} done: {}.".format(op, ', '.join(new_names))
+        return {"ok": True, "code": "ok", "reason": text, "names": new_names,
+                "removed": removed, "programs": programs}
+
+    def _zone_op_programs(self, spec, built):
+        """Programs that used a replaced zone now mow what took its place, at the
+        same position in their order. Returns how many changed."""
+        replaced = set(spec['replaced'])
+        if self.permanent_program_list_msg is None or not replaced:
+            return 0
+        fresh = [z.msg for z in built]
+        changed = 0
+        for program in self.permanent_program_list_msg.program_list:
+            if (not self._on_current_map(program)
+                    or not any(z.name in replaced for z in program.zone_list)):
+                continue
+            zone_list = []
+            for z in program.zone_list:
+                for item in (fresh if z.name in replaced else [z]):
+                    if all(item.name != have.name for have in zone_list):
+                        zone_list.append(copy.deepcopy(item))
+            program.zone_list = zone_list
+            program.area = min(int(sum(z.area for z in zone_list)), 32767)
+            program.length = min(int(sum(z.length for z in zone_list)), 32767)
+            changed += 1
+        if changed:
+            self.save_programs()
+            self.program_list_publisher()
+            self._bundle_export_programs()
+        return changed
+
     def callback_zone_selected(self, msg):
         with self._workspace_lock:   # current_zone is shared with the zone regen
             if self.map_data is None:
@@ -1083,6 +1567,7 @@ class Node:
         image_copy = self.current_zone.np_zone_navi.copy()
         area_sum = 0
         for i in range(0, self.current_zone.msg.border_paths):
+            self._gen_check()
             inverted = cv2.bitwise_not(self.current_zone.np_zone_paths.view(np.uint8))
             inverted = np.where(inverted == 255, inverted, 0)
             contours, hierarchy = cv2.findContours(inverted, cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
@@ -1092,18 +1577,20 @@ class Node:
             hierarchy = hierarchy[0]
             self.get_shapely_poly(polygons, contours, hierarchy, 0, True, [])
             for poly in polygons:
-                ros_poly = self.convert_poly_to_ros_coord(poly)
-                self.current_zone.path_polygons.append(PathPolygon(ros_poly, i))
+                # A raster contour can touch itself (a hole on the edge, usual
+                # next to a map rule) and GEOS refuses such a polygon later on.
+                for ros_poly in coverage_rules.valid_parts(self.convert_poly_to_ros_coord(poly)):
+                    self.current_zone.path_polygons.append(PathPolygon(ros_poly, i))
 
-                # Save area of the first path greater of 1/2 of the coverage diameter
-                if i == 0:
-                    mow_radius = MapSpec.COVERAGE_DIAMETER / 2
-                    poly_b = ros_poly.buffer(mow_radius,
-                                       join_style='round',
-                                       mitre_limit=5.0,
-                                       cap_style='flat',
-                                       quad_segs=16)
-                    area_sum += poly_b.area
+                    # Save area of the first path greater of 1/2 of the coverage diameter
+                    if i == 0:
+                        mow_radius = MapSpec.COVERAGE_DIAMETER / 2
+                        poly_b = ros_poly.buffer(mow_radius,
+                                           join_style='round',
+                                           mitre_limit=5.0,
+                                           cap_style='flat',
+                                           quad_segs=16)
+                        area_sum += poly_b.area
 
                 # Draw exterior to map
                 points = [[x, y] for x, y in zip(*poly.exterior.coords.xy)]
@@ -1468,16 +1955,20 @@ class Node:
 
         first_level_polygons = self.get_first_level_outline_poly()
         first_level_polygons = self.filter_list_of_polygons(first_level_polygons)
+        for polygon in first_level_polygons:
+            shapely.prepare(polygon)
 
         multilines = []
         raw_lines_by_pass = {}  # {pass_idx: [LineString, ...]} — raw coverage lines, no connectors
         angle = self.current_zone.msg.coverage_angle
         paths_distance = self.current_zone.msg.paths_distance
         for polygon in top_level_polygons:
+            shapely.prepare(polygon)
             max_length = 50.5 + shapely.distance(geometry.Point(polygon.bounds[0], polygon.bounds[1]),
                                                 geometry.Point(polygon.bounds[2], polygon.bounds[3]))
             paths_offset = int(round((0.6 / paths_distance)))
             for i_line_offset in range(0, paths_offset):
+                self._gen_check()
                 paths_distance_offset = paths_distance * paths_offset
                 # Create lines for coverage
                 offset = i_line_offset * paths_distance
@@ -1529,6 +2020,8 @@ class Node:
 
                 # Store raw coverage lines per pass (before connector generation)
                 raw_lines_by_pass.setdefault(i_line_offset, []).extend(list(multiline.geoms))
+                if self._gen_dry:
+                    continue    # what follows only draws np_zone_paths
 
                 # connect lines by nearest point of other lines
                 line_list = []
@@ -1617,6 +2110,7 @@ class Node:
         current_point = ref_point
 
         while remaining:
+            self._gen_check()
             best_idx = None
             best_dist = float('inf')
             best_reversed = False
@@ -1700,6 +2194,8 @@ class Node:
 
         first_level_polygons = self.get_first_level_outline_poly()
         first_level_polygons = self.filter_list_of_polygons(first_level_polygons)
+        for polygon in first_level_polygons:
+            shapely.prepare(polygon)
 
         path_all = Path()
         path_all.header.frame_id = "map"
@@ -1977,12 +2473,12 @@ class Node:
 
 
     def is_crossing_polygons(self, geom, polygons):
-        result = False
-        for polygon in polygons:
-            if not polygon.contains(geom):  # Zone polygon
-                result = True
-                return result
-        return result
+        """geom leaves the free space: no single outline polygon holds it. An
+        obstacle or a map rule can cut a zone in parts; a connector inside one
+        part is fine, it can never lie in all of them."""
+        if not polygons:
+            return False
+        return not any(polygon.contains(geom) for polygon in polygons)
 
     def is_crossing_other_lines(self, conn_line, multilines, line_list=None):
         result = False
@@ -2020,24 +2516,119 @@ class Node:
         """Copy of `program_msg` whose zones are the CURRENT workspace zones of
         the same names (fresh coverage paths after a map refresh / zone edit).
         Returns (program, None) or (None, reason) when the program cannot run:
-        no zones, a zone no longer on the map, or a zone without mowing paths."""
+        no zones, a zone no longer on the map, or a zone without mowing paths.
+        A zone a map rule took the paths from is left out with a start note (the
+        rule may be temporary); only when that leaves nothing the program refuses."""
         if not program_msg.zone_list:
             return None, "it has no zones — edit the program and add a zone"
         with self._workspace_lock:
             ws = {z.msg.name: z.msg for z in (self.map_data.zones if self.map_data else [])}
             zones = []
+            notes = []
             for z in program_msg.zone_list:
                 cur = ws.get(z.name)
                 if cur is None:
                     return None, "zone '{}' is not on the active map".format(z.name)
                 if not cur.paths:
-                    return None, "zone '{}' has no mowing paths".format(z.name)
+                    rules = self._zone_rules(cur)
+                    if not rules:
+                        return None, "zone '{}' has no mowing paths".format(z.name)
+                    notes.append(coverage_rules.start_note(
+                        'zone_under_rule', program_msg.name, z.name, rule=rules[0]['name']))
+                    continue
+                height = coverage_rules.effective_cut_height(program_msg, cur.cut_height)
+                if not coverage_rules.cut_height_ok(height):
+                    return None, "cut height {} mm of zone '{}' is outside {}".format(
+                        height, z.name, coverage_rules.cut_height_text())
                 zones.append(copy.deepcopy(cur))
+        if not zones:
+            return None, "map rules leave no mowing path in any of its zones ({})".format(
+                '; '.join(n['text_en'] for n in notes))
+        self._add_start_notes(notes)
         program = copy.deepcopy(program_msg)
         program.zone_list = zones
         program.area = min(int(sum(z.area for z in zones)), 32767)
         program.length = min(int(sum(z.length for z in zones)), 32767)
         return program, None
+
+    # ---- a checkpoint belongs to the paths it was taken on ------------------
+    # last_result names a path by index, and regenerated zones (map edit, rule,
+    # shape) number their paths anew. What the mission got is recorded at every
+    # hand-over, so whatever happened since, and in whatever order the mission's
+    # late write-backs came, a resume can tell. No record = cannot tell = the same
+    # as different: mowing twice beats skipping.
+    _RUN_PATHS_FILE = os.path.join(_RUNNING_DIR, 'planner_run_paths.json')
+
+    def _run_paths_read(self):
+        try:
+            with open(self._RUN_PATHS_FILE) as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _run_paths_key(self, name):
+        return '{}|||{}'.format(self._planner_key() or '', name)
+
+    def _record_run_paths(self, program):
+        """Hand-over to the mission: {zone: fingerprint of the paths it gets}."""
+        self._run_paths[self._run_paths_key(program.name)] = {
+            z.name: coverage_rules.path_fingerprint(z.paths) for z in program.zone_list}
+        try:
+            planner_io.write_json_atomic(self._RUN_PATHS_FILE, self._run_paths)
+        except Exception as e:
+            rospy.logwarn("[{}] Run paths not saved: {}".format(rospy.get_caller_id(), e))
+
+    def _add_start_notes(self, notes):
+        self._start_notes.extend(notes)
+        for note in notes:
+            self.chain_log("Program '{}': {}.".format(note['program'], note['text_en']))
+
+    def start_notes(self):
+        return list(self._start_notes)
+
+    def _rebase_checkpoint(self, stored, program):
+        """Before a resume: the mission skips every zone ahead of the checkpoint
+        and every path ahead of it in that zone. Allowed only where the paths are
+        the ones the stopped run had. Otherwise the resume starts at the first
+        zone that changed. `stored` = the saved program, `program` = what the
+        mission gets; both take the new checkpoint, so a restart cannot bring the
+        old index back on the record of this hand-over."""
+        found = run_path.parse_checkpoint(program.last_result)
+        if not found:
+            return
+        zone = found[0]
+        order = [z.name for z in stored.zone_list]
+        if zone not in order:
+            self._add_start_notes([coverage_rules.start_note(
+                'checkpoint_zone_gone', program.name, zone)])
+            return                  # the mission mows the whole program
+        record = self._run_paths.get(self._run_paths_key(program.name)) or {}
+        current = {z.name: z for z in program.zone_list}
+        upto = order.index(zone) + 1
+        target = None
+        for name in order[:upto]:
+            if (name in current and record.get(name)
+                    != coverage_rules.path_fingerprint(current[name].paths)):
+                target = name
+                break
+        if target is None:
+            if zone in current:
+                return              # the same paths: the checkpoint holds
+            after = [n for n in order[upto:] if n in current]
+            if not after:
+                self._add_start_notes([coverage_rules.start_note(
+                    'checkpoint_zone_gone', program.name, zone)])
+                return
+            target = after[0]       # its zone is left out: on with the next one
+        else:
+            self._add_start_notes([coverage_rules.start_note(
+                'checkpoint_stale', program.name, target)])
+        text = 'failed: on_path-{}-0-0'.format(target)
+        program.last_result = stored.last_result = text
+        self.save_programs()
+        self.program_list_publisher()
+        self._bundle_export_programs()
 
     def _select_on_map(self, name, verb, pub):
         """Hand a program of the map that is on to the mission. (True, None), or
@@ -2045,9 +2636,13 @@ class Node:
         if self.permanent_program_list_msg is not None and self._programs_usable():
             for program_msg in self.permanent_program_list_msg.program_list:
                 if program_msg.name == name:
+                    self._start_notes = []
                     program, reason = self._program_with_current_zones(program_msg)
                     if program is None:
                         return False, reason
+                    if verb == 'resume':
+                        self._rebase_checkpoint(program_msg, program)
+                    self._record_run_paths(program)
                     self.program_active = program
                     self.log_publisher("Program selected to {}: {}".format(verb, name))
                     rospy.loginfo("[{}] Program selected to {}: {}".format(rospy.get_caller_id(), verb, name))
@@ -2171,7 +2766,10 @@ class Node:
         return None
 
     def chain_current(self, program):
-        return self._program_with_current_zones(program)
+        current, reason = self._program_with_current_zones(program)
+        if current is not None:
+            self._record_run_paths(current)
+        return current, reason
 
     def chain_id(self):
         return str(int(time.time() * 1000))
@@ -2379,6 +2977,7 @@ class Node:
             merged = list(existing.values())
             if not merged:
                 return
+            bundle_sync.apply_effective(merged, vbundle.load_programs(site) or [])
             vbundle.save_zones(site, merged)  # utm_zone from manifest
             self._touch_bundle_stamp(site, 'zones')  # own write != external edit (A4)
             rospy.loginfo("[{}] Site bundle: exported {} zone(s) to '{}'.".format(rospy.get_caller_id(), len(bzones), site))
@@ -2593,10 +3192,24 @@ class Node:
             vbundle.save_programs(site, progs)
             self._touch_bundle_stamp(site, 'programs')  # own write != external edit (A4)
             rospy.loginfo("[{}] Site bundle: exported {} program(s) to '{}'.".format(rospy.get_caller_id(), len(progs), site))
+            self._bundle_refresh_effective(site, progs)
             return True
         except Exception as e:
             rospy.logwarn("[{}] Site bundle: programs export failed: {}".format(rospy.get_caller_id(), e))
             return False
+
+    def _bundle_refresh_effective(self, site, progs):
+        """A program edit can change what a zone really gets: keep props.effective
+        in zones.geojson true (map_objects_server reads it from there). Never
+        fails the programs export."""
+        try:
+            bzones = vbundle.load_zones(site) or []
+            if bundle_sync.apply_effective(bzones, progs):
+                vbundle.save_zones(site, bzones)
+                self._touch_bundle_stamp(site, 'zones')
+        except Exception as e:
+            rospy.logwarn("[{}] Site bundle: effective zone values not updated: "
+                          "{}".format(rospy.get_caller_id(), e))
 
     def _bundle_build_zone_msg(self, name, poly_xy, props):
         """Construct a MapEditZone from a map-frame polygon + bundle props.
@@ -3028,6 +3641,32 @@ class Node:
         except Exception:
             return None
 
+    def _zones_behind_rules(self):
+        """Zones whose paths were not generated under the rules that bear on them
+        now. A rule far from a zone, or a new seq with the same set, is no change."""
+        zones = list(self.map_data.zones) if self.map_data is not None else []
+        return [z for z in zones
+                if (getattr(z, 'rules_fp', '')
+                    != coverage_rules.fingerprint(self._zone_rules(z.msg)))]
+
+    def callback_map_rules(self, msg):
+        """Latched /map_objects/rules. Only a change that moves a path reaches the
+        refresh worker, through the same debounce as an edited map."""
+        try:
+            self._map_rules = coverage_rules.parse_rules(msg.data)
+        except (ValueError, TypeError, IndexError, AttributeError) as e:
+            rospy.logwarn("[{}] /map_objects/rules ignored: {}".format(
+                rospy.get_caller_id(), e))
+            return
+        self._check_rules_behind()
+
+    def _check_rules_behind(self):
+        if not self._site_native() or not self._zones_behind_rules():
+            return
+        with self._site_map_lock:
+            self._site_map_rules_dirty = True
+        self._arm_site_map_timer()
+
     def callback_site_map(self, grid):
         """Persistent latched subscriber on /mapping_manager/site_map. On a NEW
         grid (fingerprint differs from the last seen): stash it and (re)arm a
@@ -3041,6 +3680,9 @@ class Node:
                 return  # identical grid re-latched -> nothing to do
             self._site_map_last_fp = fp
             self._site_map_pending = grid
+        self._arm_site_map_timer()
+
+    def _arm_site_map_timer(self):
         # (re)arm the debounce timer outside the lock; edits arrive in bursts, so
         # each new grid pushes the fire time out another 2.5 s.
         if self._site_map_timer is not None:
@@ -3074,13 +3716,15 @@ class Node:
                 with self._site_map_lock:
                     grid = self._site_map_pending
                     self._site_map_pending = None
-                if grid is not None:
+                    rules = self._site_map_rules_dirty
+                    self._site_map_rules_dirty = False
+                if grid is not None or rules:
                     self._do_live_refresh(grid)
                 with self._site_map_lock:
                     if not self._site_map_rerun:
                         break
                     self._site_map_rerun = False
-                    if self._site_map_pending is None:
+                    if self._site_map_pending is None and not self._site_map_rules_dirty:
                         break
         finally:
             with self._site_map_lock:
@@ -3089,8 +3733,14 @@ class Node:
     def _do_live_refresh(self, grid):
         """Rebuild the workspace from `grid`, regenerate EVERY zone against the
         new free space, propagate the fresh zones into programs, export the
-        bundle and republish the latched lists + map layers. On error the
-        previous workspace is restored/kept. Runs in the worker thread."""
+        bundle and republish the latched lists + map layers. grid None: the map is
+        the same, the rules moved — only the zones behind them regenerate. On
+        error the previous workspace is restored/kept. Runs in the worker thread.
+
+        Never under a running mission: it mows its own copy, while the zones,
+        the saved program and the markers would show paths it does not drive, and
+        np_zone_navi would change under SMACH|ZONE. The map rules guard covers the
+        mission; the refresh runs once it is over (_resume_deferred_refresh)."""
         if not self._site_native():
             return
         key = None if self._legacy_maps() else self._planner_key()
@@ -3126,7 +3776,34 @@ class Node:
                               "served site does the work).".format(
                                   rospy.get_caller_id(), served_now, self._workspace_site))
                 return
+            if self._mission_running():
+                self._defer_refresh(grid)
+                return
             self._do_site_map_refresh_locked(grid, t0)
+
+    def _mission_running(self):
+        return self._program_is_running(self._mission_program) or self._mission_busy is True
+
+    def _defer_refresh(self, grid):
+        """Keep the work for the end of the mission. A newer grid that came in
+        meanwhile wins; a full refresh also brings the rules up to date."""
+        with self._site_map_lock:
+            if grid is None:
+                self._site_map_rules_dirty = True
+            elif self._site_map_pending is None:
+                self._site_map_pending = grid
+            self._site_map_deferred = True
+        rospy.loginfo("[{}] Planner refresh waits for the end of the running "
+                      "mission.".format(rospy.get_caller_id()))
+
+    def _resume_deferred_refresh(self):
+        if not self._site_map_deferred or self._mission_running():
+            return
+        with self._site_map_lock:
+            if not self._site_map_deferred:
+                return
+            self._site_map_deferred = False
+        self._site_map_timer_fire(None)
 
     def _served_site_now(self):
         """serving.site from a fresh /mapping_manager/status, or None."""
@@ -3144,8 +3821,12 @@ class Node:
         try:
             # snapshot zone msgs before the raster swap; _regenerate_zone rebuilds
             # each from its polygon against the new assembled free space.
-            prev_zone_msgs = [copy.deepcopy(z.msg) for z in self.map_data.zones]
-            if not self._rebuild_workspace_from_grid(grid):
+            zones = self._zones_behind_rules() if grid is None else self.map_data.zones
+            prev_zone_msgs = [copy.deepcopy(z.msg) for z in zones]
+            if grid is None:
+                if not prev_zone_msgs:
+                    return          # settled meanwhile
+            elif not self._rebuild_workspace_from_grid(grid):
                 # rebuild refused (empty/failed) -> keep previous workspace.
                 self.map_data = prev_map_data
                 return
@@ -3159,6 +3840,7 @@ class Node:
                     rospy.logwarn("[{}] site_native live refresh: zone '{}' regen "
                                   "failed: {}".format(rospy.get_caller_id(),
                                                       getattr(zmsg, 'name', '?'), e))
+                    self._drop_paths_behind_rules(zmsg)
             self.current_zone = None
             self.save_running_data()
             # export bundle (existing hooks) + republish latched UI lists/layers.
@@ -3175,6 +3857,17 @@ class Node:
             self.map_data = prev_map_data
             rospy.logwarn("[{}] site_native live refresh failed ({}) — keeping "
                           "previous workspace.".format(rospy.get_caller_id(), e))
+
+    def _drop_paths_behind_rules(self, zmsg):
+        """A zone that failed to regenerate keeps its old paths, unless a rule
+        bears on it: those may run through the rule. No paths = the program says
+        so at start, instead of mowing there."""
+        if not self._zone_rules(zmsg):
+            return
+        for zone in self.map_data.zones:
+            if zone.msg.name == zmsg.name:
+                zone.msg.paths = []
+                self._propagate_zone_to_programs(zone.msg)
 
     def _programs_refuse_edit(self, what):
         """Program edits are refused while the list in memory is not the served
@@ -3202,6 +3895,7 @@ class Node:
         if self._mission_status in run_path.STARTING_STATUS:
             self._run_path_fresh = self._mission_status == run_path.FRESH_STATUS
         self._program_markers_sync()
+        self._resume_deferred_refresh()
 
     def callback_run_path_busy(self, msg):
         self._run_path_busy = msg.data
@@ -3209,6 +3903,7 @@ class Node:
 
     def callback_mission_busy(self, msg):
         self._mission_busy = bool(msg.data)
+        self._resume_deferred_refresh()
 
     def callback_mission_stop(self, msg):
         if msg.data:
@@ -3269,6 +3964,13 @@ class Node:
                 self._mission_write_back(msg)
             return
         if self._programs_refuse_edit("Program '{}' NOT saved".format(msg.name)):
+            return
+        if msg.override_zone and not coverage_rules.cut_height_ok(msg.cut_height):
+            text = "Program '{}' NOT saved: cut height {} mm is outside {}.".format(
+                msg.name, msg.cut_height, coverage_rules.cut_height_text())
+            self.log_publisher(text)
+            rospy.logwarn("[{}] {}".format(rospy.get_caller_id(), text))
+            self.program_list_publisher()
             return
         if not self._legacy_maps() and not self._legacy_tagged(msg):
             # A program belongs to the map it is created on (vitulus-field#46):
@@ -3370,6 +4072,7 @@ class Node:
         # disk (cheap). Used by the web UI to reliably re-fetch the one-shot
         # zone/polygon/program lists over rosbridge.
         if msg.data:
+            self.map_data_publisher()   # not latched: margin / fill / shape
             self.map_poly_list_publisher()
             self.map_zone_list_publisher()
             self.program_list_publisher()

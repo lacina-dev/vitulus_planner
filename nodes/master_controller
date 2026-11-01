@@ -18,6 +18,8 @@ and this node reacts to them:
   - interrupted:battery        -> charge sleep, then resume
   - interrupted:weather        -> sleep weather_sleep_duration_h, then resume
   - interrupted:temp           -> sleep temp_sleep_duration_h, then resume
+  - interrupted:temp_spike     -> stay awake temp_spike_wait_min, then resume
+  - interrupted:temp_sensor    -> report it, no resume: the blade has no protection
   - rejected:rain|recent_rain|forecast (at scheduled start)
                                -> treat like weather interrupt (keep & retry)
   - rejected:battery           -> charge sleep, then resume
@@ -375,6 +377,8 @@ class MasterController(object):
             '~weather_sleep_duration_h', 4.0) * 3600.0
         self.temp_sleep_duration_s = rospy.get_param(
             '~temp_sleep_duration_h', 1.0) * 3600.0
+        self.temp_spike_wait_s = rospy.get_param(
+            '~temp_spike_wait_min', 5.0) * 60.0
         self.critical_sleep_duration_s = rospy.get_param(
             '~critical_error_sleep_duration_h', 0.5) * 3600.0
         self.terminal_short_wait_s = rospy.get_param(
@@ -1786,6 +1790,8 @@ class MasterController(object):
             recovery = 'weather'
         elif stop_reason == "interrupted:temp":
             recovery = 'temp'
+        elif stop_reason == "interrupted:temp_spike":
+            recovery = 'temp_spike'
         elif stop_reason == "interrupted:window":
             recovery = 'window'
         elif stop_reason.startswith("critical:"):
@@ -1793,6 +1799,12 @@ class MasterController(object):
 
         if run is None:
             self.log("[Master] Program end %s, no run to resume." % stop_reason)
+            self._route_after_program(None, in_dock)
+            return
+
+        if stop_reason == "interrupted:temp_sensor":
+            self.log("[Master] Mower temperature sensor fault: run given up.")
+            self._give_up(run, 'run_failed', reason='temp_sensor')
             self._route_after_program(None, in_dock)
             return
 
@@ -1841,6 +1853,7 @@ class MasterController(object):
     def _wait_s(self, reason):
         return {'weather': self.weather_sleep_duration_s,
                 'temp': self.temp_sleep_duration_s,
+                'temp_spike': self.temp_spike_wait_s,
                 'critical': self.critical_sleep_duration_s,
                 'gps': self.gps_retry_s}.get(reason, 0.0)
 

@@ -97,7 +97,8 @@ class ChainStart(object):
         names = [first.name] + [p.name for p in programs]
         for row in skipped:
             self.env.chain_log('Chain: ' + row['text_en'])
+        notes = self.env.start_notes() if hasattr(self.env, 'start_notes') else []
         self.env.chain_state_pub.publish(String(json.dumps(
             {'id': chain_id, 'verb': self.verb, 'requested': self.refs, 'programs': names,
-             'skipped': skipped})))
+             'skipped': skipped, 'notes': notes})))
         self.pub.publish(first)

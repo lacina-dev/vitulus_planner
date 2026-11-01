@@ -636,6 +636,30 @@ class Runs(Base):
         self.tick()
         self.assertEqual(self.resumes(), ['Mow'])
 
+    def test_temp_spike_resumes_soon_and_awake(self):
+        mc = self.mc
+        self.end('interrupted:temp_spike')
+        self.assertEqual(mc.persistent['run']['reason'], 'temp_spike')
+        left = mc.persistent['run']['wait_until'] - mc._t()
+        self.assertAlmostEqual(left, mc.temp_spike_wait_s, delta=2.0)
+        self.assertLess(left, 600.0)
+        self.tick()
+        self.assertEqual(self.sleeps, [])
+        self.assertEqual(self.resumes(), [])
+
+    def test_temp_still_waits_the_hour(self):
+        mc = self.mc
+        self.end('interrupted:temp')
+        left = mc.persistent['run']['wait_until'] - mc._t()
+        self.assertAlmostEqual(left, mc.temp_sleep_duration_s, delta=2.0)
+
+    def test_temp_sensor_fault_gives_up_and_reports(self):
+        mc = self.mc
+        self.end('interrupted:temp_sensor')
+        self.assertEqual(mc.persistent['issues'][-1]['code'], 'run_failed')
+        self.assertEqual(mc.persistent['issues'][-1]['detail']['reason'], 'temp_sensor')
+        self.assertFalse(mc.persistent.get('run'))
+
     def test_new_event_waits_for_the_unfinished_run(self):
         mc = self.mc
         mc.calendar = [daily('08:00'), daily('12:00', 'ev2', 'Mow')]
