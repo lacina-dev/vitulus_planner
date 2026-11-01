@@ -834,40 +834,63 @@ class Node:
             rospy.logerr("[{}] {}".format(rospy.get_caller_id(), text))
         return False
 
-    def _zone_result(self, op, name, ok, message):
+    def _zone_result(self, op, name, ok, message, programs=0):
         """Unambiguous outcome of a zone save/remove for the UI: a JSON String on
-        /web_plan/zone_result {"op": "save"|"remove", "name", "ok", "message"}
-        (published AFTER the latched zone_list update on success), plus the same
-        text on /web_plan/log."""
+        /web_plan/zone_result {"op": "save"|"remove", "name", "ok", "message",
+        "programs"} (published AFTER the latched zone_list update on success),
+        plus the same text on /web_plan/log. programs = how many saved programs
+        got the new zone."""
         self.log_publisher(message)
         if not ok:
             rospy.logerr("[{}] {}".format(rospy.get_caller_id(), message))
         self.zone_result_pub.publish(String(json.dumps(
-            {"op": op, "name": name, "ok": bool(ok), "message": message})))
+            {"op": op, "name": name, "ok": bool(ok), "message": message,
+             "programs": programs})))
 
     def callback_map_save_zone(self, msg):
         # /web_plan/zone_result contract: exactly ONE result for EVERY attempt,
         # on success published after the latched zone_list update.
         ok = False
+        programs = 0
         text = "Zone '{}' NOT saved: internal planner error.".format(msg.name)
         try:
-            ok, text = self._save_zone(msg)
+            ok, text, programs = self._save_zone(msg)
         except Exception as e:
             rospy.logerr("[{}] Zone '{}' save failed: {}".format(
                 rospy.get_caller_id(), msg.name, e))
         finally:
-            self._zone_result("save", msg.name, ok, text)
+            self._zone_result("save", msg.name, ok, text, programs)
+
+    def _zone_save_refusal(self, name):
+        """Why a zone must not change now, or None. Programs embed a copy of their
+        zones: a save during a swap would miss the programs of this map, and a
+        running mission would continue on a shape its program no longer has."""
+        if not self._programs_usable():
+            return ("Zone '{}' NOT saved: the programs of the active map are not "
+                    "loaded yet — try again in a moment.".format(name))
+        programs = (self.permanent_program_list_msg.program_list
+                    if self.permanent_program_list_msg is not None else [])
+        for p in programs:
+            if (self._on_current_map(p) and self._program_is_running(p.name)
+                    and any(z.name == name for z in p.zone_list)):
+                return ("Zone '{}' NOT saved: program '{}' is running on it — stop "
+                        "it first.".format(name, p.name))
+        return None
 
     def _save_zone(self, msg):
-        """Returns (ok, message for the UI)."""
+        """Returns (ok, message for the UI, programs updated)."""
         if not self._ensure_workspace("Zone '{}' NOT saved".format(msg.name),
                                       report=False):
             return False, ("Zone '{}' NOT saved: no map is active — activate or "
-                           "record a map first.".format(msg.name))
+                           "record a map first.".format(msg.name)), 0
         # The whole save runs under the workspace lock and works on the zone
         # object returned by the regen — self.current_zone is shared with the
         # live-refresh worker and the zone selection.
         with self._workspace_lock:   # AUDIT #10
+            refusal = self._zone_save_refusal(msg.name)
+            if refusal:
+                return False, refusal, 0
+            before = list(self.map_data.zones)
             try:
                 zone = self._regenerate_zone(msg)
             except Exception as e:
@@ -879,19 +902,28 @@ class Node:
                     rospy.get_caller_id(), msg.name, e))
                 return False, ("Zone '{}' NOT saved: mowing paths could not be "
                                "generated — the zone is too small or lies outside "
-                               "the map.".format(msg.name))
+                               "the map.".format(msg.name)), 0
+            if not zone.msg.paths:
+                # The zone a program mows would be gone, and only at the next
+                # start would anybody learn why. The stored zone stays.
+                self.map_data.zones = before
+                self.current_zone = None
+                self._clear_zone_preview()
+                return False, ("Zone '{}' NOT saved: this shape leaves no mowing "
+                               "path — it is too small or lies outside the free "
+                               "space of the map.".format(msg.name)), 0
             self.map_zone_list_publisher()
             # Show zone map
             self.np_show = zone.np_zone_paths
             self._publish_zone_preview(zone)
             # Push the edited zone (new shape/route) into existing programs that use
             # it, so a map change is reflected without rebuilding the programs.
-            self._propagate_zone_to_programs(zone.msg)
+            updated = self._propagate_zone_to_programs(zone.msg)
             self.program_list_publisher()
             self.save_running_data()
             # Mirror the workspace zones into the site bundle (UTM, bundle-wins).
             self._bundle_export_zones()
-        return True, "Zone {} saved.".format(zone.msg.name)
+        return True, "Zone {} saved.".format(zone.msg.name), updated
 
     def callback_zone_rename(self, msg):
         """Payload JSON {from, to}; exactly one result on the rename result topic."""

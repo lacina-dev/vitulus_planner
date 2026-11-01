@@ -783,6 +783,73 @@ class SiteProgramsTest(unittest.TestCase):
         n.callback_program_remove(String('MowAll'))
         self.assertEqual(mem_programs(n), {})
 
+    # --------------------------------- shape changes from the map editor
+    def _result(self):
+        return self._zone_results()[-1]
+
+    def _poly(self, n, name):
+        z = [z for z in n.map_data.zones if z.msg.name == name][0]
+        return [(round(p.x, 3), round(p.y, 3)) for p in z.msg.polygon.polygon.points]
+
+    def test_shape_reaches_programs_and_the_bundle(self):
+        n = self._site_a_with_mowall()
+        before = [z for z in n.map_data.zones if z.msg.name == 'Near'][0].msg.length
+        del EVENTS[:]
+        n.callback_map_save_zone(zmsg('Near', 2, 2, 9, 9))
+        self.assertTrue(self._result()['ok'])
+        self.assertEqual(self._result()['programs'], 1)
+        after = [z for z in n.map_data.zones if z.msg.name == 'Near'][0].msg
+        self.assertGreater(after.length, before)
+        stored = n.permanent_program_list_msg.program_list[0]
+        self.assertEqual([z.name for z in stored.zone_list], ['Near', 'Far'])
+        self.assertEqual(stored.zone_list[0].length, after.length)
+        self.assertEqual(yaml_programs('A'), {'MowAll': ['Near', 'Far']})
+        reread = {z['name']: z for z in M.vbundle.load_zones('A')}
+        self.assertIn('Near', reread)
+
+    def test_shape_without_mowing_path_keeps_the_zone(self):
+        n = self._site_a_with_mowall()
+        shape = self._poly(n, 'Near')
+        length = n.permanent_program_list_msg.program_list[0].zone_list[0].length
+        saved = (M.Node.create_outline_path_msg, M.Node.create_coverage_path_msg)
+        M.Node.create_outline_path_msg = M.Node.create_coverage_path_msg = lambda self: None
+        try:
+            del EVENTS[:]
+            n.callback_map_save_zone(zmsg('Near', 3, 3, 4, 4))
+        finally:
+            M.Node.create_outline_path_msg, M.Node.create_coverage_path_msg = saved
+        self.assertFalse(self._result()['ok'])
+        self.assertIn('no mowing path', self._result()['message'])
+        self.assertEqual(self._poly(n, 'Near'), shape)
+        self.assertEqual(n.permanent_program_list_msg.program_list[0].zone_list[0].length, length)
+        self.assertEqual([t for t, m in EVENTS if t == '/web_plan/zone_list'], [])
+
+    def test_shape_refused_while_its_program_runs(self):
+        n = self._site_a_with_mowall()
+        shape = self._poly(n, 'Near')
+        n.callback_mission_program(String('MowAll'))
+        n.callback_mission_status(String('Mowing'))
+        del EVENTS[:]
+        n.callback_map_save_zone(zmsg('Near', 2, 2, 9, 9))
+        self.assertFalse(self._result()['ok'])
+        self.assertIn("program 'MowAll' is running", self._result()['message'])
+        self.assertEqual(self._poly(n, 'Near'), shape)
+        n.callback_map_save_zone(zmsg('Other', 8, 2, 11, 5))    # no program uses it
+        self.assertTrue(self._result()['ok'])
+        n.callback_mission_status(String('Stopped'))
+        n.callback_map_save_zone(zmsg('Near', 2, 2, 9, 9))
+        self.assertTrue(self._result()['ok'])
+
+    def test_shape_refused_while_programs_are_not_loaded(self):
+        n = self._site_a_with_mowall()
+        shape = self._poly(n, 'Near')
+        n._programs_need_import = True
+        del EVENTS[:]
+        n.callback_map_save_zone(zmsg('Near', 2, 2, 9, 9))
+        self.assertFalse(self._result()['ok'])
+        self.assertIn('not loaded yet', self._result()['message'])
+        self.assertEqual(self._poly(n, 'Near'), shape)
+
 
 if __name__ == '__main__':
     unittest.main()
