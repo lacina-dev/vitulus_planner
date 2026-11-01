@@ -27,7 +27,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 PLANNER = os.path.abspath(os.path.join(HERE, '..', '..'))
 SCENARIOS = ['disabled', 'normal', 'prestart_rain', 'battery', 'rain', 'rain_reject_keeps',
              'stack_restart', 'master_restart', 'mission_crash', 'dst', 'window_end',
-             'terminal_cap', 'stop_visible', 'agent_block', 'no_weather', 'mux_hold', 'hold_rain']
+             'terminal_cap', 'stop_visible', 'agent_block', 'no_weather', 'mux_hold', 'hold_rain',
+             'window_change', 'window_back', 'window_off']
 
 
 def navi_tree():
@@ -168,6 +169,7 @@ class Sim(object):
         self.p_reset = rospy.Publisher('/mower_smach/reset', Bool, queue_size=1)
         self.p_agent = rospy.Publisher('/vitulus_test/supervisor_status', String, queue_size=1)
         self.p_mux = rospy.Publisher('/cmd_vel_mux/active', String, queue_size=1, latch=True)
+        self.p_window = rospy.Publisher('/scheduler/set_window', String, queue_size=1)
         self.p_held = rospy.Publisher('/cmd_vel_mux/held', Bool, queue_size=1, latch=True)
         self.load_params()
         self.spawn_world()
@@ -611,6 +613,73 @@ def scenario_window_end():
     check('morning', s.now().hour >= 7 and s.now().hour < 10, s.now())
     check('finished', finish_ok(s, 150))
     check('next path, not the same again', [y for y, _ in s.mowed()].count(0.0) >= 1 and sorted(set(y for y, _ in s.mowed())) == ALL_PATHS)
+    return s
+
+
+def set_window(s, **cfg):
+    s.p_window.publish(String(json.dumps(cfg)))
+
+
+def scenario_window_change():
+    """The owner closes the window during mowing (real topic, real mission): the
+    window-end path; the setting survives a restart; widening it again lets the
+    run resume by the usual rules."""
+    s = Sim(master_params={'idle_sleep_threshold_s': 1e7})
+    start(s, D(2026, 6, 10, 9, 59, 56), daily('10:00'))
+    check('mowing path 0', s.wait(lambda: any(y == 0.0 for y, _ in s.mowed()), 60, 'path 0'))
+    set_window(s, enabled=True, start='07:00', end='09:00')
+    check('reported at once', s.wait(lambda: (s.report.get('window') or {}).get('end') == '09:00', 5, 'report'),
+          s.report.get('window'))
+    check('stored', s.state().get('allowed_window') == {'enabled': True, 'start': '07:00', 'end': '09:00'},
+          s.state().get('allowed_window'))
+    check('goes home', s.wait(lambda: s.stop_reason == 'interrupted:window', 40, 'window'), s.stop_reason)
+    check('finished the path first', all(y == 0.0 for y, _ in s.mowed()), s.mowed())
+    check('docked', s.wait(lambda: len(s.events('dock_program')) >= 2 and s.status == 'Ready', 40, 'dock'))
+    time.sleep(3)
+    check('run kept', (s.state().get('run') or {}).get('reason') == 'window', s.state().get('run'))
+    s.kill('master')
+    s.report = {}
+    s.spawn_master()
+    check('survives a restart', s.wait(lambda: (s.report.get('window') or {}).get('end') == '09:00', 15, 'restart'),
+          s.report.get('window'))
+    time.sleep(3)
+    check('no resume outside it', len(s.selects()) == 1, s.selects())
+    set_window(s, enabled=True, start='07:00', end='21:00')
+    check('resumes in the new window', s.wait(lambda: len(s.selects()) >= 2, 40, 'resume'))
+    check('as a resume', s.selects()[-1]['resume'] is True)
+    check('finished', finish_ok(s, 150))
+    return s
+
+
+def scenario_window_back():
+    """Closed and opened again before the path ended: it just mows on."""
+    s = Sim(master_params={'idle_sleep_threshold_s': 1e7})
+    start(s, D(2026, 6, 10, 9, 59, 56), daily('10:00'))
+    check('mowing path 0', s.wait(lambda: any(y == 0.0 for y, _ in s.mowed()), 60, 'path 0'))
+    set_window(s, end='09:00')
+    time.sleep(1.5)
+    set_window(s, end='21:00')
+    check('finished', finish_ok(s, 150))
+    check('never went home early', s.stop_reason == 'succeeded' and len(s.selects()) == 1,
+          (s.stop_reason, s.selects()))
+    return s
+
+
+def scenario_window_off():
+    """With the switch off the setting is stored and reported, nothing moves."""
+    s = Sim(enabled=False)
+    s.set_clock(D(2026, 6, 10, 10, 0, 0))
+    check('report', s.wait(lambda: s.report.get('enabled') is False, 20, 'report'))
+    set_window(s, enabled=False, start='22:00', end='05:00')
+    check('stored', s.wait(lambda: s.state().get('allowed_window') == {
+        'enabled': False, 'start': '22:00', 'end': '05:00'}, 5, 'stored'), s.state().get('allowed_window'))
+    check('reported', s.wait(lambda: s.report.get('window') is None and (
+        s.report.get('window_setting') or {}).get('start') == '22:00', 5, 'report'), s.report)
+    set_window(s, enabled=True, start='10:00', end='10:00')
+    check('equal refused', s.wait(lambda: (s.report.get('window_setting') or {}).get('error') == 'equal', 5, 'refused'))
+    check('still off', s.state().get('automation_enabled') is False and s.report.get('window') is None)
+    time.sleep(3)
+    check('nothing moved', not s.selects() and not s.sleep_req)
     return s
 
 

@@ -24,7 +24,7 @@ os.environ['TZ'] = 'Europe/Prague'
 time.tzset()
 
 import rospy                                 # noqa: E402
-from std_msgs.msg import Bool                # noqa: E402
+from std_msgs.msg import Bool, String        # noqa: E402
 
 EVENTS = []
 
@@ -177,6 +177,179 @@ class Switch(Base):
         self.assertEqual(published('/mower_smach/stop'), [])
         self.end('succeeded')
         self.assertEqual(self.sleeps, [])
+
+
+class Window(Base):
+    """The allowed window set from the UI: /scheduler/set_window."""
+
+    def setUp(self):
+        super().setUp()
+        self.cal(daily('08:00'))
+
+    def set(self, **cfg):
+        self.mc.set_window_callback(String(json.dumps(cfg)))
+
+    def report(self):
+        self.mc._publish_report(force=True)
+        return json.loads(published('/scheduler/report')[-1])
+
+    def stored(self):
+        with open(self.mc.state_file) as f:
+            return json.load(f).get('allowed_window')
+
+    def test_yaml_defaults_until_set_then_stored_survives_a_restart(self):
+        self.assertIsNone(self.stored())
+        rep = self.report()
+        self.assertEqual(rep['window'], {'start': '07:00', 'end': '21:00'})
+        self.assertFalse(rep['window_setting']['stored'])
+        self.set(enabled=True, start='6:30', end='22:15')
+        self.assertEqual(self.stored(), {'enabled': True, 'start': '06:30', 'end': '22:15'})
+        mc = self.make()
+        self.assertEqual((mc.window_enabled, mc.window_start, mc.window_end),
+                         (True, (6, 30), (22, 15)))
+        self.assertTrue(self.report()['window_setting']['stored'])
+
+    def test_disabled_survives_and_report_keeps_the_times(self):
+        self.set(enabled=False)
+        rep = self.report()
+        self.assertIsNone(rep['window'])
+        self.assertEqual(rep['outside_window'], [])
+        self.assertEqual(rep['window_setting']['start'], '07:00')
+        self.assertFalse(self.make().window_enabled)
+
+    def test_broken_stored_value_means_defaults(self):
+        for bad in ({'enabled': 'yes'}, {'start': '25:00'}, {'start': '08:00', 'end': '08:00'}, 'x'):
+            self.mc.persistent['allowed_window'] = bad
+            self.mc._save_state()
+            mc = self.make()
+            self.assertEqual((mc.window_enabled, mc.window_start, mc.window_end),
+                             (True, (7, 0), (21, 0)), bad)
+
+    def test_refused_values_change_nothing_and_are_reported(self):
+        for payload, code in (('{"start":"08:00","end":"08:00"}', 'equal'),
+                              ('{"start":"8:00","end":"08:00"}', 'equal'),
+                              ('{"end":"07:00"}', 'equal'),
+                              ('{"start":"25:00"}', 'invalid'),
+                              ('{"start":7}', 'invalid'),
+                              ('{"enabled":1}', 'invalid'),
+                              ('[]', 'invalid'),
+                              ('not json', 'invalid')):
+            self.mc.set_window_callback(String(payload))
+            self.assertEqual(self.report()['window_setting']['error'], code, payload)
+            self.assertEqual((self.mc.window_start, self.mc.window_end), ((7, 0), (21, 0)))
+            self.assertIsNone(self.stored())
+        self.set(start='08:00')
+        self.assertIsNone(self.report()['window_setting']['error'])
+
+    def test_outside_list_and_wrap_midnight_live(self):
+        self.mc.calendar = [daily('08:00'), daily('23:30', 'ev2')]
+        self.assertEqual(self.report()['outside_window'], ['ev2'])
+        self.set(start='21:00', end='07:00')
+        self.assertEqual(self.report()['outside_window'], ['ev1'])
+        self.assertEqual(self.report()['window'], {'start': '21:00', 'end': '07:00'})
+        self.at(2026, 6, 10, 23, 0, 0)
+        self.assertTrue(self.mc._start_allowed(self.clock[0]))
+        self.at(2026, 6, 11, 6, 40, 0)                     # 20 min left past midnight
+        self.assertTrue(self.mc._in_allowed_window(self.clock[0]))
+        self.assertFalse(self.mc._start_allowed(self.clock[0]))
+        self.at(2026, 6, 11, 12, 0, 0)
+        self.assertFalse(self.mc._in_allowed_window(self.clock[0]))
+
+    def test_switch_stays_off_and_nothing_moves(self):
+        self.at(2026, 6, 10, 8, 0, 30)
+        self.mc.state = self.mc.STATE_DISABLED
+        self.set(enabled=True, start='00:00', end='23:59')
+        self.tick(3)
+        self.assertFalse(self.mc.automation_on)
+        self.assertFalse(self.report()['enabled'])
+        self.assertEqual((self.starts(), self.resumes(), self.sleeps), ([], [], []))
+
+    def test_the_change_itself_starts_nothing(self):
+        self.on()
+        self.at(2026, 6, 10, 22, 0, 0)
+        self.cal(daily('21:50'))
+        self.tick()
+        self.assertEqual(self.starts(), [])
+        self.mc.check_interval_s = 1e6
+        self.mc._last_idle_eval = self.mc._t()
+        self.set(end='23:30')
+        self.assertEqual(self.starts(), [])                # not from the callback
+        self.tick()
+        self.assertEqual(self.starts(), ['Mow'])           # the usual catch-up rule
+
+    def test_idle_decides_again_at_once(self):
+        self.on()
+        self.mc.check_interval_s = 1e6
+        self.mc._last_idle_eval = self.mc._t()
+        self.at(2026, 6, 10, 10, 0, 0)
+        self.set(enabled=True, start='18:00', end='20:00')
+        self.tick()
+        self.assertEqual(self.mc._code, 'outside_window')
+        self.assertEqual(len(self.sleeps), 1)
+        # 18:00 today minus the wake lead (10 + 2 min)
+        self.assertEqual(self.sleeps[0][0], (8 * 3600 - 720) * 1000)
+
+    def test_same_value_does_not_disturb_idle(self):
+        self.mc._last_idle_eval = 5.0
+        self.set(enabled=True, start='07:00', end='21:00')
+        self.assertEqual(self.mc._last_idle_eval, 5.0)
+        self.assertIsNotNone(self.stored())
+
+    def mowing(self):
+        self.on()
+        self.at(2026, 6, 10, 8, 0, 30)
+        self.tick()
+        self.assertEqual(self.starts(), ['Mow'])
+        self.run_started()
+
+    def test_closed_by_the_change_takes_the_window_end_path(self):
+        self.mowing()
+        self.at(2026, 6, 10, 9, 0, 0)
+        self.tick()
+        self.assertEqual(published('/mower_smach/finish_after_path'), [])
+        self.set(end='08:30')
+        self.tick()
+        self.assertEqual(published('/mower_smach/finish_after_path'), [True])
+        self.assertEqual(published('/mower_smach/return_home'), [])
+        self.at(2026, 6, 10, 9, 31, 0)                     # the cap counts from the change
+        self.tick()
+        self.assertEqual(published('/mower_smach/return_home'), ['window'])
+        self.end('interrupted:window')
+        self.assertEqual(self.mc.persistent['run']['reason'], 'window')
+        self.tick()
+        self.assertEqual(self.resumes(), [])
+
+    def test_moved_back_during_the_way_out_mows_on(self):
+        self.mowing()
+        self.at(2026, 6, 10, 21, 5, 0)
+        self.tick()
+        self.assertEqual(published('/mower_smach/finish_after_path'), [True])
+        self.set(end='23:00')
+        self.tick()
+        self.assertEqual(published('/mower_smach/finish_after_path'), [True, False])
+        self.at(2026, 6, 10, 21, 40, 0)
+        self.tick()
+        self.assertEqual(published('/mower_smach/return_home'), [])
+        self.at(2026, 6, 10, 23, 0, 30)                    # the new end works as usual
+        self.tick()
+        self.assertEqual(published('/mower_smach/finish_after_path'), [True, False, True])
+
+    def test_switched_off_during_the_way_out_mows_on(self):
+        self.mowing()
+        self.at(2026, 6, 10, 21, 5, 0)
+        self.tick()
+        self.set(enabled=False)
+        self.tick()
+        self.assertEqual(published('/mower_smach/finish_after_path'), [True, False])
+
+    def test_a_request_of_a_previous_master_is_taken_back_too(self):
+        self.mowing()
+        self.mc._window_end_first = 0.0                    # node restarted meanwhile
+        self.at(2026, 6, 10, 21, 5, 0)
+        self.mc.window_end = (20, 0)
+        self.set(end='23:00')
+        self.tick()
+        self.assertEqual(published('/mower_smach/finish_after_path'), [False])
 
 
 class Slots(Base):

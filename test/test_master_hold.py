@@ -12,6 +12,8 @@ Covers
     reason stay, release resumes it
   * without Hold the behaviour is unchanged (battery -> sleep until charged)
   * status while the mission waits for Reset after STOP
+  * /scheduler/set_window during a sleep sequence: called off and decided again,
+    except when the power cut is already under way; under Hold it starts nothing
   * cmd_vel_mux hold (gnss_watchdog, also escalated): no start, no resume and no
     sleep over it; the slot waits; a robot sent home is still sent (dock_smach
     and the mission wait the hold out themselves)
@@ -237,6 +239,44 @@ class MasterHoldTest(unittest.TestCase):
         mc.dock_program = String('dock')
         mc._go_home_or_report()
         self.assertEqual(len(published('/dock_smach/start_docking')), 1)
+
+    def test_window_change_calls_a_sleep_on_its_way_off(self):
+        """Planned for the old window: IDLE decides again, no fail cooldown."""
+        mc = self.mc
+        self.assertIs(mc._execute_sleep(duration_ms=3600000), True)
+        self.assertEqual(mc.state, mc.STATE_PREPARE_SLEEP)
+        mc.set_window_callback(String('{"enabled": true, "start": "06:00", "end": "22:00"}'))
+        mc._step()
+        self.assertEqual(mc.state, mc.STATE_IDLE)
+        self.assertEqual(mc.sleep_block, 'window_changed')
+        self.assertEqual(mc._sleep_cooldown_until, 0.0)
+        self.assertFalse(mc._sleep_replan)
+        self.assertIsNone(mc.persistent.get('sleep_intent'))
+
+    def test_same_window_leaves_the_sleep_alone(self):
+        mc = self.mc
+        mc.window_enabled = True
+        mc._execute_sleep(duration_ms=3600000)
+        mc.set_window_callback(String('{"enabled": true, "start": "07:00", "end": "21:00"}'))
+        self.assertFalse(mc._sleep_replan)
+
+    def test_window_change_cannot_call_off_a_power_cut_under_way(self):
+        mc = self.mc
+        mc._execute_sleep(duration_ms=3600000)
+        mc.sleep_seq.state = M.sleep_manager.WAIT_CUT
+        mc.sleep_seq.helper = type('H', (), {'poll': lambda s: None})()
+        mc.set_window_callback(String('{"start": "06:00"}'))
+        mc._step()
+        self.assertEqual(mc.state, mc.STATE_PREPARE_SLEEP)
+        self.assertEqual(mc.sleep_seq.state, M.sleep_manager.WAIT_CUT)
+
+    def test_window_change_under_hold_starts_nothing(self):
+        mc = self.mc
+        mc.is_inhibited = True
+        mc.set_window_callback(String('{"enabled": true, "start": "00:00", "end": "23:59"}'))
+        mc._step()
+        self.assertEqual(mc.state, mc.STATE_INHIBITED)
+        self.assertEqual(published('/web_plan/program_select'), [])
 
     def test_status_while_stopped_waits_for_reset(self):
         mc = self.mc

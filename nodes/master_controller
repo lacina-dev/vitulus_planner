@@ -26,7 +26,9 @@ and this node reacts to them:
 
 Recovery is capped so the robot always wakes before the next scheduled
 program. A global allowed time-window ("don't mow at night") gates all
-starts/resumes.
+calendar starts/resumes; it does not concern a manual Run or the agent. Its
+defaults are in the yaml, the owner's setting is in the state file
+("allowed_window", /scheduler/set_window, in force at once).
 
 Activation: one persisted switch (scheduler_state.json "automation_enabled",
 default OFF; /scheduler/set_enabled topic + service, /scheduler/enabled
@@ -284,6 +286,29 @@ class MowerScheduler(object):
             cand += datetime.timedelta(days=1)
         return cand
 
+    @classmethod
+    def clean_window(cls, cfg, current):
+        """A window setting from /scheduler/set_window or the state file.
+
+        cfg: {"enabled": bool, "start": "HH:MM", "end": "HH:MM"}, a missing key
+        keeps its value from current (enabled, start_hm, end_hm). Returns the
+        new (enabled, start_hm, end_hm); ValueError('invalid' or 'equal').
+        start == end is refused: it would read as "all day" to one person and
+        "never" to another, and within_window takes it for one minute.
+        """
+        if not isinstance(cfg, dict):
+            raise ValueError('invalid')
+        enabled = cfg.get('enabled', current[0])
+        if not isinstance(enabled, bool):
+            raise ValueError('invalid')
+        start = cls._parse_hhmm(cfg['start']) if 'start' in cfg else current[1]
+        end = cls._parse_hhmm(cfg['end']) if 'end' in cfg else current[2]
+        if start is None or end is None:
+            raise ValueError('invalid')
+        if start == end:
+            raise ValueError('equal')
+        return enabled, start, end
+
 
 # ---------------------------------------------------------------------------
 # Master Controller
@@ -357,7 +382,8 @@ class MasterController(object):
         self.terminal_long_sleep_s = rospy.get_param(
             '~terminal_error_long_sleep_h', 8.0) * 3600.0
 
-        # Allowed time-window ("don't mow at night").
+        # Allowed time-window ("don't mow at night"). These are the defaults; a
+        # setting in the state file replaces them below.
         self.window_enabled = rospy.get_param('~allowed_window_enabled', True)
         self.window_start = MowerScheduler._parse_hhmm(
             str(rospy.get_param('~allowed_window_start', '07:00')))
@@ -464,6 +490,9 @@ class MasterController(object):
         self._ready_no_reason_since = None
         self._window_end_sent = 0.0
         self._window_end_first = 0.0
+        self._window_moved = False    # changed while mowing: _check_window_end
+        self._window_error = None     # the last refused /scheduler/set_window
+        self._sleep_replan = False    # changed during a sleep sequence
         self._attached = False
         self._code = 'init'
         self._code_detail = {}
@@ -480,6 +509,7 @@ class MasterController(object):
         self.calendar = MowerScheduler.validate_calendar(
             self.persistent.get('calendar', []))
         self.persistent['calendar'] = self.calendar
+        self._load_window()
         self._save_state()
 
         # ---- publishers ----------------------------------------------------
@@ -573,6 +603,8 @@ class MasterController(object):
                                          self.set_enabled_service)
         rospy.Subscriber('/scheduler/set_calendar', String,
                          self.set_calendar_callback)
+        rospy.Subscriber('/scheduler/set_window', String,
+                         self.set_window_callback)
         rospy.Subscriber('/dock_manager/dock_program', DockProgram,
                          self.dock_program_callback)
         rospy.Subscriber('/client_count', Int32, self.client_count_callback)
@@ -584,10 +616,8 @@ class MasterController(object):
         self.run_active_pub.publish(Bool(False))
 
         rospy.loginfo("Master Controller initialised.")
-        self.log("[Master] Init. automation=%s window=%s-%s" % (
-            self.automation_on,
-            rospy.get_param('~allowed_window_start', '07:00'),
-            rospy.get_param('~allowed_window_end', '21:00')))
+        self.log("[Master] Init. automation=%s window=%s" % (
+            self.automation_on, self._window_text()))
 
     # =====================================================================
     # logging
@@ -656,6 +686,20 @@ class MasterController(object):
                 os.close(fd)
         except Exception as e:
             rospy.logerr("Failed to save state: %s", str(e))
+
+    def _load_window(self):
+        """The owner's window from the state file; none or a broken one leaves
+        the yaml defaults."""
+        stored = self.persistent.get('allowed_window')
+        if stored is None:
+            return
+        try:
+            (self.window_enabled, self.window_start,
+             self.window_end) = MowerScheduler.clean_window(
+                stored, (self.window_enabled, self.window_start, self.window_end))
+        except ValueError:
+            rospy.logerr("Stored window %s is not valid, using the defaults.",
+                         str(stored))
 
     def _set_interrupted(self, event_id, reason):
         with self.lock:
@@ -901,6 +945,39 @@ class MasterController(object):
     # =====================================================================
     # FSM helpers
     # =====================================================================
+    def set_window_callback(self, msg):
+        """The allowed window: stored and in force at once, nothing to restart.
+
+        This only changes what the running logic reads, it starts nothing
+        itself. A refused value leaves everything as it was and the report says
+        why. See _check_window_end for a change during mowing; a sleep on its
+        way was planned for the old window, so it is called off (unless the
+        power cut is already under way) and IDLE decides again."""
+        try:
+            with self.lock:
+                current = (self.window_enabled, self.window_start, self.window_end)
+            new = MowerScheduler.clean_window(json.loads(msg.data), current)
+        except ValueError as e:
+            code = str(e) if str(e) == 'equal' else 'invalid'
+            rospy.logerr("set_window: %s: %s", code, msg.data)
+            with self.lock:
+                self._window_error = code
+            self._publish_report(force=True)
+            return
+        with self.lock:
+            (self.window_enabled, self.window_start, self.window_end) = new
+            self._window_error = None
+            self.persistent['allowed_window'] = {
+                'enabled': new[0], 'start': "%02d:%02d" % new[1],
+                'end': "%02d:%02d" % new[2]}
+            self._save_state()
+        if new != current:
+            self._last_idle_eval = 0.0
+            self._window_moved = self.state == self.STATE_MOWING
+            self._sleep_replan = self.state == self.STATE_PREPARE_SLEEP
+            self.log("[Master] Window set: %s." % self._window_text())
+        self._publish_report(force=True)
+
     def _program_on_map(self, prog_name, site=None):
         """False when no map has the program (deleted, renamed). The planner's
         list is only the map that is on: another map's program is started too,
@@ -961,21 +1038,32 @@ class MasterController(object):
                 return ev
         return None
 
+    def _window(self):
+        """(enabled, start, end) as one value: /scheduler/set_window changes
+        them from another thread, a mix of old and new could read as closed."""
+        with self.lock:
+            return self.window_enabled, self.window_start, self.window_end
+
+    def _window_text(self):
+        enabled, start, end = self._window()
+        return ("%02d:%02d-%02d:%02d" % (start + end)) if enabled else "off"
+
     def _in_allowed_window(self, now=None):
-        if not self.window_enabled:
+        enabled, start, end = self._window()
+        if not enabled:
             return True
         if now is None:
             now = self._now()
-        return MowerScheduler.within_window(
-            now, self.window_start, self.window_end)
+        return MowerScheduler.within_window(now, start, end)
 
     def _start_allowed(self, now):
         """In the window and with enough of it left to do something."""
-        if not self.window_enabled:
+        enabled, _, window_end = self._window()
+        if not enabled:
             return True
         if not self._in_allowed_window(now):
             return False
-        end = MowerScheduler.window_end_after(now, self.window_end)
+        end = MowerScheduler.window_end_after(now, window_end)
         return MowerScheduler.real_seconds(now, end) >= self.start_min_left_s
 
     def _mission_blocked(self):
@@ -1045,14 +1133,17 @@ class MasterController(object):
             pending = list(self._pending_view)
             battery = self.battery_capacity
             weather = dict(self.weather) if self.weather else None
+            stored = 'allowed_window' in self.persistent
+            window_error = self._window_error
+        win_on, win_start, win_end = self._window()
         next_dt, next_ev = MowerScheduler.get_next_event(calendar, now)
         outside = []
-        if self.window_enabled:
+        if win_on:
             for ev in calendar:
                 hm = MowerScheduler._parse_hhmm(ev.get('start_time', ''))
                 if hm and not MowerScheduler.within_window(
                         now.replace(hour=hm[0], minute=hm[1], second=0, microsecond=0),
-                        self.window_start, self.window_end):
+                        win_start, win_end):
                     outside.append(ev['id'])
         rep = {
             'enabled': self.automation_on,
@@ -1068,9 +1159,16 @@ class MasterController(object):
             'pending': pending,
             'issues': issues[-5:],
             'outside_window': outside,
-            'window': ({'start': "%02d:%02d" % self.window_start,
-                        'end': "%02d:%02d" % self.window_end}
-                       if self.window_enabled else None),
+            'window': ({'start': "%02d:%02d" % win_start,
+                        'end': "%02d:%02d" % win_end}
+                       if win_on else None),
+            # 'window' is what applies now; this is the setting, also when off.
+            'window_setting': {'enabled': win_on,
+                               'start': "%02d:%02d" % win_start,
+                               'end': "%02d:%02d" % win_end,
+                               'stored': stored,
+                               'min_left_min': self.start_min_left_s / 60.0,
+                               'error': window_error},
             'limits': {'resumes': self.resume_max, 'critical': self.critical_max},
             'weather': ({'age_min': int((t - weather['t']) / 60.0),
                          'rain_now': weather['rain_now'],
@@ -1258,7 +1356,7 @@ class MasterController(object):
                 self._issue('not_charging', program, block=block)
 
     def _sleep_until_window(self, now, label):
-        win_start = MowerScheduler.next_window_start(now, self.window_start)
+        win_start = MowerScheduler.next_window_start(now, self._window()[1])
         sleep_s = (MowerScheduler.real_seconds(now, win_start) - self.wake_lead_s)
         # Woken up before the window: stay awake, a short sleep is a cold start.
         if sleep_s < self.idle_sleep_threshold_s:
@@ -1624,8 +1722,15 @@ class MasterController(object):
     def _check_window_end(self):
         """The window closed while mowing: finish the path, then go home;
         mower_smach keeps the checkpoint and the run resumes in the next
-        window. window_overrun_max_min caps a path that does not end."""
+        window. window_overrun_max_min caps a path that does not end.
+        A window moved (/scheduler/set_window) so that the robot is inside it
+        again takes the request back: it mows on."""
+        moved, self._window_moved = self._window_moved, False
         if self._in_allowed_window(self._now()):
+            if moved or self._window_end_first:
+                self._window_end_first = 0.0
+                self._window_end_sent = 0.0
+                self.finish_after_path_pub.publish(Bool(False))
             return
         t = self._t()
         if not self._window_end_first:
@@ -1882,7 +1987,8 @@ class MasterController(object):
         decides nothing here, sleep_manager has dealt with it.
         """
         seq = self.sleep_seq
-        block = None if seq.past_return else self._sleep_gate()
+        block = None if seq.past_return else (
+            'window_changed' if self._sleep_replan else self._sleep_gate())
         seq.tick(block)
         if seq.active:
             if seq.state == sleep_manager.WAIT_CUT:
@@ -1891,10 +1997,11 @@ class MasterController(object):
                 self._set_status("Preparing sleep", 'sleep_prepare')
             return
         reason = seq.result
+        self._sleep_replan = False
         self._clear_sleep_intent()
         self.sleep_block = reason
         self.log("[Master] Sleep not done: %s." % reason)
-        if reason not in ('disabled', 'hold', 'off_dock'):
+        if reason not in ('disabled', 'hold', 'off_dock', 'window_changed'):
             self._sleep_cooldown_until = (
                 self._t() + self.sleep_cfg.fail_cooldown_s)
             self._sleep_cooldown_reason = reason
@@ -2032,6 +2139,7 @@ class MasterController(object):
 
         self.sleep_block = None
         self._sleep_last_refusal = None
+        self._sleep_replan = False
         self.log("[Master] Sleep (%s, %.0f min)." % (mode, sleep_ms / 60000.0))
         with self.lock:
             self.persistent['sleep_intent'] = {

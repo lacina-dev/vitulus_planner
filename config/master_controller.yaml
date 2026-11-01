@@ -117,9 +117,14 @@ mission_lost_grace_s: 20.0
 # Age of /vitulus_test/supervisor_status that still counts (agent phase running).
 agent_status_max_age_s: 15.0
 
-# Global allowed time-window ("don't mow at night"). Outside it the manager
-# never starts/resumes and sleeps until the window opens. Set enabled=false to
-# rely solely on calendar times. Supports wrap-around (start > end).
+# Global allowed time-window ("don't mow at night"), DEFAULTS only: the owner's
+# setting (UI: Programs > Calendar > Allowed mowing time, or /scheduler/set_window,
+# std_msgs/String with JSON {"enabled": true, "start": "HH:MM", "end": "HH:MM"})
+# is kept in ~/.vitulus/scheduler_state.json ("allowed_window"), wins over these
+# and works at once. Outside the window the calendar never starts/resumes and
+# the robot sleeps until it opens. It does not limit a manual Run or the agent.
+# enabled=false relies solely on calendar times. May wrap midnight (start > end);
+# start = end is refused.
 allowed_window_enabled: true
 allowed_window_start: "07:00"
 allowed_window_end: "21:00"
