@@ -3,6 +3,10 @@
 # Parameter names here match exactly what nodes/master_controller reads via
 # rospy.get_param('~<name>', ...). Durations suffixed _h are hours, _s seconds,
 # _min minutes.
+#
+# The owner's settings (Autonomy page, docs/AUTONOMY.md) live in
+# ~/.vitulus/autonomy.json and win; the values here are their defaults. The
+# mapping of keys to names is FIELDS in src/node_planner/autonomy.py.
 
 # The master switch is NOT here: it is persisted in ~/.vitulus/scheduler_state.json
 # ("automation_enabled", default false), set from the UI (Calendar card) or
@@ -56,6 +60,12 @@ sleep_check_logins: true
 # An open web UI (rosbridge client) keeps the robot awake too: somebody may be
 # working in it, and being awake costs nothing in the dock.
 sleep_check_ui: true
+# Autonomy defaults: the automation may sleep at all; it may sleep after a run.
+sleep_enabled: true
+sleep_after_run: true
+# A sleep over logins or UI clients that are ignored is announced this long on
+# /scheduler/sleep_countdown (a person can cancel, /scheduler/sleep_cancel).
+sleep_countdown_s: 60.0
 
 # Charge sleep. 'timed': a charge time from the battery deficit, it ends even
 # without contact. 'until_charged': ends only on CHARGED, so without contact it
@@ -74,6 +84,17 @@ battery_recovery_min_capacity: 40
 # charge really is worth a trip out of the dock. CHARGED on the power module
 # counts as reached.
 battery_resume_after_low_pct: 80
+
+# Rain, defaults of the owner's settings; master_controller pushes them to
+# node_mower_smach. always = programs started by hand obey the rain too;
+# calendar = only calendar runs; ignore = nobody.
+rain_mode: always
+rain_after_min: 60          # rain this long ago still refuses a start
+rain_forecast_min: 30       # forecast looked at (10, 20 or 30)
+rain_return_home: true      # rain during a run sends it home
+rain_stale_ok: true         # rain data too old: start anyway
+# Return level of a mission; keep equal to battery_return_pct in mower_smach.yaml.
+battery_return_pct: 25
 
 # Recovery sleep durations (hours) by interrupt reason. Each is capped so the
 # robot still wakes before the next scheduled program.

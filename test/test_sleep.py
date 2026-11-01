@@ -111,6 +111,7 @@ class Base(unittest.TestCase):
         mc.automation_on = True
         mc.mission_busy = False
         mc.sleep_check_logins = False
+        mc.sleep_countdown_s = 0        # the countdown has its own tests
         mc.window_enabled = False
         mc.state = mc.STATE_IDLE
         mc.is_in_dock = True

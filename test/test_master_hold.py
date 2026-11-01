@@ -91,6 +91,7 @@ class MasterHoldTest(unittest.TestCase):
         assert mc.state_file.startswith(_HOME), mc.state_file
         mc.window_enabled = False
         mc.sleep_check_logins = False
+        mc.sleep_countdown_s = 0
         mc.boot_grace_period_s = 0
         mc.check_interval_s = 0
         mc.programs_loaded = True

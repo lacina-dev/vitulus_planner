@@ -28,7 +28,7 @@ PLANNER = os.path.abspath(os.path.join(HERE, '..', '..'))
 SCENARIOS = ['disabled', 'normal', 'prestart_rain', 'battery', 'rain', 'rain_reject_keeps',
              'stack_restart', 'master_restart', 'mission_crash', 'dst', 'window_end',
              'terminal_cap', 'stop_visible', 'agent_block', 'no_weather', 'mux_hold', 'hold_rain',
-             'window_change', 'window_back', 'window_off']
+             'window_change', 'window_back', 'window_off', 'manual_rain', 'manual_rain_calendar']
 
 
 def navi_tree():
@@ -211,7 +211,7 @@ class Sim(object):
                 'tick_hz': 4.0, 'mission_lost_grace_s': 4.0, 'off_dock_wait_s': 100000.0,
                 'sleep_wait_before_standby_s': 1.0, 'sleep_min_off_s': 0.0, 'sleep_min_s': 1.0,
                 'sleep_timer_drift': 0.0, 'sleep_final_grace_s': 0.2, 'sleep_retry_s': 0.6,
-                'sleep_check_logins': False, 'sleep_shutdown_cmd': '/bin/true',
+                'sleep_check_logins': False, 'sleep_countdown_s': 0.0, 'sleep_shutdown_cmd': '/bin/true',
                 'automation_enabled': self.enabled if OLD else False}
         base.update(self.master_params)
         for k, v in base.items():
@@ -228,9 +228,10 @@ class Sim(object):
                              '__name:=node_mower_smach'], env)
 
     def spawn_master(self):
+        env = {'PYTHONPATH': os.path.join(NAVI_T, 'src') + ':' + os.environ.get('PYTHONPATH', '')}
         self.spawn('master', [sys.executable, os.path.join(HERE, 'sim_master.py'),
                               os.path.join(PLANNER_T, 'nodes', 'master_controller'),
-                              '__name:=master_controller'])
+                              '__name:=master_controller'], env)
 
     def close(self):
         for k in list(self.procs):
@@ -508,7 +509,7 @@ def _rain_rest(s, n1, y1):
 
 
 def scenario_rain():
-    """As shipped: weather_rain_bypass true (for manual runs). A calendar run obeys."""
+    """As shipped: rain_mode always. A calendar run obeys."""
     s = Sim(master_params={'weather_sleep_duration_h': 0.003, 'idle_sleep_threshold_s': 1e7})
     n1, y1 = _rain_run(s)
     _rain_rest(s, n1, y1)
@@ -516,9 +517,9 @@ def scenario_rain():
 
 
 def scenario_rain_reject_keeps():
-    """Rain checks on for everybody: only the checkpoint behaviour differs."""
-    s = Sim(master_params={'weather_sleep_duration_h': 0.003, 'idle_sleep_threshold_s': 1e7},
-            smach_params={'weather_rain_bypass': False})
+    """rain_mode calendar, today's old default: a calendar run obeys all the same."""
+    s = Sim(master_params={'weather_sleep_duration_h': 0.003, 'idle_sleep_threshold_s': 1e7,
+                           'rain_mode': 'calendar'})
     n1, y1 = _rain_run(s, forecast=True)
     _rain_rest(s, n1, y1)
     return s
@@ -785,6 +786,66 @@ def scenario_no_weather():
     s.set(no_weather=True)
     start(s, D(2026, 6, 10, 7, 59, 56), daily('08:00'))
     check('finished', finish_ok(s))
+    return s
+
+
+def _run_by_hand(s):
+    pub = rospy.Publisher('/web_plan/program_select', String, queue_size=1, latch=True)
+    s.wait(lambda: pub.get_num_connections() > 0, 15, 'planner listens')
+    return lambda: pub.publish(String(daily('08:00')['program_name']))
+
+
+def scenario_manual_rain():
+    """rain_mode always: a Run by hand obeys the rain; "ignore this time" lets one
+    run through, and only one."""
+    s = Sim(master_params={'idle_sleep_threshold_s': 1e7})
+    s.wait(lambda: os.path.exists(os.environ['SIM_STORE']), 10, 'store')
+    s.set(rain_now=1)
+    time.sleep(1.5)
+    go = _run_by_hand(s)
+    go()
+    check('refused', s.wait(lambda: s.stop_reason == 'rejected:rain', 30, 'rejected'), s.stop_reason)
+    check('never undocked', not s.events('dock_program'))
+    check('the report knows', s.wait(lambda: s.report.get('reject') == 'rain'
+                                     and s.report.get('rain_would_refuse') == 'rain', 10, 'report'))
+    once = rospy.Publisher('/scheduler/ignore_rain_once', Bool, queue_size=1)
+    s.wait(lambda: once.get_num_connections() >= 2, 15, 'both listen')
+    once.publish(Bool(True))
+    time.sleep(0.5)
+    go()
+    check('ignored once: it goes', s.wait(lambda: len(s.events('dock_program')) >= 1, 40, 'undock'))
+    check('finished in the rain', finish_ok(s))
+    check('flag gone', s.wait(lambda: s.report.get('ignore_rain_once') is False, 10, 'cleared'))
+    n = len(s.events('dock_program'))
+    time.sleep(1.0)
+    go()
+    check('refused again', s.wait(lambda: s.stop_reason == 'rejected:rain', 30, 'rejected'), s.stop_reason)
+    check('did not undock again', len(s.events('dock_program')) == n)
+    return s
+
+
+def scenario_manual_rain_calendar():
+    """rain_mode calendar is what the robot did until now: a Run by hand does not
+    care. The value reaches the mission from master_controller, not from the yaml;
+    a change on the settings topic reaches it at once."""
+    s = Sim(master_params={'idle_sleep_threshold_s': 1e7, 'rain_mode': 'calendar'})
+    s.wait(lambda: os.path.exists(os.environ['SIM_STORE']), 10, 'store')
+    check('pushed', s.wait(lambda: rospy.get_param('/node_mower_smach/weather_rain_mode') == 'calendar',
+                           15, 'param'))
+    s.set(rain_now=1)
+    time.sleep(1.5)
+    go = _run_by_hand(s)
+    go()
+    check('goes in the rain', s.wait(lambda: len(s.events('dock_program')) >= 1, 40, 'undock'))
+    check('finished', finish_ok(s))
+    pub = rospy.Publisher('/scheduler/set_settings', String, queue_size=1)
+    s.wait(lambda: pub.get_num_connections() > 0, 15, 'master listens')
+    pub.publish(String(json.dumps({'req': 'x', 'by': 'owner', 'values': {'rain_mode': 'always'}})))
+    check('changed live', s.wait(lambda: rospy.get_param('/node_mower_smach/weather_rain_mode') == 'always',
+                                 10, 'param'))
+    rospy.set_param('/node_mower_smach/weather_rain_mode', 'calendar')     # a launch reload
+    check('put right', s.wait(lambda: rospy.get_param('/node_mower_smach/weather_rain_mode') == 'always',
+                              15, 'param'))
     return s
 
 
