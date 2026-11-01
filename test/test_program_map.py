@@ -79,6 +79,8 @@ class Verify(unittest.TestCase):
                 (dict(good, site='B'), 0, True),                    # old map in navi
                 (dict(good, dock_err_m=3.0), 0, True),              # pose not on the dock
                 (dict(good, dock_err_m=30.0), 3, False),            # out on the lawn
+                (dict(good, ready=False), 3, False),                # out: starts as ever
+                (dict(good, site='B'), 3, False),
                 (dict(good, dock_err_m=None), 0, False)):           # no docked point
             self.assertEqual(pm.needs_verify(ready, 'A', dock, 0.5), want, (ready, dock))
 
@@ -234,6 +236,27 @@ class Gate(unittest.TestCase):
         self.assertEqual(go(env)[1], [])
         self.assertEqual(env.reports[-1]['code'], 'no_dock_point')
 
+    def test_no_docked_point(self):
+        env = Env()
+        env.navi.update(has_docked=False, dock_err_m=None)
+        self.assertEqual(go(env)[1], [])
+        self.assertEqual(env.reports[-1]['code'], 'no_docked_point')
+
+    def test_no_pose_on_the_new_map_is_not_verified(self):
+        env = Env()
+        env.navi.update(has_docked=True, dock_err_m=None)
+        self.assertEqual(go(env)[1], [])
+        self.assertEqual(env.reports[-1]['code'], 'timeout_navi')
+
+    def test_settle_starts_again_when_the_planner_drops_out(self):
+        env = Env()
+        ticks = iter([True, True, False] + [True] * 100000)
+        env.planner_ready = lambda site, legacy: next(ticks)
+        started = go(env)[1]
+        self.assertEqual(len(started), 1)
+        # 2 s from the last gap (third poll at 1000.4), not from the first pass
+        self.assertGreaterEqual(started[0][1], 1000.0 + 3 * 0.2 + 2.0 - 1e-6)
+
     def test_robot_leaves_during_the_wait(self):
         env = Env()
         env.navi = {'ready': False}
@@ -270,6 +293,9 @@ class Gate(unittest.TestCase):
         other = pm.Plan(pm.Plan.SWITCH, 'Other', site='T1')
         self.assertFalse(gate.submit(other, 'Other', 'run', False, start))
         self.assertEqual(env.reports[n]['code'], 'switching')
+        # The topic ends on the start that is really running.
+        last = env.reports[-1]
+        self.assertEqual((last['state'], last['program']), ('switching', 'B1Test'))
         gate.cancel()
 
     def test_program_not_runnable_after_the_load(self):

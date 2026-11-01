@@ -296,6 +296,9 @@ class MasterController(object):
     STATE_MOWING = "MOWING"
     STATE_WAIT_OFF_DOCK = "WAIT_OFF_DOCK"
     STATE_PREPARE_SLEEP = "PREPARE_SLEEP"
+    # A map load says 'switching' once; the planner bounds it (180 s) and says
+    # how it ended. Longer silence = the planner is gone (vitulus-field#46).
+    MAP_GATE_MAX_S = 200.0
 
     def __init__(self):
         rospy.init_node('master_controller')
@@ -993,7 +996,7 @@ class MasterController(object):
             return 'mission'
         # A start that loads its map is a mission already, just not in the SMACH
         # yet (vitulus-field#46). Bounded: a dead planner must not block for ever.
-        if start.get('state') == 'switching' and start_age < 200.0:
+        if start.get('state') == 'switching' and start_age < self.MAP_GATE_MAX_S:
             return 'mission'
         if dock in (1, 2):
             return 'dock'
@@ -1578,10 +1581,12 @@ class MasterController(object):
         handled here, the mission has nothing to pick up yet."""
         with self.lock:
             state = self.start_state
+            age = self._t() - self.start_state_t
         if not state or state.get('program') != prog:
             return False
         if state.get('state') == 'switching':
-            # The planner's own timeout bounds this.
+            if age >= self.MAP_GATE_MAX_S:
+                return False        # dead planner: the start deadline decides
             self._mission_start_deadline = self._t() + 60.0
             self._set_status("Mowing (Loading the map of %s)" % prog,
                              'loading_map', program=prog, site=state.get('site'))

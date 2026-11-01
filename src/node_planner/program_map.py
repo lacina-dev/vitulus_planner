@@ -103,6 +103,11 @@ REASONS = {
     'no_dock_point': (
         "map '{site}' has no DOCK point, the robot could not get home - add it first",
         "mapa {site} nemá bod DOCK, robot by se nevrátil domů; nejdřív ho přidej"),
+    'no_docked_point': (
+        "map '{site}' has no docked point, the robot cannot place itself on it in "
+        "the dock - dock it on that map and save the point first",
+        "mapa {site} nemá bod docked, robot se na ní v doku neumístí; zadokuj ho "
+        "na té mapě a bod ulož"),
     'cancelled': (
         "start of program '{program}' cancelled",
         "spuštění programu {program} zrušeno"),
@@ -245,14 +250,15 @@ def switch_blocker(dock_status, in_dock, mission_status, mission_busy, mapping_r
 
 def needs_verify(ready, site, dock_status, tol_m):
     """The map is on, but was it ever taken over? A switch that failed leaves it
-    served, so the next Run must not go straight to the undock. None = navi has
-    not said anything yet: nothing to go by."""
-    if not isinstance(ready, dict):
+    served, so the next Run must not go straight to the undock. Only in the dock:
+    a robot that is out starts as it always did, the map does not change there.
+    None = navi has not said anything yet: nothing to go by."""
+    if not isinstance(ready, dict) or dock_status != 0:
         return False
     if not ready.get('ready') or ready.get('site') != site:
         return True
     err = ready.get('dock_err_m')
-    return dock_status == 0 and err is not None and err > tol_m
+    return err is not None and err > tol_m
 
 
 def navi_ready(ready, target, legacy_mode):
@@ -268,6 +274,9 @@ def navi_ready(ready, target, legacy_mode):
         return False, None, {}
     if not legacy_mode and ready.get('has_dock') is False:
         return False, 'no_dock_point', {}
+    if not legacy_mode and ready.get('has_docked') is False:
+        # No dock hold without it: the robot would leave with the old map's pose.
+        return False, 'no_docked_point', {}
     return True, None, {}
 
 
@@ -314,6 +323,13 @@ class MapGate(object):
         self.env.log("Program '{}' not started: {}.".format(
             program, reason_text(code, 'en', program=program, site=site, **params)))
 
+    def refuse_busy(self, verb, ref, program, site, running):
+        """A second start while a map loads. The state topic ends on the running
+        start again: master_controller follows that one, not the refused one."""
+        self.refuse(verb, ref, program, site, 'switching', busy=running['program'])
+        self._report(SWITCHING, running['verb'], running['ref'], running['program'],
+                     running['site'])
+
     def ready(self, verb, ref, program, site):
         self._report(READY, verb, ref, program, site)
 
@@ -325,13 +341,13 @@ class MapGate(object):
             if self._busy:
                 running = dict(self._busy)
             else:
-                self._busy = {'program': plan.name, 'site': plan.site, 'ref': ref}
+                self._busy = {'program': plan.name, 'site': plan.site, 'ref': ref,
+                              'verb': verb}
                 self._cancel.clear()
         if running:
             # The calendar and the UI may repeat themselves: same start = no news.
             if running['ref'] != ref:
-                self.refuse(verb, ref, plan.name, plan.site, 'switching',
-                            busy=running['program'])
+                self.refuse_busy(verb, ref, plan.name, plan.site, running)
             return False
         worker = threading.Thread(target=self._run, name='program_map_gate',
                                   args=(plan, ref, verb, legacy_mode, start))
@@ -388,6 +404,7 @@ class MapGate(object):
             error = env.serve_error(stamp)
             if error and not legacy_mode:
                 return 'serve_failed', {'detail': error}
+            ok = False
             if env.map_on(site, legacy_mode):
                 phase = 'timeout_planner'
                 if env.planner_ready(site, legacy_mode):
@@ -396,16 +413,18 @@ class MapGate(object):
                     if code:
                         return code, params
                     pose_err = (env.navi_state() or {}).get('dock_err_m')
+                    if ok and pose_err is None and not legacy_mode:
+                        ok = False      # no pose on the new map yet: not verified
                     if ok and pose_err is not None and pose_err > self.pose_tol_m:
                         ok = False
                         phase = 'pose_mismatch'
-                    if ok:
-                        now = env.now()
-                        good_since = now if good_since is None else good_since
-                        if now - good_since >= self.SETTLE_S:
-                            return None, {}
-                    else:
-                        good_since = None
+            if ok:
+                now = env.now()
+                good_since = now if good_since is None else good_since
+                if now - good_since >= self.SETTLE_S:
+                    return None, {}
+            else:
+                good_since = None
             if env.now() >= deadline:
                 if phase == 'pose_mismatch':
                     err = (env.navi_state() or {}).get('dock_err_m')

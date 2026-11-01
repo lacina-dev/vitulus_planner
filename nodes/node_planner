@@ -2028,8 +2028,7 @@ class Node:
             running = self._map_gate.busy()
             name = program_map.parse_ref(ref)[1]
             if running and running['ref'] != ref:
-                self._map_gate.refuse(verb, ref, name, running['site'], 'switching',
-                                      busy=running['program'])
+                self._map_gate.refuse_busy(verb, ref, name, running['site'], running)
             return
         legacy = self._legacy_maps()
         plan = program_map.plan_start(

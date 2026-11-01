@@ -536,6 +536,19 @@ class Restart(Base):
             self.assertEqual(f.read(), before)
 
 
+class MapGate(Base):
+    def test_silence_does_not_hold_the_start_for_ever(self):
+        """vitulus-field#46: the planner died while it was loading a map."""
+        mc = self.mc
+        mc._mission_start_deadline = 0.0
+        mc.start_state = {'state': 'switching', 'program': 'Mow', 'site': 'BACK'}
+        mc.start_state_t = mc._t()
+        self.assertTrue(mc._map_gate_says('Mow'))
+        self.assertGreater(mc._mission_start_deadline, mc._t())
+        self.clock[0] += dt.timedelta(seconds=mc.MAP_GATE_MAX_S + 1)
+        self.assertFalse(mc._map_gate_says('Mow'))
+
+
 if __name__ == '__main__':
     try:
         unittest.main(verbosity=1)
