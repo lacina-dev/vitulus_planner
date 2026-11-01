@@ -31,6 +31,7 @@ import shutil
 from node_planner.planner_data import MapData, MapSpec, PathPolygon, Zone
 from node_planner import planner_io
 from node_planner import run_path
+from node_planner import program_chain
 
 # Planner state lives under ~/.vitulus (created on first boot, see Node.__init__).
 _VITULUS_DIR = os.path.join(os.path.expanduser('~'), '.vitulus')
@@ -178,6 +179,9 @@ class Node:
         self.program_list_pub = rospy.Publisher("/web_plan/program_list", PlannerProgramList, latch=True, queue_size=10)
         self.program_active_pub = rospy.Publisher("/web_plan/program_active", PlannerProgram, queue_size=1)
         self.program_active_unfinished_pub = rospy.Publisher("/web_plan/program_active_unfinished", PlannerProgram, queue_size=1)
+        # program_chain.py: all programs of a chain, then what came of the request.
+        self.chain_pub = rospy.Publisher("/web_plan/program_chain", PlannerProgramList, latch=True, queue_size=1)
+        self.chain_state_pub = rospy.Publisher("/web_plan/program_chain_state", String, latch=True, queue_size=1)
         self.planner_loaded_pub = rospy.Publisher("/web_plan/planner_loaded", String, queue_size=1, latch=True)
 
         # Needs log_pub + program_list_pub (publishes the loaded list, latched).
@@ -1991,11 +1995,40 @@ class Node:
                     return
         self._program_not_found(name)
 
+    def _select_chain(self, text, verb, pub):
+        """A plain program, or a chain of them (program_chain.py)."""
+        refs = program_chain.parse(text)
+        if len(refs) < 2 or self.chain_program(text, None) is not None:
+            self._select_program(text, verb, pub)
+            return
+        self._select_program(refs[0], verb, program_chain.ChainStart(self, refs, verb, pub))
+
+    # ---- env of program_chain.ChainStart -----------------------------------
+    def chain_program(self, name, site):
+        """The listed program of this name on the map that is on, or None."""
+        if self.permanent_program_list_msg is None or not self._programs_usable():
+            return None
+        for program in self.permanent_program_list_msg.program_list:
+            if program.name == name and self._on_current_map(program) \
+                    and site in (None, program.map_name, self._bundle_site()):
+                return program
+        return None
+
+    def chain_current(self, program):
+        return self._program_with_current_zones(program)
+
+    def chain_id(self):
+        return str(int(time.time() * 1000))
+
+    def chain_log(self, text):
+        self.log_publisher(text)
+        rospy.logwarn("[{}] {}".format(rospy.get_caller_id(), text))
+
     def callback_program_select(self, msg):
-        self._select_program(msg.data, "run", self.program_active_pub)
+        self._select_chain(msg.data, "run", self.program_active_pub)
 
     def callback_program_select_resume(self, msg):
-        self._select_program(msg.data, "resume", self.program_active_unfinished_pub)
+        self._select_chain(msg.data, "resume", self.program_active_unfinished_pub)
 
     def program_list_publisher(self):
         """ Publish program list """
