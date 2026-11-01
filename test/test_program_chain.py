@@ -140,6 +140,33 @@ class ProgramChainTest(unittest.TestCase):
         self.assertEqual([p.name for p in self.sent(CHAIN)[0].program_list], ['ZoneA', 'Test'])
         self.assertEqual(self.state()['skipped'][0]['name'], 'Third')
 
+    def test_first_on_another_map_goes_through_the_map_gate(self):
+        # vitulus-field#46: the map of the first program goes on first; only then
+        # is the rest resolved, against that map.
+        n = self.n
+        S.serve(n, 'B')
+        n.callback_map_save_zone(S.zmsg('Back', 2, 2, 6, 6))
+        n.callback_program_new(S.program('Far', S.zone_msgs(n, 'Back')))
+        n.callback_program_new(S.program('Far2', S.zone_msgs(n, 'Back')))
+        S.serve(n, 'A')
+        n._site_catalog = {'A': ['ZoneA', 'Test', 'Third'], 'B': ['Far', 'Far2']}
+        starts = []
+        n._map_gate.submit = lambda plan, ref, verb, legacy, start: starts.append(
+            (plan, ref, start))
+        del S.EVENTS[:]
+
+        n.callback_program_select(String('B|||Far>>>A|||Test>>>Far2'))
+        self.assertEqual([(p.site, ref) for p, ref, _s in starts], [('B', 'B|||Far')])
+        for topic in (ACTIVE, CHAIN, STATE):
+            self.assertEqual(self.sent(topic), [])
+
+        S.serve(n, 'B')
+        self.assertEqual(starts[0][2]('Far', 'run'), (True, None))
+        self.assertEqual([p.name for p in self.sent(CHAIN)[0].program_list], ['Far', 'Far2'])
+        self.assertEqual(self.sent(ACTIVE)[0].name, 'Far')
+        self.assertEqual([(row['name'], row['code']) for row in self.state()['skipped']],
+                         [('Test', 'not_on_map')])
+
     def test_run_path_follows_the_running_program(self):
         # /web_plan/program_marker(_state): the map shows the program that runs.
         n = self.n

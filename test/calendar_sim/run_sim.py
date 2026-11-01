@@ -734,4 +734,5 @@ def run(name):
     return 1 if FAILS else 0
 
 
-sys.exit(run(sys.argv[1]))
+if __name__ == "__main__":
+    sys.exit(run(sys.argv[1]))
