@@ -116,6 +116,24 @@ def active_logins(run=subprocess.check_output):
         return ['unknown']
 
 
+def busy_ttys(logins, active_s, now=None, stat=os.stat):
+    """Terminals used in the last active_s, by input (atime, what `who -u` shows) or
+    output (mtime).  One that cannot be told is busy, active_s 0 asks nothing."""
+    if active_s <= 0:
+        return []
+    now = time.time() if now is None else now
+    busy = []
+    for tty in logins:
+        try:
+            st = stat('/dev/' + tty)
+            used = max(st.st_atime, st.st_mtime)
+        except OSError:
+            used = now
+        if now - used < active_s:
+            busy.append(tty)
+    return busy
+
+
 def read_boot_id(path='/proc/sys/kernel/random/boot_id'):
     try:
         with open(path) as f:
@@ -152,6 +170,7 @@ class SleepSequencer(object):
     def __init__(self, cfg, pm, status_fn, helper, log=lambda m: None,
                  clock=time.time):
         self.cfg = cfg
+        self.run_cfg = cfg          # of this attempt, see start()
         self.pm = pm                # send_wait/send_time/send_offset/arm/cancel
         self.status_fn = status_fn  # -> (Power_status or None, age_s)
         self.helper = helper
@@ -165,7 +184,9 @@ class SleepSequencer(object):
         self._reset_try()
 
     # -- control --------------------------------------------------------------
-    def start(self, mode, sleep_ms=0):
+    def start(self, mode, sleep_ms=0, cfg=None):
+        """cfg: other timing for this attempt, the hardware reset's W."""
+        self.run_cfg = cfg or self.cfg
         self.mode = mode
         self.sleep_ms = int(sleep_ms)
         self.result = None
@@ -206,20 +227,20 @@ class SleepSequencer(object):
 
     def _status(self):
         st, age = self.status_fn()
-        return st if st is not None and age <= self.cfg.stale_s else None
+        return st if st is not None and age <= self.run_cfg.stale_s else None
 
     def _due(self):
         """Time for the next send of an unconfirmed command."""
         now = self.clock()
         if now < self.next_send:
             return False
-        self.next_send = now + self.cfg.retry_s
+        self.next_send = now + self.run_cfg.retry_s
         self.tries += 1
         return True
 
     @property
     def _exhausted(self):
-        return (self.tries >= self.cfg.max_tries
+        return (self.tries >= self.run_cfg.max_tries
                 and self.clock() >= self.next_send)
 
     def _flag(self, st):
@@ -227,10 +248,10 @@ class SleepSequencer(object):
                 else st.sleep_status)
 
     def _wait_ms(self):
-        return int(self.cfg.wait_before_standby_s * 1000)
+        return int(self.run_cfg.wait_before_standby_s * 1000)
 
     def _offset_ms(self):
-        return int(self.cfg.charged_offset_s * 1000)
+        return int(self.run_cfg.charged_offset_s * 1000)
 
     # -- states ---------------------------------------------------------------
     def tick(self, block=None):
@@ -294,7 +315,7 @@ class SleepSequencer(object):
         if st is None or not self._flag(st):
             self._abort('pm_lost')
             return
-        if self.clock() - self.armed_at >= self.cfg.final_grace_s:
+        if self.clock() - self.armed_at >= self.run_cfg.final_grace_s:
             self.log('[Sleep] PM armed, shutting the OS down.')
             self.helper.start()
             self._go(WAIT_CUT)
@@ -306,7 +327,7 @@ class SleepSequencer(object):
         if block:
             self._abort(block)
         elif (self.clock() - self.armed_at
-              > self.cfg.wait_before_standby_s + self.cfg.cut_margin_s):
+              > self.run_cfg.wait_before_standby_s + self.run_cfg.cut_margin_s):
             self._abort('pm_no_cut')
 
     def _t_abort(self, _block):

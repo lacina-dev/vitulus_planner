@@ -75,13 +75,17 @@ class World(object):
         self.s = {'battery': 90.0, 'rain_now': 0, 'past_rain': False,
                   'forecast_rain': False, 'x': -3.0, 'y': 0.0, 'docked': True,
                   'no_weather': False, 'stale_weather': False, 'undock_fail': False,
-                  'charge_rate': 1.0, 'drain_rate': 0.0, 'smach_lock': False}
+                  'charge_rate': 1.0, 'drain_rate': 0.0, 'smach_lock': False,
+                  'mower_silent': False, 'mower_heal': '', 'blade_dead': False,
+                  'mcu_dead': False}
         self.prog = {'name': 'Mow', 'last_result': '', 'last_duration_minutes': 0}
         if os.path.exists(STORE):
             d = json.load(open(STORE))
             self.s.update(d['s'])
             self.prog.update(d['prog'])
         self.mower = {'power': False, 'motor': False, 'rpm': 0, 'height': 60}
+        self.bat_out = True
+        self.holds = set()          # /cmd_vel_mux/hold
         self.dock_status = 0 if self.s['docked'] else 3
         self.dock_busy = 0.0
         self.motors = False
@@ -92,6 +96,7 @@ class World(object):
         self.pm_sleep = {'sleep_status': False, 'sleep_charged_status': False,
                          'sleep_wait_standby': 15000, 'sleep_time_interval': 0,
                          'sleep_wait_charged': 120000}
+        self.pm_sleep.update(self.s.get('pm_eeprom') or {})     # survives the cut
         for topic, kind, field in (
                 ('set_robot_sleep', Bool, 'sleep_status'),
                 ('set_sleep_until_charged', Bool, 'sleep_charged_status'),
@@ -117,8 +122,11 @@ class World(object):
         self.p_unfinished = rospy.Publisher('/web_plan/program_active_unfinished',
                                             PlannerProgram, queue_size=1)
         self.p_mower = rospy.Publisher('/mower/status', Mower, queue_size=1)
+        self.p_link = rospy.Publisher('/mower/link', String, queue_size=1)
+        self.silent_t = None
         self.p_motor_state = rospy.Publisher('/base/motor_power_state', Bool, queue_size=1)
         self.p_rain = rospy.Publisher('/weather_alert/rain_alert', RainAlert, queue_size=1)
+        self.p_held = rospy.Publisher('/cmd_vel_mux/held', Bool, queue_size=1, latch=True)
         self.tf = tf.TransformBroadcaster()
 
         rospy.Subscriber('/sim/set', String, self.on_set)
@@ -131,6 +139,9 @@ class World(object):
         rospy.Subscriber('/mower/set_motor_on', Bool, self.on_motor)
         rospy.Subscriber('/mower/set_motor_rpm', Int16, self.on_rpm)
         rospy.Subscriber('/mower/set_cut_height', Int16, self.on_height)
+        rospy.Subscriber('/mower/link_cmd', String, self.on_link_cmd)
+        rospy.Subscriber('/pm/set_bat_out_switch', Bool, self.on_bat_out)
+        rospy.Subscriber('/cmd_vel_mux/hold', String, self.on_hold)
 
         self.a_mb = actionlib.SimpleActionServer('/move_base_flex/move_base', MoveBaseAction,
                                                  lambda g: self.a_mb.set_succeeded(MoveBaseResult()),
@@ -161,7 +172,7 @@ class World(object):
 
     # --- persistence --------------------------------------------------------
     def store(self):
-        tmp = STORE + '.tmp'
+        tmp = '%s.%d.tmp' % (STORE, threading.get_ident())
         with open(tmp, 'w') as f:
             json.dump({'s': self.s, 'prog': self.prog}, f)
         os.replace(tmp, STORE)
@@ -206,18 +217,58 @@ class World(object):
         self.publish_list()
 
     # --- mower --------------------------------------------------------------
+    def silent(self):
+        """A dead link: nothing reaches the board, the blade stands."""
+        return self.s['mower_silent']
+
     def on_power(self, msg):
-        self.mower['power'] = msg.data
-        rec('mower_power', on=msg.data)
+        rec('mower_power', on=msg.data, silent=self.silent())
+        if not self.silent():
+            self.mower['power'] = msg.data
+            if msg.data:
+                self.bat_out = True     # the firmware asks the PM for it
 
     def on_motor(self, msg):
-        self.mower['motor'] = msg.data
+        rec('mower_motor', on=msg.data, silent=self.silent())
+        if not self.silent():
+            self.mower['motor'] = msg.data
+            if msg.data:
+                self.s['blade_dead'] = False
 
     def on_rpm(self, msg):
-        self.mower['rpm'] = msg.data
+        if not self.silent():
+            self.mower['rpm'] = msg.data
 
     def on_height(self, msg):
-        self.mower['height'] = msg.data
+        if not self.silent():
+            self.mower['height'] = msg.data
+
+    def heal(self):
+        """The board restarted: at max height, blade off, rpm from its EEPROM."""
+        self.s['mower_silent'] = False
+        self.mower.update(motor=False, power=True, height=60, rpm=2000)
+
+    def on_link_cmd(self, msg):
+        rec('link_cmd', cmd=msg.data)
+        if msg.data == 'restart_serial' and self.s['mower_heal'] == 'serial':
+            self.heal()
+
+    def on_bat_out(self, msg):
+        rec('bat_out', on=msg.data, silent=self.silent())
+        self.bat_out = msg.data
+        if not msg.data:
+            self.mower['motor'] = False
+            if self.s['mower_heal'] == 'power':     # it answers with the rail off
+                self.heal()
+                self.mower['power'] = False
+
+    def on_hold(self, msg):
+        req = json.loads(msg.data)
+        before = bool(self.holds)
+        (self.holds.add if req['hold'] else self.holds.discard)(req['source'])
+        if bool(self.holds) != before:
+            rec('mux_hold', on=bool(self.holds), x=round(self.s['x'], 3), y=round(self.s['y'], 3))
+        self.p_held.publish(Bool(bool(self.holds)))
 
     # --- dock ---------------------------------------------------------------
     def on_dock_program(self, msg):
@@ -284,7 +335,7 @@ class World(object):
                 self.a_exe.set_preempted(ExePathResult(outcome=8))
                 return
             # walk the poses (0.03 m apart) by one tick's distance
-            left = step
+            left = 0 if self.holds else step
             with self.lock:
                 while i < len(poses) and left > 0:
                     t = poses[i].pose.position
@@ -312,6 +363,10 @@ class World(object):
 
     def pm_sleep_cmd(self, msg, field):
         self.pm_sleep[field] = msg.data
+        if field in ('sleep_wait_standby', 'sleep_time_interval'):
+            rec('pm_write', field=field, value=msg.data)
+            self.s['pm_eeprom'] = {k: self.pm_sleep[k] for k in
+                                   ('sleep_wait_standby', 'sleep_time_interval')}
 
     def slow(self):
         s = self.s
@@ -324,6 +379,7 @@ class World(object):
         pm.battery_capacity = int(s['battery'])
         pm.supply_status = 'ONLINE' if online else 'OFFLINE'
         pm.charger_status = 'CHARGING' if online else 'DISCHARGING'
+        pm.bat_out_switch = self.bat_out
         for k, v in self.pm_sleep.items():
             setattr(pm, k, v)
         self.p_pm.publish(pm)
@@ -338,11 +394,20 @@ class World(object):
         m.max_height = 60
         m.current_height = self.mower['height']
         m.status = 'READY' if self.mower['power'] else 'OFF'
+        spins = self.mower['motor'] and self.mower['power'] and not s['blade_dead']
+        if spins and self.mower['rpm'] > 0:
+            m.status = 'RUN'
         if s.get('mower_temp') and self.mower['power']:
             m.status = 'TEMP'
-        m.moto_rpm = self.mower['rpm'] if self.mower['motor'] else 0
+        m.moto_rpm = self.mower['rpm'] if spins else 0
         m.setpoint_rpm = self.mower['rpm']
-        self.p_mower.publish(m)
+        if not s['mower_silent']:
+            self.p_mower.publish(m)
+        self.silent_t = (self.silent_t or time.time()) if s['mower_silent'] else None
+        if s.get('link_node'):      # node_mower_link
+            self.p_link.publish(String(json.dumps(
+                {'state': 'silent' if self.silent_t else 'ok', 'status': m.status,
+                 'silent_s': round(time.time() - self.silent_t, 1) if self.silent_t else 0.2})))
         if not s['no_weather']:
             r = RainAlert()
             r.time = rospy.Time.now() - rospy.Duration(7200 if s['stale_weather'] else 0)

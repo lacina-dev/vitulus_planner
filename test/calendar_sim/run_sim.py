@@ -25,10 +25,11 @@ import zlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PLANNER = os.path.abspath(os.path.join(HERE, '..', '..'))
-SCENARIOS = ['disabled', 'normal', 'prestart_rain', 'battery', 'rain', 'rain_reject_keeps',
+SCENARIOS = ['link_hw_reset', 'link_hw_spent', 'link_hw_cancel', 'link_hw_person', 'disabled', 'normal', 'prestart_rain', 'battery', 'rain', 'rain_reject_keeps',
              'stack_restart', 'master_restart', 'mission_crash', 'dst', 'window_end',
              'terminal_cap', 'stop_visible', 'agent_block', 'no_weather', 'mux_hold', 'hold_rain',
-             'window_change', 'window_back', 'window_off', 'manual_rain', 'manual_rain_calendar']
+             'window_change', 'window_back', 'window_off', 'manual_rain', 'manual_rain_calendar',
+             'link_heals', 'link_dead', 'link_stop', 'link_blade', 'link_manual', 'moved_event']
 
 
 def navi_tree():
@@ -115,7 +116,7 @@ open(os.environ['SIM_CLOCK'], 'w').write('0')
 open(os.environ['SIM_LOG'], 'w').close()
 
 import rospy                                         # noqa: E402
-from std_msgs.msg import Bool, Empty, String, UInt64  # noqa: E402,F401
+from std_msgs.msg import Bool, Empty, Int32, String, UInt64  # noqa: E402,F401
 
 STATE_FILE = os.path.join(HOME, '.vitulus', 'scheduler_state.json')
 PLANNER_T = os.environ['SIM_PLANNER']
@@ -162,6 +163,10 @@ class Sim(object):
         rospy.Subscriber('/pm/set_sleep_time', UInt64, self._s('sleep_time'))
         rospy.Subscriber('/pm/set_sleep_until_charged', Bool, self._s('until_charged'))
         rospy.Subscriber('/pm/set_robot_sleep', Bool, self._s('sleep_req'))
+        self.countdown = None
+        rospy.Subscriber('/scheduler/sleep_countdown', String, self._countdown)
+        self.p_cancel = rospy.Publisher('/scheduler/sleep_cancel', Bool, queue_size=1)
+        self.p_ui = rospy.Publisher('/client_count', Int32, queue_size=1, latch=True)
         self.p_set = rospy.Publisher('/sim/set', String, queue_size=5)
         self.p_cal = rospy.Publisher('/scheduler/set_calendar', String, queue_size=1, latch=True)
         self.p_en = rospy.Publisher('/scheduler/set_enabled', Bool, queue_size=1, latch=True)
@@ -181,6 +186,9 @@ class Sim(object):
         def cb(msg):
             setattr(self, attr, msg.data)
         return cb
+
+    def _countdown(self, msg):
+        self.countdown = json.loads(msg.data)
 
     def _report(self, msg):
         self.report = json.loads(msg.data)
@@ -319,6 +327,8 @@ class Sim(object):
                                 'at': self.now().isoformat(), 't': time.time()}) + '\n')
         w = json.load(open(os.environ['SIM_STORE']))
         self.set(battery=min(100.0, w['s']['battery'] + ms / 3600000.0 * 30.0))
+        if not w['s'].get('mcu_dead'):
+            self.set(mower_silent=False)    # 19 V gone: that cures a hung MCU
         time.sleep(0.2)
         self.sleep_req = False
         self.sleep_time = 0
@@ -716,6 +726,236 @@ def scenario_stop_visible():
     time.sleep(8)
     check('no restart after a person stopped it', len(s.selects()) == 1, len(s.selects()))
     check('run closed', s.state().get('run') is None and s.state().get('interrupted_event_id') is None)
+    return s
+
+
+LINK_FAST = {'mower_link': {'rpm_low_s': 2.0, 'spinup_s': 3.0, 'resync_s': 2.0, 'serial_s': 2.0,
+                            'attempt_s': 15.0, 'blade_s': 4.0}}
+
+
+def on_path(s, y):
+    return s.wait(lambda: any(p == y for p, _ in s.mowed()), 90, 'mowing path %s' % y)
+
+
+def holds(s, on=True):
+    return [e for e in s.events('mux_hold') if e['on'] == on]
+
+
+def scenario_link_heals():
+    """The incident, with a board that answers after the power cycle."""
+    s = Sim(master_params={'idle_sleep_threshold_s': 1e7}, smach_params=LINK_FAST)
+    start(s, D(2026, 6, 10, 7, 59, 54), daily('08:00'))
+    check('mowing', on_path(s, 1.0))
+    t0 = time.time()
+    s.set(mower_silent=True, mower_heal='power')
+    check('holds', s.wait(lambda: holds(s), 6, 'hold'), time.time() - t0)
+    check('released', s.wait(lambda: holds(s, False), 25, 'release'))
+    held, free = holds(s)[0], holds(s, False)[0]
+    check('stood still', (held['x'], held['y']) == (free['x'], free['y']), (held, free))
+    check('serial, then power', [e['cmd'] for e in s.events('link_cmd')] == ['restart_serial']
+          and [e['on'] for e in s.events('bat_out')] == [False]
+          and any(e['on'] for e in s.events('mower_power')), s.events('bat_out'))
+    on = [e for e in s.events('mower_motor') if e['on'] and not e['silent']]
+    check('blade through the normal command', bool(on))
+    check('finished, no interruption', finish_ok(s), s.stop_reason)
+    check('every path', sorted(set(y for y, _ in s.mowed())) == ALL_PATHS,
+          sorted(set(y for y, _ in s.mowed())))
+    exes = s.events('exe')
+    y = held['y']
+    after = [e for e in exes if not e['transit'] and e['blade'] and e['first'][1] == y]
+    check('the gap mowed again', len(after) >= 2, after)
+    check('one recovery, no resume', len(s.selects()) == 1, len(s.selects()))
+    return s
+
+
+def scenario_link_dead():
+    """The incident as it was: the board never answers."""
+    s = Sim(master_params={'idle_sleep_threshold_s': 1e7, 'mower_link_wait_min': 0.25,
+                           'reject_retry_min': 0.1},
+            smach_params=LINK_FAST)
+    start(s, D(2026, 6, 10, 7, 59, 54), daily('08:00'))
+    check('mowing', on_path(s, 1.0))
+    s.set(mower_silent=True)
+    check('holds', s.wait(lambda: holds(s), 6, 'hold'))
+    check('goes home', s.wait(lambda: s.stop_reason == 'interrupted:mower_link', 25, 'reason'),
+          s.stop_reason)
+    check('power cut', s.events('bat_out')[-1]['on'] is False, s.events('bat_out'))
+    n = len(s.mowed())
+    check('in the dock', s.wait(lambda: json.load(open(os.environ['SIM_STORE']))['s']['docked'],
+                                60, 'dock'))
+    check('no mowing path on the way', len(s.mowed()) == n, s.mowed()[n:])
+    check('run kept', s.wait(lambda: (s.state().get('run') or {}).get('reason') == 'mower_link',
+                             15, 'run'), s.state().get('run'))
+    check('reported', s.state()['issues'][-1]['code'] == 'mower_link', s.state().get('issues'))
+    check('checkpoint', json.load(open(os.environ['SIM_STORE']))['prog']['last_result']
+          .startswith('failed: on_path-'))
+    check('still silent: refused in the dock',
+          s.wait(lambda: s.stop_reason == 'rejected:mower_link', 40, 'refused'), s.stop_reason)
+    undocks = len(s.events('dock_program'))
+    s.set(mower_silent=False, mower_heal='')
+    check('resumed and finished', finish_ok(s, 180), s.stop_reason)
+    check('every path', sorted(set(y for y, _ in s.mowed())) == ALL_PATHS,
+          sorted(set(y for y, _ in s.mowed())))
+    check('left the dock again', len(s.events('dock_program')) > undocks)
+    return s
+
+
+HW_RESET = {'idle_sleep_threshold_s': 1e7, 'mower_link_wait_min': 0.25, 'reject_retry_min': 0.1,
+            'hw_reset_wait_s': 1.0, 'hw_reset_off_s': 1.0, 'hw_reset_final_grace_s': 0.2,
+            'hw_reset_countdown_s': 3.0, 'hw_reset_silent_s': 2.0, 'auto_hw_reset': True,
+            'hw_reset_tty_active_s': 0.0}
+
+
+def _to_dock_silent(s, **world):
+    start(s, D(2026, 6, 10, 7, 59, 54), daily('08:00'))
+    check('mowing', on_path(s, 1.0))
+    s.set(mower_silent=True, link_node=True, **world)
+    check('goes home', s.wait(lambda: s.stop_reason == 'interrupted:mower_link', 25, 'reason',
+                              serve=False), s.stop_reason)
+    check('in the dock', s.wait(lambda: json.load(open(os.environ['SIM_STORE']))['s']['docked'],
+                                60, 'dock', serve=False))
+
+
+def scenario_link_hw_reset():
+    """The night of 1. 11. with the rule: the master cuts the power, the MCU answers,
+    the run goes on from its checkpoint."""
+    s = Sim(master_params=HW_RESET, smach_params=LINK_FAST)
+    _to_dock_silent(s)
+    check('announced first', s.wait(lambda: (s.countdown or {}).get('reason') == 'hw_reset', 30,
+                                    'countdown', serve=False), s.countdown)
+    check('not armed in the countdown', not s.sleep_req)
+    check('told', s.wait(lambda: any(i['code'] == 'hw_reset' for i in s.state().get('issues', [])),
+                         5, 'issue', serve=False), s.state().get('issues'))
+    check('cut', s.wait(lambda: s.events('sleep'), 30, 'sleep'), s.events('sleep'))
+    check('W + off', s.events('sleep')[-1]['ms'] == 2000, s.events('sleep'))
+    run = s.state().get('run') or {}
+    check('spent in the run', run.get('hw_reset') is True, run)
+    check('resumed and finished', finish_ok(s, 180), s.stop_reason)
+    check('every path', sorted(set(y for y, _ in s.mowed())) == ALL_PATHS,
+          sorted(set(y for y, _ in s.mowed())))
+    check('one reset', len(s.events('sleep')) == 1, s.events('sleep'))
+    check('counted', len(s.state().get('hw_resets') or []) == 1, s.state().get('hw_resets'))
+    check('W and T back', s.wait(lambda: 'hw_reset_pm' not in s.state(), 15, 'restore'))
+    writes = {}
+    for e in s.events('pm_write'):
+        writes[e['field']] = e['value']
+    check('W as it was', writes.get('sleep_wait_standby') == 15000, s.events('pm_write'))
+    return s
+
+
+def scenario_link_hw_spent():
+    """The reset did not help: one per run, then a person."""
+    s = Sim(master_params=HW_RESET, smach_params=LINK_FAST)
+    _to_dock_silent(s, mcu_dead=True)
+    check('cut', s.wait(lambda: s.events('sleep'), 40, 'sleep'), s.events('sleep'))
+    check('told', s.wait(lambda: any(i['code'] == 'hw_reset_spent'
+                                     for i in s.state().get('issues', [])), 40, 'spent'),
+          s.state().get('issues'))
+    time.sleep(5.0)
+    check('no second reset', len(s.events('sleep')) == 1, s.events('sleep'))
+    return s
+
+
+def scenario_link_hw_cancel():
+    """Cancel in the countdown holds for the run."""
+    s = Sim(master_params=dict(HW_RESET, hw_reset_countdown_s=8.0), smach_params=LINK_FAST)
+    _to_dock_silent(s, mcu_dead=True)
+    check('announced', s.wait(lambda: (s.countdown or {}).get('reason') == 'hw_reset', 30,
+                              'countdown', serve=False), s.countdown)
+    s.p_cancel.publish(Bool(True))
+    check('off', s.wait(lambda: not (s.countdown or {}).get('active'), 5, 'cancel', serve=False),
+          s.countdown)
+    time.sleep(12.0)
+    check('never cut', not s.sleep_req and not s.events('sleep'), s.events('sleep'))
+    check('marked', (s.state().get('run') or {}).get('hw_reset') == 'cancelled', s.state().get('run'))
+    check('not counted', not s.state().get('hw_resets'), s.state().get('hw_resets'))
+    return s
+
+
+def scenario_link_hw_person():
+    """A person connected who is not ignored: told, no cut, and it goes when they are gone."""
+    s = Sim(master_params=HW_RESET, smach_params=LINK_FAST)
+    s.p_ui.publish(Int32(1))
+    _to_dock_silent(s)
+    check('told', s.wait(lambda: any(i['code'] == 'hw_reset_person'
+                                     for i in s.state().get('issues', [])), 30, 'person',
+                         serve=False), s.state().get('issues'))
+    check('no cut', not s.sleep_req)
+    s.p_ui.publish(Int32(0))
+    check('cut once alone', s.wait(lambda: s.events('sleep'), 30, 'sleep'), s.events('sleep'))
+    check('resumed and finished', finish_ok(s, 180), s.stop_reason)
+    return s
+
+
+def scenario_link_stop():
+    """A person stops it in the middle of the ladder: that word stays."""
+    s = Sim(master_params={'idle_sleep_threshold_s': 1e7}, smach_params=LINK_FAST)
+    start(s, D(2026, 6, 10, 7, 59, 54), daily('08:00'))
+    check('mowing', on_path(s, 1.0))
+    s.set(mower_silent=True)
+    check('holds', s.wait(lambda: holds(s), 6, 'hold'))
+    s.p_stop.publish(Bool(True))
+    check('stopped', s.wait(lambda: s.status == 'Stopped', 30, 'stop'), s.status)
+    check('hold released', s.wait(lambda: holds(s, False), 5, 'release'))
+    n = len(s.events('bat_out'))
+    time.sleep(20)
+    check('nothing after the stop', len(s.events('bat_out')) == n
+          and not [e for e in s.events('bat_out') if e['on']], s.events('bat_out'))
+    check('no reason of ours', s.stop_reason.startswith('stopped:'), s.stop_reason)
+    check('no restart', len(s.selects()) == 1, len(s.selects()))
+    return s
+
+
+def scenario_link_blade():
+    """The board talks, the blade has stopped (a restart nobody saw)."""
+    s = Sim(master_params={'idle_sleep_threshold_s': 1e7}, smach_params=LINK_FAST)
+    start(s, D(2026, 6, 10, 7, 59, 54), daily('08:00'))
+    check('mowing', on_path(s, 1.0))
+    s.set(blade_dead=True)
+    check('holds', s.wait(lambda: holds(s), 10, 'hold'))
+    check('released', s.wait(lambda: holds(s, False), 10, 'release'))
+    check('no serial, no power', not s.events('link_cmd') and not s.events('bat_out'))
+    check('finished', finish_ok(s), s.stop_reason)
+    return s
+
+
+def scenario_link_manual():
+    """A Run by hand: the same mission, and nobody resumes it."""
+    s = Sim(master_params={'idle_sleep_threshold_s': 1e7, 'mower_link_wait_min': 0.05},
+            smach_params=LINK_FAST)
+    s.wait(lambda: os.path.exists(os.environ['SIM_STORE']), 10, 'store')
+    time.sleep(1.5)     # as manual_rain: the world's program must reach a connected smach
+    go = _run_by_hand(s)
+    go()
+    check('mowing', on_path(s, 0.0))
+    s.set(mower_silent=True)
+    check('holds', s.wait(lambda: holds(s), 6, 'hold'))
+    check('goes home', s.wait(lambda: s.stop_reason == 'interrupted:mower_link', 25, 'reason'),
+          s.stop_reason)
+    s.wait(lambda: json.load(open(os.environ['SIM_STORE']))['s']['docked'], 60, 'dock')
+    s.set(mower_silent=False)
+    time.sleep(12)
+    check('no resume by hand', len(s.events('select')) <= 1, s.events('select'))
+    check('reported', (s.state().get('issues') or [{}])[-1].get('code') == 'mower_link',
+          s.state().get('issues'))
+    return s
+
+
+def scenario_moved_event():
+    """The event ran today and is moved later today: it runs again, once."""
+    s = Sim(master_params={'idle_sleep_threshold_s': 1e7})
+    start(s, D(2026, 6, 10, 7, 59, 54), daily('08:00'))
+    check('first run', finish_ok(s))
+    time.sleep(2)
+    s.calendar(daily('08:10'))
+    time.sleep(2)
+    check('marks gone', 'ev1' not in s.state().get('closed_slot_by_event', {}), s.state())
+    s.set_clock(D(2026, 6, 10, 8, 9, 56))
+    check('runs at the new time', s.wait(lambda: len(s.selects()) == 2, 30, 'second'),
+          len(s.selects()))
+    s.wait(lambda: s.stop_reason == 'succeeded' and s.status == 'Ready', 120, 'done')
+    time.sleep(8)
+    check('once', len(s.selects()) == 2, len(s.selects()))
     return s
 
 

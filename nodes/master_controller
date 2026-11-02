@@ -20,6 +20,9 @@ and this node reacts to them:
   - interrupted:temp           -> sleep temp_sleep_duration_h, then resume
   - interrupted:temp_spike     -> stay awake temp_spike_wait_min, then resume
   - interrupted:temp_sensor    -> report it, no resume: the blade has no protection
+  - interrupted:mower_power_off -> report it, no resume: a person cut that power
+  - interrupted:mower_link     -> report it, stay awake mower_link_wait_min, then resume;
+                                  a silent MCU in the dock gets a hardware reset first
   - rejected:rain|recent_rain|forecast (at scheduled start)
                                -> treat like weather interrupt (keep & retry)
   - rejected:battery           -> charge sleep, then resume
@@ -73,7 +76,7 @@ _PKG_SRC = os.path.join(os.path.dirname(os.path.dirname(
     os.path.realpath(__file__))), 'src')
 if _PKG_SRC not in sys.path:
     sys.path.insert(0, _PKG_SRC)
-from node_planner import autonomy, sleep_manager  # noqa: E402
+from node_planner import autonomy, hw_reset, sleep_manager  # noqa: E402
 try:
     # The rule the mission decides with, so the page cannot say otherwise.
     from mower_unit_smach import rain_rule  # noqa: E402
@@ -397,6 +400,8 @@ class MasterController(object):
             '~temp_sleep_duration_h', 1.0) * 3600.0
         self.temp_spike_wait_s = rospy.get_param(
             '~temp_spike_wait_min', 5.0) * 60.0
+        self.mower_link_wait_s = rospy.get_param(
+            '~mower_link_wait_min', 10.0) * 60.0
         self.critical_sleep_duration_s = rospy.get_param(
             '~critical_error_sleep_duration_h', 0.5) * 3600.0
         self.terminal_short_wait_s = rospy.get_param(
@@ -444,6 +449,20 @@ class MasterController(object):
         self.sleep_after_run = True
         # A sleep over ignored logins is announced this long (0 = not at all).
         self.sleep_countdown_s = rospy.get_param('~sleep_countdown_s', 60.0)
+        # Hardware reset: node_planner/hw_reset.py, _tick_hw_reset.
+        self.auto_hw_reset = rospy.get_param('~auto_hw_reset', False)
+        self.hw_cfg = sleep_manager.SleepConfig(**vars(self.sleep_cfg))
+        self.hw_cfg.wait_before_standby_s = rospy.get_param('~hw_reset_wait_s', 20.0)
+        self.hw_cfg.final_grace_s = rospy.get_param('~hw_reset_final_grace_s', 5.0)
+        off_s = rospy.get_param('~hw_reset_off_s', 60.0)
+        # T <= W: the PM "wakes" a NUC that still has 19 V, see sleep_manager.
+        self.hw_reset_ms = int((self.hw_cfg.wait_before_standby_s
+                                + (off_s if off_s > 0 else 60.0)) * 1000)
+        self.hw_reset_countdown_s = rospy.get_param('~hw_reset_countdown_s', 60.0)
+        self.hw_reset_silent_s = rospy.get_param('~hw_reset_silent_s', 120.0)
+        self.hw_reset_max_day = rospy.get_param('~hw_reset_max_day', 2)
+        active_s = rospy.get_param('~hw_reset_tty_active_s', 600.0)
+        self.tty_active = lambda logins: sleep_manager.busy_ttys(logins, active_s)
         self.boot_id_file = rospy.get_param(
             '~boot_id_file', '/proc/sys/kernel/random/boot_id')
         sleep_cmd = rospy.get_param('~sleep_shutdown_cmd', os.path.join(
@@ -487,6 +506,8 @@ class MasterController(object):
         self.stop_reason = ""
         self.active_program_name = ""
         self.pm_status = None
+        self.mower_link = None      # last /mower/link
+        self.mower_link_t = 0.0
         self.pm_status_time = 0.0
         self.dock_program = None
         self.ui_clients = 0
@@ -511,6 +532,8 @@ class MasterController(object):
         self._sleep_reannounce = False
         self._announced = {}          # who has been told of this sleep
         self._pm_cancel_next = 0.0
+        self._hw_restore_next = 0.0
+        self._hw_restore_tries = 0
         self._sleep_cancel_req = False
         self._countdown = None        # a sleep that waits for its announcement
         self._countdown_last = None
@@ -638,6 +661,7 @@ class MasterController(object):
                          self.start_state_callback)
         rospy.Subscriber('/pm/power_status', Power_status,
                          self.power_callback)
+        rospy.Subscriber('/mower/link', String, self.mower_link_callback)
         rospy.Subscriber('/mower_smach/status', String,
                          self.smach_status_callback)
         rospy.Subscriber('/mower_smach/stop_reason', String,
@@ -865,6 +889,8 @@ class MasterController(object):
             self.sleep_enabled = self.settings['sleep_enabled']
         if 'sleep_after_run' in changed:
             self.sleep_after_run = self.settings['sleep_after_run']
+        if 'auto_hw_reset' in changed:
+            self.auto_hw_reset = self.settings['auto_hw_reset']
         if any(k in changed for k in self.WINDOW_KEYS):
             start = autonomy.parse_hhmm(self.settings['window_start'])
             end = autonomy.parse_hhmm(self.settings['window_end'])
@@ -1110,6 +1136,11 @@ class MasterController(object):
         'run_rejected': ('error', 'run_failed', 'finished'),
         'run_expired': ('warn', 'run_failed', 'finished'),
         'run_event_removed': ('warn', None, 'finished'),
+        # The run waits, nothing has failed yet; only the last one wants a person.
+        'mower_link': ('error', 'mower_link', 'waited'),
+        'hw_reset': ('warn', 'mower_link', 'waited'),
+        'hw_reset_person': ('warn', 'mower_link', 'waited'),
+        'hw_reset_spent': ('error', 'hw_reset_spent', 'waited'),
         'sleep_failed': ('error', 'sleep_failed', 'slept'),
     }
 
@@ -1146,6 +1177,15 @@ class MasterController(object):
     def dock_callback(self, msg):
         with self.lock:
             self.is_in_dock = msg.data
+
+    def mower_link_callback(self, msg):
+        try:
+            link = json.loads(msg.data)
+        except ValueError:
+            return
+        with self.lock:
+            self.mower_link = link
+            self.mower_link_t = self._t()
 
     def programs_callback(self, msg):
         with self.lock:
@@ -1189,7 +1229,16 @@ class MasterController(object):
 
     def stop_reason_callback(self, msg):
         with self.lock:
+            new = msg.data != self.stop_reason
             self.stop_reason = msg.data
+            run = self.persistent.get('run')
+        # A Run by hand has no run here and _handle_program_end does not see it; the
+        # owner hears the same.  A latched old reason after a restart is not news.
+        link = {"interrupted:mower_link": 'mower_link',
+                "interrupted:mower_power_off": 'mower_power_off'}.get(msg.data)
+        if (link and new and run is None
+                and self._t() - self.node_start_time > self.MOWER_LINK_LATCH_S):
+            self._issue('mower_link', self.active_program_name.strip(), reason=link)
 
     def active_program_callback(self, msg):
         with self.lock:
@@ -1358,6 +1407,7 @@ class MasterController(object):
                           len(events) - len(valid))
         with self.lock:
             changed = valid != self.calendar
+            self._release_moved_slots(self.calendar, valid)
             self.calendar = valid
             self.persistent['calendar'] = valid
             # A slot that is added for a time already past is not "missed".
@@ -1369,6 +1419,32 @@ class MasterController(object):
         if changed:
             self._last_idle_eval = 0.0
             self._replan_sleep()
+
+    SCHEDULE_KEYS = ('start_time', 'days_of_week', 'recurrence', 'day_of_month', 'month',
+                     'start_date')
+
+    def _release_moved_slots(self, old, new):
+        """An event moved in time is a new slot, under the same id.  The marks are
+        per date: a run at 21:30 today would use up the event's new 22:30 today and
+        the robot would sleep to next week.  Only the next slot of a moved event is
+        released, and only when that slot lies ahead: nothing past comes back.
+        Under self.lock."""
+        before = {ev.get('id'): ev for ev in old}
+        now = self._now()
+        for ev in new:
+            was = before.get(ev.get('id'))
+            if was is None or all(was.get(k) == ev.get(k) for k in self.SCHEDULE_KEYS):
+                continue
+            slots = MowerScheduler.slots_between([ev], now, now + datetime.timedelta(days=8))
+            if not slots:
+                continue
+            day = slots[0][0].strftime("%Y-%m-%d")
+            for key in ('last_run_by_event', 'closed_slot_by_event'):
+                marks = self.persistent.setdefault(key, {})
+                if marks.get(ev['id']) == day:
+                    del marks[ev['id']]
+                    self.log("[Master] %s moved: slot of %s is free again."
+                             % (ev.get('program_name'), day))
 
     # =====================================================================
     # FSM helpers
@@ -1624,7 +1700,23 @@ class MasterController(object):
 
     MUX_PERSON = ('ds4', 'teleop', 'primitive')
     RUN_WAIT_KEY = {'weather': 'rain', 'battery': 'battery', 'temp': 'temperature',
-                    'temp_spike': 'temperature', 'gps': 'gnss'}
+                    'temp_spike': 'temperature', 'gps': 'gnss', 'mower_link': 'mower'}
+    MOWER_LINK_AGE_S = 5.0          # /mower/link comes at 1 Hz
+    MOWER_LINK_LATCH_S = 10.0
+
+    def _mower_check(self):
+        """/mower/link as (state, code, detail), None without it: an old node or none.
+        Silent is the very test the mission's PreStartCheck refuses a start on."""
+        with self.lock:
+            link = dict(self.mower_link or {})
+            age = self._t() - self.mower_link_t
+        if not link or age > self.MOWER_LINK_AGE_S:
+            return None
+        if link.get('state') == 'silent':
+            return 'block', 'silent', {'silent_s': link.get('silent_s')}
+        if link.get('state') == 'ok':
+            return 'ok', 'ok', {'status': link.get('status')}
+        return 'unknown', 'not_checked', {}
 
     def _next_target(self, now):
         """What would go next: the run, a pending slot or the next one."""
@@ -1707,8 +1799,24 @@ class MasterController(object):
         else:
             add('gnss', 'unknown', 'not_checked')   # the mission finds out at undock
 
+        mower = self._mower_check()
+        if run_wait == 'mower':
+            add('mower', 'wait', 'waiting_mower_link', left_s=wait_left)
+        elif mower is None:
+            add('mower', 'unknown', 'not_checked')
+        else:
+            add('mower', mower[0], mower[1], **mower[2])
+
+        with self.lock:
+            link = (self.mower_link or {}) if mower is not None and mower[0] == 'ok' else {}
+            temp = link.get('temp')
+            hot = link.get('status') == 'TEMP'
         if run_wait == 'temperature':
             add('temperature', 'wait', 'waiting_' + reason, left_s=wait_left)
+        elif hot:
+            add('temperature', 'block', 'temp', temp=temp)
+        elif temp is not None:
+            add('temperature', 'ok', 'ok', temp=temp)
         else:
             add('temperature', 'unknown', 'not_checked')    # the mission's to judge
 
@@ -1835,7 +1943,8 @@ class MasterController(object):
         """What it does now, as data; the UI writes the sentence."""
         cd = self._countdown
         if cd:
-            return {'code': 'sleep_countdown', 'vars': {'left_s': int(cd['left'])}}
+            code = 'hw_reset_countdown' if cd['source'] == 'hw_reset' else 'sleep_countdown'
+            return {'code': code, 'vars': {'left_s': int(cd['left'])}}
         return {'code': self._code, 'vars': dict(self._code_detail)}
 
     def _step(self):
@@ -1844,6 +1953,7 @@ class MasterController(object):
         self._expire_settings(self._now())
         self._tick_ignore_rain()
         self._tick_pm_cancel()
+        self._tick_hw_restore()
         self._tick_sleep_requests()
 
         # Switched off in another thread while this tick was on its way.
@@ -2181,6 +2291,9 @@ class MasterController(object):
         if (self._t() - self._last_idle_eval) < self.check_interval_s:
             return
         self._last_idle_eval = self._t()
+
+        if self._tick_hw_reset():
+            return
 
         now = self._now()
         with self.lock:
@@ -2642,6 +2755,11 @@ class MasterController(object):
             recovery = 'temp'
         elif stop_reason == "interrupted:temp_spike":
             recovery = 'temp_spike'
+        elif stop_reason == "interrupted:mower_link":
+            recovery = 'mower_link'
+            # The robot could not put it right.  Without a run: stop_reason_callback.
+            if run is not None:
+                self._issue('mower_link', program, reason='mower_link')
         elif stop_reason == "interrupted:window":
             recovery = 'window'
         elif stop_reason.startswith("critical:"):
@@ -2655,6 +2773,12 @@ class MasterController(object):
         if stop_reason == "interrupted:temp_sensor":
             self.log("[Master] Mower temperature sensor fault: run given up.")
             self._give_up(run, 'run_failed', reason='temp_sensor')
+            self._route_after_program(None, in_dock)
+            return
+
+        if stop_reason == "interrupted:mower_power_off":
+            self.log("[Master] A person took the mower's power away: no resume.")
+            self._give_up(run, 'run_failed', reason='mower_power_off')
             self._route_after_program(None, in_dock)
             return
 
@@ -2710,6 +2834,7 @@ class MasterController(object):
         return {'weather': self.weather_sleep_duration_s,
                 'temp': self.temp_sleep_duration_s,
                 'temp_spike': self.temp_spike_wait_s,
+                'mower_link': self.mower_link_wait_s,
                 'critical': self.critical_sleep_duration_s,
                 'gps': self.gps_retry_s}.get(reason, 0.0)
 
@@ -2866,7 +2991,7 @@ class MasterController(object):
         if self._sleep_cancel_req and not seq.past_return:
             self._sleep_cancel_req = False
             self._sleep_cancelled = True
-        if (not seq.past_return and self.sleep_countdown_s > 0
+        if (not seq.past_return and self._countdown_s(self._sleep_source) > 0
                 and not self._sleep_cancelled and self._sleep_new_people()):
             self._sleep_reannounce = True
         block = None if seq.past_return else (
@@ -2902,6 +3027,8 @@ class MasterController(object):
         if self._sleep_cancelled:
             self._sleep_cancelled = False
             self._sleep_hold_off('countdown_cancelled')
+            if self._sleep_source == 'hw_reset':
+                self._hw_reset_cancelled()
         elif reason not in ('disabled', 'hold', 'off_dock', 'window_changed',
                             'sleep_off', 'stay_awake'):
             self._sleep_hold_off(reason)
@@ -2955,6 +3082,7 @@ class MasterController(object):
         runs `who`: callback threads must not block."""
         source = source or self._sleep_source
         manual = source == 'manual'
+        repair = source == 'hw_reset'   # the robot's state and people count, sleep_off not
         items = []
 
         def add(key, state, code, block=None, **detail):
@@ -2967,11 +3095,11 @@ class MasterController(object):
             smach = self.smach_status
             ui = self.ui_clients
             manual_age = t - self._manual_t
-        ignoring = manual or not (self.sleep_check_logins and self.sleep_check_ui)
+        ignoring = manual or repair or not (self.sleep_check_logins and self.sleep_check_ui)
 
         if not manual and not self.automation_on:
             add('enabled', 'block', 'automation_off', 'disabled')
-        elif not manual and not self.sleep_enabled:
+        elif not manual and not repair and not self.sleep_enabled:
             add('enabled', 'block', 'sleep_off', 'sleep_off')
         else:
             add('enabled', 'ok', 'on')
@@ -3031,7 +3159,7 @@ class MasterController(object):
         for item in self._sleep_items(source):
             if item['block']:
                 return item['block']
-        return None
+        return self._hw_reset_gate() if (source or self._sleep_source) == 'hw_reset' else None
 
     def _pm_status(self):
         with self.lock:
@@ -3154,19 +3282,25 @@ class MasterController(object):
             return False
         return self._sleep_go(mode, sleep_ms, source)
 
+    def _countdown_s(self, source):
+        """A hardware reset is announced to anybody, whatever a sleep is set to."""
+        if source == 'hw_reset':
+            return max(self.sleep_countdown_s, self.hw_reset_countdown_s)
+        return self.sleep_countdown_s
+
     def _start_countdown(self, mode, sleep_ms, who, source):
-        self._countdown = {'left': float(self.sleep_countdown_s), 'mode': mode,
+        left = self._countdown_s(source)
+        self._countdown = {'left': float(left), 'mode': mode,
                            'ms': sleep_ms, 'source': source, 'who': who}
         self._sleep_cancel_req = False
         self._sleep_source = source
         self._set_sleep_block('countdown')
-        self.log("[Master] Sleep in %.0f s, with %s connected."
-                 % (self.sleep_countdown_s, who))
+        self.log("[Master] Sleep in %.0f s, with %s connected." % (left, who))
         self._publish_countdown()
         if [x for x in who.get('ssh', []) if x != 'unknown']:
-            self._wall("Vitulus: power off for sleep in %.0f s. Cancel: Autonomy page, or "
+            self._wall("Vitulus: power off for %s in %.0f s. Cancel: Autonomy page, or "
                        "rostopic pub -1 /scheduler/sleep_cancel std_msgs/Bool true"
-                       % self.sleep_countdown_s)
+                       % ('a hardware reset' if source == 'hw_reset' else 'sleep', left))
 
     def _wall(self, text):
         """Tell the terminals. Never blocks, and never from a test on this machine:
@@ -3198,7 +3332,13 @@ class MasterController(object):
         self._sleep_replan = False
         self._sleep_cancelled = False
         self._sleep_source = source
-        self.log("[Master] Sleep (%s, %.0f min)." % (mode, sleep_ms / 60000.0))
+        hw = source == 'hw_reset'
+        if hw:
+            self._hw_reset_spend()
+        else:
+            with self.lock:
+                self.persistent.pop('hw_reset_pm', None)    # its own W and T go in now
+        self.log("[Master] Sleep (%s, %.1f min)." % (mode, sleep_ms / 60000.0))
         self._journal('slept', mode, ms=int(sleep_ms), by=source)
         with self.lock:
             self.persistent['sleep_intent'] = {
@@ -3207,7 +3347,7 @@ class MasterController(object):
                 'started': self._t(),
                 'planned_wake': self._t() + sleep_ms / 1000.0}
             self._save_state()
-        self.sleep_seq.start(mode, sleep_ms)
+        self.sleep_seq.start(mode, sleep_ms, self.hw_cfg if hw else None)
         self._transition(self.STATE_PREPARE_SLEEP)
         return True
 
@@ -3238,7 +3378,7 @@ class MasterController(object):
         if seq.past_return:
             self._send_countdown({'active': False})
             return
-        wait = self.sleep_cfg.wait_before_standby_s
+        wait = seq.run_cfg.wait_before_standby_s
         if seq.state in (sleep_manager.FINAL, sleep_manager.WAIT_CUT):
             wait += seq.armed_at - self._t()
         self._send_countdown(self._countdown_data(
@@ -3273,6 +3413,8 @@ class MasterController(object):
                 self._end_countdown('countdown_cancelled')
                 self._sleep_hold_off('countdown_cancelled')
                 self._last_idle_eval = 0.0
+                if cd['source'] == 'hw_reset':
+                    self._hw_reset_cancelled()
             elif block:
                 self._end_countdown(block)
             else:
@@ -3281,7 +3423,8 @@ class MasterController(object):
                     self._publish_countdown()
                 else:
                     ms = cd['ms']
-                    if cd['mode'] == sleep_manager.MODE_TIMED:   # the wake stays put
+                    if (cd['mode'] == sleep_manager.MODE_TIMED    # the wake stays put
+                            and cd['source'] != 'hw_reset'):
                         ms = max(ms - int(self.sleep_countdown_s * 1000), ms // 2)
                     self._countdown = None
                     self._publish_countdown()
@@ -3316,6 +3459,119 @@ class MasterController(object):
             self._command_result('sleep_now', True, 'countdown')
         else:
             self._command_result('sleep_now', False, self.sleep_block)
+
+    # =====================================================================
+    # hardware reset: the mower MCU hangs, only the 19 V rail cures it
+    # =====================================================================
+    def _hw_reset_wanted(self):
+        """The run that waits for a mower which is silent, or None."""
+        with self.lock:
+            link = self.mower_link
+            age = self._t() - self.mower_link_t
+        if age > self.MOWER_LINK_AGE_S:
+            return None         # no node: that is no hung MCU
+        run = self._run()
+        return run if hw_reset.wanted(run, link, self.hw_reset_silent_s) else None
+
+    def _hw_reset_gate(self):
+        """What only a hardware reset asks, over _sleep_gate.  The flag is the sequence's
+        own while it runs; before that it is somebody's raw sleep."""
+        st, age = self._pm_status()
+        if st is None or age > self.sleep_cfg.stale_s:
+            return 'pm_no_status'
+        if st.supply_status != 'ONLINE':
+            return 'no_charger'
+        if not self.sleep_seq.active and self._pm_armed():
+            return 'pm_armed'
+        if self.persistent.get('pm_cancel_pending'):
+            return 'pm_cancel_pending'
+        if self._hw_reset_wanted() is None:
+            return 'link_back'
+        # Ignored or not, nobody debugging on a live terminal is ever cut.
+        busy = self.tty_active(self._logins())
+        return 'login:%s' % ','.join(busy) if busy else None
+
+    def _tick_hw_reset(self):
+        """From IDLE, past the boot grace, in the dock.  True: IDLE starts nothing now.
+
+        A person here who is not ignored (sleep_ignore_ssh, sleep_ignore_ui) stops the
+        cut: told once, asked again every evaluation.  Off the dock the gate says no,
+        and the sequence asks it too up to the last moment."""
+        if self._countdown:
+            return self._countdown['source'] == 'hw_reset'
+        run = self._hw_reset_wanted()
+        if run is None or not self.auto_hw_reset:
+            return False
+        program = run.get('program', '')
+        with self.lock:
+            times = list(self.persistent.get('hw_resets') or [])
+        limit = hw_reset.spent(run, times, self._t(), self.hw_reset_max_day)
+        if limit:
+            self._hw_reset_tell(run, 'hw_reset_spent', program, limit=limit)
+            return False
+        block = self._sleep_gate('hw_reset')
+        if block:
+            if block.startswith(('login:', 'ui:')):
+                self._hw_reset_tell(run, 'hw_reset_person', program, who=block)
+            return False
+        self._hw_reset_tell(run, 'hw_reset', program,
+                            left_s=int(self._countdown_s('hw_reset')))
+        self._start_countdown(sleep_manager.MODE_TIMED, self.hw_reset_ms,
+                              self._ignored_people('hw_reset'), 'hw_reset')
+        return True
+
+    def _hw_reset_tell(self, run, code, program, **detail):
+        if run.get('hw_reset_told') != code:
+            self._update_run(hw_reset_told=code)
+            self._issue(code, program, **detail)
+
+    def _hw_reset_spend(self):
+        """Before the arm: the power is gone a few seconds later, and an attempt that
+        fails counts as well.  No loop whatever happens."""
+        if (self._run() or {}).get('hw_reset'):
+            return              # announced anew for a person who just came
+        st, _ = self._pm_status()
+        self._update_run(hw_reset=True)
+        with self.lock:
+            self.persistent['hw_resets'] = hw_reset.recent(
+                self.persistent.get('hw_resets'), self._t()) + [self._t()]
+            self.persistent.setdefault('hw_reset_pm', {
+                'w': int(st.sleep_wait_standby), 't': int(st.sleep_time_interval)})
+            self._save_state()
+
+    def _hw_reset_cancelled(self):
+        """A person said no: not asked again for this run, and not counted."""
+        run = self._run() or {}
+        if run.get('hw_reset') is True:         # already in the sequence
+            with self.lock:
+                self.persistent['hw_resets'] = (self.persistent.get('hw_resets') or [])[:-1]
+        self._update_run(hw_reset='cancelled', hw_reset_told='hw_reset_spent')
+        self._journal('waited', 'hw_reset_cancelled', run.get('program', ''))
+
+    def _tick_hw_restore(self):
+        """W and T stay in the PM's EEPROM: back they go, or a raw sleep from Settings
+        would cut a running system after 20 s.  Bounded; the master's own sleep writes
+        its values anyway."""
+        rec = self.persistent.get('hw_reset_pm')
+        if not rec or self.sleep_seq.active or self.state == self.STATE_PREPARE_SLEEP:
+            return
+        st, age = self._pm_status()
+        if st is None or age > self.sleep_cfg.stale_s or self._pm_armed():
+            return
+        back = st.sleep_wait_standby == rec['w'] and st.sleep_time_interval == rec['t']
+        if back or self._hw_restore_tries >= self.sleep_cfg.max_tries:
+            self._hw_restore_tries = 0
+            with self.lock:
+                self.persistent.pop('hw_reset_pm', None)
+                self._save_state()
+            if not back:
+                rospy.logwarn("[Master] PM keeps W and T of the hardware reset.")
+            return
+        if self._t() >= self._hw_restore_next:
+            self._hw_restore_next = self._t() + self.sleep_cfg.retry_s
+            self._hw_restore_tries += 1
+            self.send_wait(rec['w'])
+            self.send_time(rec['t'])
 
     def _clear_sleep_intent(self):
         with self.lock:
@@ -3405,6 +3661,7 @@ class MasterController(object):
             if intent.get('planned_wake') else None)
         cd = self._countdown
         report['countdown'] = int(cd['left']) if cd else None
+        report['source'] = self._sleep_source
         return report
 
 

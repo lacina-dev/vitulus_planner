@@ -18,6 +18,7 @@ import tempfile
 import time
 import types
 import unittest
+from unittest import mock
 
 import yaml
 
@@ -137,7 +138,7 @@ class Base(unittest.TestCase):
         with open(mc.boot_id_file, 'w') as f:
             f.write('boot-1')
         self.starts = []
-        mc.sleep_seq.start = lambda mode, ms: self.starts.append((mode, ms))
+        mc.sleep_seq.start = lambda mode, ms, cfg=None: self.starts.append((mode, ms))
         self.logins = []
         mc._logins = lambda: list(self.logins)
         mc._wall = lambda text: None
@@ -199,7 +200,7 @@ class Defaults(Base):
             'idle_sleep_threshold_min': 20.0, 'wake_before_min': 12.0,
             'sleep_after_run': True, 'stay_awake_until': None, 'temp_wait_h': 1.0,
             'temp_spike_wait_min': 5.0, 'error_retry_max': 3, 'resume_max': 12,
-            'run_max_age_h': 48.0, 'off_dock_wait_min': 20.0}
+            'run_max_age_h': 48.0, 'off_dock_wait_min': 20.0, 'auto_hw_reset': False}
         self.assertEqual(v, today)
         self.assertEqual(set(v), set(A.BY_KEY))
         self.assertEqual(self.mc.wake_lead_s,
@@ -428,7 +429,7 @@ class Checks(Base):
     def test_keys(self):
         self.assertEqual([c['key'] for c in self.report()['checks']],
                          ['automation', 'hold', 'dock', 'mission', 'battery', 'rain',
-                          'gnss', 'temperature', 'window', 'programs', 'map'])
+                          'gnss', 'mower', 'temperature', 'window', 'programs', 'map'])
 
     def test_automation_hold_dock(self):
         self.assertEqual(self.check('automation')['state'], 'off')
@@ -770,6 +771,83 @@ class SleepGates(Base):
         mc._route_after_program(None, True)
         mc._step()
         self.assertEqual(len(slept), 1)
+
+
+class HwReset(Base):
+    """node_planner/hw_reset.py in the master, on the fake robot."""
+
+    def setUp(self):
+        super().setUp()
+        self.on()
+        mc = self.mc
+        self.set(auto_hw_reset=True, sleep_ignore_ssh=True, sleep_ignore_ui=True)
+        mc.persistent['run'] = dict(mc._new_run({'id': 'e', 'program_name': 'Mow'}, None),
+                                    reason='mower_link', started=True, wait_until=mc._t() + 600)
+        mc.mower_link = {'state': 'silent', 'silent_s': 500.0}
+        mc.mower_link_t = mc._t()
+        mc.pm_status = type('P', (), dict(supply_status='ONLINE', sleep_status=False,
+                                          sleep_charged_status=False, sleep_wait_standby=180000,
+                                          sleep_time_interval=900000, battery_capacity=90,
+                                          charger_status='CHARGING'))()
+        mc.pm_status_time = mc._t()
+        mc.tty_active = lambda logins: []
+
+    def cd(self):
+        return lastj('/scheduler/sleep_countdown')
+
+    def test_h4_off_by_default(self):
+        self.assertIs(M.autonomy.defaults(lambda k, d=None: d)['auto_hw_reset'], False)
+
+    def test_announced_with_its_own_notify_code(self):
+        self.assertTrue(self.mc._tick_hw_reset())
+        self.assertEqual(self.cd()['reason'], 'hw_reset')
+        self.assertEqual(lastj('/scheduler/notify')['code'], 'mower_link')
+
+    def test_m6_only_spent_wants_a_person(self):
+        routes = self.mc.ISSUE_ROUTES
+        self.assertEqual(routes['hw_reset_spent'][1], 'hw_reset_spent')
+        for code in ('mower_link', 'hw_reset', 'hw_reset_person'):
+            self.assertEqual(routes[code][1], 'mower_link')
+
+    def test_h3_a_live_ignored_login_stops_the_cut(self):
+        self.logins = ['pts/1']
+        self.mc.tty_active = lambda logins: list(logins)
+        self.assertFalse(self.mc._tick_hw_reset())
+        self.assertFalse(self.cd()['active'])
+        self.assertEqual(self.mc.persistent['issues'][-1]['code'], 'hw_reset_person')
+
+    def test_h3_a_dead_ignored_login_does_not(self):
+        self.logins = ['pts/0']
+        self.assertTrue(self.mc._tick_hw_reset())
+
+    def test_h3_somebody_logs_in_during_the_countdown(self):
+        self.assertTrue(self.mc._tick_hw_reset())
+        self.logins = ['pts/1']
+        self.mc.tty_active = lambda logins: list(logins)
+        self.mc._tick_sleep_requests()
+        self.assertFalse(self.cd()['active'])
+        self.assertEqual(self.starts, [])
+
+    def test_low_off_s_never_under_w(self):
+        with mock.patch.dict(YAML, {'hw_reset_off_s': 0.0}):
+            mc = self.make()
+        self.assertGreater(mc.hw_reset_ms, mc.hw_cfg.wait_before_standby_s * 1000)
+
+    def _armed(self):
+        mc = self.mc
+        mc._sleep_go(M.sleep_manager.MODE_TIMED, mc.hw_reset_ms, 'hw_reset', {})
+        return mc
+
+    def test_low_a_second_go_counts_once(self):
+        mc = self._armed()
+        mc._sleep_go(M.sleep_manager.MODE_TIMED, mc.hw_reset_ms, 'hw_reset', {})
+        self.assertEqual(len(mc.persistent['hw_resets']), 1)
+
+    def test_low_a_cancel_in_the_sequence_does_not_count(self):
+        mc = self._armed()
+        mc._hw_reset_cancelled()
+        self.assertEqual(mc.persistent.get('hw_resets'), [])
+        self.assertEqual(mc._run()['hw_reset'], 'cancelled')
 
 
 class Countdown(Base):

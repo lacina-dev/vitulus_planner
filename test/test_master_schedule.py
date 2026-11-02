@@ -484,6 +484,67 @@ class Slots(Base):
         self.assertEqual(nd, D(2026, 7, 9, 8, 0))
 
 
+class MovedEvent(Base):
+    """1. 11. 2026: Bigger ran at 21:30, the owner moved it to a later time the
+    same evening, and the robot slept to next Sunday."""
+
+    def setUp(self):
+        Base.setUp(self)
+        self.on()
+        self.at(2026, 6, 10, 10, 40, 0)
+        self.mc.calendar = [daily('10:30')]
+        self.mc.persistent['last_run_by_event'] = {'ev1': '2026-06-10'}
+        self.mc.persistent['closed_slot_by_event'] = {'ev1': '2026-06-10'}
+        self.mc.persistent['scan_from'] = '2026-06-10T10:40:00'
+
+    def send(self, *events):
+        self.mc.set_calendar_callback(String(json.dumps(list(events))))
+
+    def marks(self):
+        return (self.mc.persistent['last_run_by_event'].get('ev1'),
+                self.mc.persistent['closed_slot_by_event'].get('ev1'))
+
+    def test_moved_later_today_runs_today(self):
+        self.send(daily('11:30'))
+        self.assertEqual(self.marks(), (None, None))
+        slot, ev = self.mc._next_slot(self.clock[0])
+        self.assertEqual(slot, D(2026, 6, 10, 11, 30))
+        self.at(2026, 6, 10, 11, 30, 5)
+        self.tick()
+        self.assertEqual(self.starts(), ['Mow'])
+
+    def test_moved_into_the_past_keeps_the_marks(self):
+        self.send(daily('09:00'))
+        self.assertEqual(self.marks(), ('2026-06-10', '2026-06-10'))
+        self.assertEqual(self.mc._next_slot(self.clock[0])[0], D(2026, 6, 11, 9, 0))
+
+    def test_same_time_keeps_the_marks(self):
+        self.send(dict(daily('10:30'), program_name='Other'))
+        self.assertEqual(self.marks(), ('2026-06-10', '2026-06-10'))
+
+    def test_today_added_to_the_days_frees_today(self):
+        wed = dict(daily('12:00'), recurrence='weekly', days_of_week=[3])
+        self.mc.calendar = [wed]
+        self.send(dict(wed, days_of_week=[3, 2]))     # 2026-06-10 is a Wednesday
+        self.assertEqual(self.marks(), (None, None))
+
+    def test_a_moved_slot_runs_once(self):
+        self.send(daily('11:30'))
+        self.at(2026, 6, 10, 11, 30, 5)
+        self.tick()
+        self.assertEqual(len(self.starts()), 1)
+        self.send(daily('11:30'))                     # the same again changes nothing
+        self.tick(3)
+        self.assertEqual(len(self.starts()), 1)
+
+    def test_other_events_stay(self):
+        other = daily('11:00', 'ev2')
+        self.mc.calendar.append(other)
+        self.mc.persistent['closed_slot_by_event']['ev2'] = '2026-06-10'
+        self.send(daily('11:30'), other)
+        self.assertEqual(self.mc.persistent['closed_slot_by_event']['ev2'], '2026-06-10')
+
+
 class Dst(unittest.TestCase):
     def test_real_seconds_over_both_changes(self):
         self.assertEqual(S.real_seconds(D(2027, 3, 27, 21, 30), D(2027, 3, 28, 7, 0)),
@@ -659,6 +720,91 @@ class Runs(Base):
         self.assertEqual(mc.persistent['issues'][-1]['code'], 'run_failed')
         self.assertEqual(mc.persistent['issues'][-1]['detail']['reason'], 'temp_sensor')
         self.assertFalse(mc.persistent.get('run'))
+
+    def test_mower_link_reports_and_resumes_soon_and_awake(self):
+        mc = self.mc
+        self.end('interrupted:mower_link')
+        run = mc.persistent['run']
+        self.assertEqual(run['reason'], 'mower_link')
+        self.assertAlmostEqual(run['wait_until'] - mc._t(), mc.mower_link_wait_s, delta=2.0)
+        self.assertEqual(mc.persistent['issues'][-1]['code'], 'mower_link')
+        note = json.loads(published('/scheduler/notify')[-1])
+        self.assertEqual(note['code'], 'mower_link')
+        self.assertEqual(note['vars']['issue'], 'mower_link')
+        self.tick()
+        self.assertEqual(self.sleeps, [])
+        self.assertEqual(self.resumes(), [])
+        run['wait_until'] = 0
+        self.tick()
+        self.assertEqual(self.resumes(), ['Mow'])
+
+    def test_mower_link_by_hand_is_reported_once_without_a_run(self):
+        mc = self.mc
+        mc.persistent['run'] = None
+        mc.node_start_time = mc._t() - 60.0
+        mc.stop_reason_callback(String('interrupted:mower_link'))
+        mc.stop_reason_callback(String('interrupted:mower_link'))
+        self.assertEqual([i['code'] for i in mc.persistent['issues']], ['mower_link'])
+
+    def test_a_latched_old_reason_is_not_news(self):
+        mc = self.mc
+        mc.persistent['run'] = None
+        mc.node_start_time = mc._t()
+        mc.stop_reason_callback(String('interrupted:mower_link'))
+        self.assertFalse(mc.persistent.get('issues'))
+
+    def test_a_persons_power_off_is_not_undone(self):
+        mc = self.mc
+        self.end('interrupted:mower_power_off')
+        self.assertFalse(mc.persistent.get('run'))
+        issue = mc.persistent['issues'][-1]
+        self.assertEqual((issue['code'], issue['detail']['reason']),
+                         ('run_failed', 'mower_power_off'))
+        note = json.loads(published('/scheduler/notify')[-1])
+        self.assertEqual(note['code'], 'run_failed')
+        self.at(2026, 6, 10, 9, 0, 0)
+        self.tick(3)
+        self.assertEqual(self.resumes(), [])
+
+    def test_a_persons_power_off_by_hand_is_told_too(self):
+        mc = self.mc
+        mc.persistent['run'] = None
+        mc.node_start_time = mc._t() - 60.0
+        mc.stop_reason_callback(String('interrupted:mower_power_off'))
+        self.assertEqual(mc.persistent['issues'][-1]['detail']['reason'], 'mower_power_off')
+
+    def test_mower_link_is_capped(self):
+        mc = self.mc
+        mc.no_progress_max = 3
+        for _ in range(3):
+            self.assertTrue(self._interrupt('interrupted:mower_link', 'failed: on_path-Z-1-0'))
+        self.assertFalse(self._interrupt('interrupted:mower_link', 'failed: on_path-Z-1-0'))
+        self.assertEqual(mc.persistent['issues'][-1]['code'], 'run_no_progress')
+
+    def test_board_silent_at_resume_is_refused_and_capped(self):
+        mc = self.mc
+        self.end('rejected:mower_link')
+        self.assertEqual(mc.persistent['run']['reject'], 'mower_link')
+        self.assertEqual(mc.persistent['run']['rejects'], 1)
+
+    def _checks(self):
+        mc = self.mc
+        return {c['key']: c for c in mc._start_checks(mc._now())}
+
+    def test_report_says_the_board_is_silent(self):
+        mc = self.mc
+        self.assertEqual(self._checks()['mower']['code'], 'not_checked')    # no /mower/link
+        mc.mower_link_callback(String(json.dumps({'state': 'ok', 'status': 'OFF', 'temp': 12.0})))
+        checks = self._checks()
+        self.assertEqual(checks['mower']['state'], 'ok')
+        self.assertEqual((checks['temperature']['state'], checks['temperature']['vars']['temp']),
+                         ('ok', 12.0))
+        mc.mower_link_callback(String(json.dumps({'state': 'silent', 'silent_s': 340.0})))
+        checks = self._checks()
+        self.assertEqual((checks['mower']['state'], checks['mower']['code']), ('block', 'silent'))
+        self.assertEqual(checks['temperature']['state'], 'unknown')
+        self.at(2026, 6, 10, 9, 0, 0)                # the node died: says nothing any more
+        self.assertEqual(self._checks()['mower']['code'], 'not_checked')
 
     def test_new_event_waits_for_the_unfinished_run(self):
         mc = self.mc

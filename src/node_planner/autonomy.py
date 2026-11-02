@@ -77,6 +77,9 @@ FIELDS = [
        'h', True),
     _f('temp_spike_wait_min', 'float', 'recovery', 'temp_spike_wait_min', 5.0, 1, 120,
        'min', True),
+    # Off by default: a reset whose boot fails leaves a robot off with nobody near,
+    # and on a robot with sleep off nothing has ever proved the boot.  On per robot.
+    _f('auto_hw_reset', 'bool', 'recovery', 'auto_hw_reset', False),
     _f('error_retry_max', 'int', 'recovery', 'critical_retry_max', 3, 1, 10, '', True),
     _f('resume_max', 'int', 'recovery', 'resume_max_attempts', 12, 1, 50, '', True),
     _f('run_max_age_h', 'float', 'recovery', 'run_max_age_h', 48.0, 1, 168, 'h', True),

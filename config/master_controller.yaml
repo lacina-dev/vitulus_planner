@@ -105,6 +105,17 @@ temp_sleep_duration_h: 1.0
 # Temperature sensor spikes sent the mission home (temp_watch.py). The motor is
 # cold: no sleep, resume after this many minutes.
 temp_spike_wait_min: 5.0
+mower_link_wait_min: 10.0    # interrupted:mower_link: stays awake this long, then resume (capped as any resume)
+# Hardware reset of a silent mower board, in the dock on the charger: node_planner/hw_reset.py.
+# The setting auto_hw_reset (Autonomy) switches it.  W = hw_reset_wait_s, T = W + hw_reset_off_s.
+auto_hw_reset: false
+hw_reset_wait_s: 20.0
+hw_reset_off_s: 60.0
+hw_reset_final_grace_s: 5.0   # from the armed PM to the OS stop, must stay under W
+hw_reset_countdown_s: 60.0    # announced at least this long, to anybody
+hw_reset_silent_s: 120.0      # /mower/link silent this long
+hw_reset_max_day: 2           # in 24 h, and one per run
+hw_reset_tty_active_s: 600.0  # an ignored terminal used this recently still stops the cut
 critical_error_sleep_duration_h: 0.5
 
 # Terminal error of a run in the dock (undock failed): wait this long (minutes),
