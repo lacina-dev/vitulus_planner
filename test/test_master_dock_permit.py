@@ -10,7 +10,10 @@ jaký uzel publikuje, skutečnému modulu `node_planner.dock_permit` a měří s
 * K1: povolení se čte jen před výjezdem; sečení venku nic nezastaví;
 * homeward (D38): konec okna s robotem venku → dosekat cestu (max deadline),
   pak domů; běh zůstane přerušený a naváže až s novým povolením; nové okno
-  homeward zruší; Q2 jedním parametrem (`dock_permit_homeward`).
+  homeward zruší; Q2 jedním parametrem (`dock_permit_homeward`);
+* Q1: běh rady agenta před výjezdem pošle uzlu značku `/dock_permit/exit_intent`
+  a vyjede až po jejím potvrzení; kalendář značku neposílá.  Uzel tu není:
+  potvrzení dává harness (`intent_ack`), tak jak by odpověděl uzel.
 
 No ROS master: rospy is stubbed, the clock is the test's.  Nothing here can
 start a mower: the publishers only record.
@@ -102,16 +105,20 @@ DRY = {'hours_since_rain': 30.0, 'rain_last_h': False, 'temp_now': 18.0,
        'stale': {'forecast': False, 'radar': False}}
 
 
-def state(allowed=True, why=None, homeward=None, stamp=None, by='owner'):
-    """/dock_permit/state, jak ho publikuje uzel (kontrakt §4)."""
+def state(allowed=True, why=None, homeward=None, stamp=None, by='owner', q1=True):
+    """/dock_permit/state, jak ho publikuje uzel (kontrakt §4); q1=False =
+    uzel z etapy 1 (bez klíče exit_intent, značku neumí)."""
     now = time.time() if stamp is None else stamp
-    return json.dumps({
+    doc = {
         'v': 1, 'stamp': now, 'allowed': allowed,
         'why': why or ('open' if allowed else 'locked'),
         'active': ({'id': 'p1-1', 'by': by, 'from': now - 60, 'to': now + 3600,
                     'max_exits': None, 'exits': 0, 'exits_left': None}
                    if allowed else None),
-        'homeward': homeward, 'dock': 'in', 'clock_ok': True, 'enforced_by': []})
+        'homeward': homeward, 'dock': 'in', 'clock_ok': True, 'enforced_by': []}
+    if q1:
+        doc.update(exit_intent=None, trip=None)
+    return json.dumps(doc)
 
 
 def hw(since=None, chunk=300.0):
@@ -129,10 +136,25 @@ class Base(unittest.TestCase):
         owners()
         self.clock = [D(2026, 6, 10, 9, 0, 0)]
         self.wx = dict(DRY)
+        self.intent_ack = True              # the node confirms exit intents
         self.mc = self.make()
+
+    def _intent(self, text):
+        """The master's /dock_permit/exit_intent publisher: recorded, and
+        answered on /dock_permit/result like the node does (Q1)."""
+        EVENTS.append((P.INTENT_TOPIC, String(text)))
+        if self.intent_ack is not None:
+            P.INTENT.on_result(json.dumps({
+                'cmd': 'exit_intent', 'ok': self.intent_ack,
+                'code': 'noted' if self.intent_ack else 'invalid',
+                'req_id': json.loads(text)['req_id']}))
+
+    def intents(self):
+        return [json.loads(x) for x in published(P.INTENT_TOPIC)]
 
     def make(self):
         mc = M.MasterController()
+        P.INTENT.setup(self._intent)
         mc._now = lambda: self.clock[0]
         mc._t = lambda: time.mktime(self.clock[0].timetuple())
         mc.boot_grace_period_s = 0
@@ -530,6 +552,223 @@ class Homeward(Base):
         self.tick(3)
         self.assertEqual(self.mc._code, 'waiting_dock')
         self.assertEqual(self.resumes(), [])
+
+
+
+class ExitIntent(Base):
+    """Q1 (owner 8. 11.): only the agent's exits count against the permit.
+    An advice run says so to the node before it leaves; the calendar not."""
+
+    def test_advice_run_sends_the_intent_before_the_start(self):
+        self.agent()
+        self.permit(True)
+        self.advise(id='a7')
+        self.tick()
+        self.assertEqual(self.starts(), ['Mow'])
+        got = self.intents()
+        self.assertEqual(len(got), 1)
+        self.assertEqual((got[0]['by'], got[0]['ttl_s']), ('master', P.INTENT_TTL_S))
+        self.assertIn('a7', got[0]['reason'])
+        self.assertTrue(got[0]['req_id'].startswith('master-'))
+        order = [t for t, _m in EVENTS if t in (P.INTENT_TOPIC, '/web_plan/program_select')]
+        self.assertEqual(order, [P.INTENT_TOPIC, '/web_plan/program_select'])
+
+    def test_calendar_run_sends_no_intent(self):
+        self.at(2026, 6, 10, 8, 0)
+        self.agent()
+        self.permit(True)
+        self.mc.calendar = [daily('09:00')]
+        self.at(2026, 6, 10, 9, 0, 30)
+        self.tick()
+        self.assertEqual(self.starts(), ['Mow'])
+        self.assertEqual(self.intents(), [])
+
+    def test_unconfirmed_intent_ends_the_advice_run(self):
+        """No answer from the node (or a refusal): the run does not leave and
+        the FSM is not blocked; after INTENT_MAX_FAILS attempts the advice run
+        ends (dock:intent_timeout), so the calendar may stand in."""
+        P.INTENT_WAIT_S, old = 0.0, P.INTENT_WAIT_S
+        try:
+            self.intent_ack = None                # the node does not answer
+            self.agent()
+            self.permit(True)
+            self.advise(id='a9')
+            t0 = time.monotonic()
+            self.tick()
+            self.assertLess(time.monotonic() - t0, 1.0)      # nothing waits
+            self.assertEqual(self.starts(), [])
+            self.assertEqual(self.mc._code, 'intent_wait')
+            self.assertIsNotNone(self.mc._run())
+            self.intent_ack = False               # a refusal counts too
+            self.tick()
+            self.intent_ack = None
+            self.tick(4)
+            self.assertEqual(self.starts(), [])
+            self.assertIsNone(self.mc._run())                # the run ended
+            self.assertEqual(len(self.intents()), P.INTENT_MAX_FAILS)
+            self.assertIn(('skipped', 'intent_timeout', 'Mow'), self.journal())
+            self.assertIn(('advice', 'dropped', 'Mow'), self.journal('advice'))
+        finally:
+            P.INTENT_WAIT_S = old
+
+    def test_late_answer_is_read_in_the_next_step(self):
+        """The answer arrives after the step: read in the next one, then go."""
+        sent = []
+        self.agent()
+        self.permit(True)
+        self.advise()
+        P.INTENT.setup(lambda text: sent.append(json.loads(text)))
+        self.tick()
+        self.assertEqual((self.starts(), len(sent)), ([], 1))
+        P.INTENT.on_result(json.dumps({'cmd': 'exit_intent', 'ok': True, 'code': 'noted',
+                                       'req_id': sent[0]['req_id']}))
+        self.tick()
+        self.assertEqual(self.starts(), ['Mow'])
+        self.assertEqual(len(sent), 1)
+
+    def test_answer_read_in_the_next_tick_despite_check_interval(self):
+        """check_interval_s 60: after intent_wait the next FSM tick looks at
+        the answer (the confirmed intent must not age towards INTENT_USE_S)."""
+        sent = []
+        self.agent()
+        self.mc.check_interval_s = 60.0
+        self.permit(True)
+        self.advise()
+        P.INTENT.setup(lambda text: sent.append(json.loads(text)))
+        self.tick()
+        self.assertEqual((self.starts(), len(sent), self.mc._code), ([], 1, 'intent_wait'))
+        P.INTENT.on_result(json.dumps({'cmd': 'exit_intent', 'ok': True, 'code': 'noted',
+                                       'req_id': sent[0]['req_id']}))
+        self.tick()                                   # the same test second
+        self.assertEqual(self.starts(), ['Mow'])
+
+    def test_interruption_between_request_and_answer_is_not_a_failure(self):
+        sent = []
+        self.agent()
+        self.permit(True)
+        self.advise()
+        P.INTENT.setup(lambda text: sent.append(json.loads(text)))
+        self.tick()
+        for _ in range(P.INTENT_MAX_FAILS + 2):
+            # e.g. STOP / end of the window held the run: the next look comes late
+            self.mc._intent_try['sent'] -= P.INTENT_ANSWER_S + 50
+            P.INTENT.on_result(json.dumps({'cmd': 'exit_intent', 'ok': True,
+                                           'code': 'noted', 'req_id': sent[-1]['req_id']})
+                               if len(sent) % 2 else '{}')     # stale answer / none
+            self.tick()
+        self.assertIsNotNone(self.mc._run())          # not dropped
+        self.assertEqual(self.mc._intent_try['fails'], 0)
+        self.assertEqual(len(sent), P.INTENT_MAX_FAILS + 3)   # sent again each time
+        P.INTENT.on_result(json.dumps({'cmd': 'exit_intent', 'ok': True, 'code': 'noted',
+                                       'req_id': sent[-1]['req_id']}))
+        self.tick()
+        self.assertEqual(self.starts(), ['Mow'])
+
+    def _mono_clock(self):
+        t = [1000.0]
+        self.mc._mono = lambda: t[0]
+        return t
+
+    def test_node_respawn_does_not_drop_the_advice(self):
+        """The node respawns (~8 s silent): the advice survives; a node
+        silent for good drops it after ~25-30 s, not after a few seconds."""
+        t = self._mono_clock()
+        self.intent_ack = None                     # respawning: nobody answers
+        self.agent()
+        self.permit(True)
+        self.advise()
+        for _ in range(8):                         # 1 Hz ticks
+            self.tick()
+            t[0] += 1.0
+        self.assertIsNotNone(self.mc._run())
+        self.intent_ack = True                     # back
+        self.tick()
+        self.tick()
+        self.assertEqual(self.starts(), ['Mow'])
+
+    def test_silent_node_drops_after_25_to_30_s(self):
+        t = self._mono_clock()
+        self.intent_ack = None
+        self.agent()
+        self.permit(True)
+        self.advise()
+        start, dropped = t[0], None
+        for _ in range(60):
+            self.tick()
+            if self.mc._run() is None:
+                dropped = t[0] - start
+                break
+            t[0] += 1.0
+        self.assertIsNotNone(dropped)
+        self.assertTrue(24.0 <= dropped <= 30.0, dropped)
+
+    def test_absolute_cap_even_when_every_look_is_late(self):
+        """Interruptions do not count, but 20 intents (or 30 min from the
+        first one) end the run anyway."""
+        for step, want in ((P.INTENT_ANSWER_S + 1.0, 'sent'), (300.0, 'time')):
+            self.setUp()
+            t = self._mono_clock()
+            self.intent_ack = None
+            self.agent()
+            self.permit(True)
+            self.advise()
+            self.tick()                            # opens the run, first intent
+            n = 1
+            while self.mc._run() is not None and n < 100:
+                self.permit(True)
+                self.tick()
+                t[0] += step                       # every look comes late
+                n += 1
+            self.assertIsNone(self.mc._run(), want)
+            if want == 'sent':
+                self.assertEqual(len(self.intents()), P.INTENT_MAX_SENT)
+            else:
+                self.assertLess(len(self.intents()), P.INTENT_MAX_SENT)
+                self.assertGreaterEqual(n * step, P.INTENT_MAX_WAIT_S)
+            self.assertIn(('skipped', 'intent_timeout', 'Mow'), self.journal())
+
+    def test_old_node_without_intent_runs_as_before(self):
+        """Mixed versions: a stage 1 node (no exit_intent in its state) counts
+        every exit itself; the master starts without an intent."""
+        self.intent_ack = None                    # nobody would answer
+        self.agent()
+        P.on_state(state(True, q1=False))
+        self.advise()
+        self.tick()
+        self.assertEqual(self.starts(), ['Mow'])
+        self.assertEqual(self.intents(), [])
+
+    def test_calendar_stands_in_after_the_dropped_advice_run(self):
+        P.INTENT_WAIT_S, old = 0.0, P.INTENT_WAIT_S
+        try:
+            self.at(2026, 6, 10, 8, 0)
+            self.intent_ack = None
+            self.agent()
+            self.mc.settings['agent_fallback_calendar'] = True
+            self.permit(True)
+            self.advise()
+            self.tick(P.INTENT_MAX_FAILS + 1)
+            self.assertIsNone(self.mc._run())
+            self.mc.calendar = [daily('09:00')]
+            self.at(2026, 6, 10, 9, 0, 30)
+            self.tick(2)
+            self.assertEqual(self.starts(), ['Mow'])
+        finally:
+            P.INTENT_WAIT_S = old
+
+    def test_link_retries_with_the_same_req_id(self):
+        sent = []
+        link = P.IntentLink()
+        link.setup(lambda text: sent.append(json.loads(text)))
+        ok, why = link.send('x', timeout=0.01, attempts=2)
+        self.assertEqual((ok, why), (False, 'intent_timeout'))
+        self.assertEqual(len(sent), 2)
+        self.assertEqual(sent[0]['req_id'], sent[1]['req_id'])
+        self.assertEqual(P.IntentLink().send('x'), (False, 'no_link'))
+        # an answer to someone else's command is not ours
+        link.setup(lambda text: link.on_result(json.dumps(
+            {'cmd': 'set', 'ok': True, 'req_id': json.loads(text)['req_id']})))
+        self.assertEqual(link.send('x', timeout=0.01, attempts=1), (False, 'intent_timeout'))
 
 
 if __name__ == '__main__':

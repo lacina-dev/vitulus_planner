@@ -693,6 +693,14 @@ class MasterController(object):
         # T18: the owner's dock permit, straight from the robot layer (no agent).
         rospy.Subscriber(dock_permit.STATE_TOPIC, String,
                          lambda m: dock_permit.on_state(m.data), queue_size=1)
+        # T18 Q1: only the agent's exits count against the permit: before an
+        # advice run leaves, the node gets an exit intent and confirms it.
+        self._permit_intent_pub = rospy.Publisher(dock_permit.INTENT_TOPIC, String,
+                                                  queue_size=10)
+        dock_permit.INTENT.setup(
+            lambda text: self._permit_intent_pub.publish(String(text)))
+        rospy.Subscriber(dock_permit.RESULT_TOPIC, String,
+                         lambda m: dock_permit.INTENT.on_result(m.data), queue_size=50)
         rospy.Subscriber('/web_plan/program_list', PlannerProgramList,
                          self.programs_callback)
         rospy.Subscriber('/mapping_manager/status', String,
@@ -3214,6 +3222,13 @@ class MasterController(object):
                 self._set_status("Idle (Agent: %s waits for the dock permission)" % prog,
                                  'waiting_dock', program=prog)
                 return
+            # Q1: the node counts only the agent's exits: say this one is the
+            # agent's and leave only once the node confirmed it (a lost intent
+            # would leave the exit uncounted).  Out of the dock nothing leaves;
+            # an old node (no exit_intent in its state) counts every exit.
+            if self.is_in_dock is not False and dock_permit.intent_supported() \
+                    and not self._exit_intent_ready(run):
+                return
         self.log("[Master] %s program: %s (%s)" % (
             "Resuming" if resume else "Starting scheduled", prog,
             run.get('reason') or 'slot'))
@@ -3232,6 +3247,79 @@ class MasterController(object):
                             self.program_select_resume_pub if resume
                             else self.program_select_pub)
         self._set_status("Mowing", 'starting', program=prog)
+
+    _mono = staticmethod(time.monotonic)    # tests drive the intent's clock
+
+    def _exit_intent_ready(self, run):
+        """T18 Q1: the exit intent of this run, without blocking the FSM:
+        sent in one step, its answer read in the next.  True = confirmed now
+        (leave).  INTENT_MAX_FAILS unconfirmed attempts end the run
+        (dock:intent_timeout), so the calendar's stand-in is not held.
+        While it waits the next FSM tick looks again (not check_interval_s
+        later).  A gap longer than INTENT_ANSWER_S between the request and the
+        look (STOP, end of the window, another hold in between) is not the
+        node's failure: the intent is sent again, not counted.  Absolute cap:
+        INTENT_MAX_WAIT_S from the first intent or INTENT_MAX_SENT intents."""
+        prog = run.get('program', '')
+        key = run.get('created')
+        st = getattr(self, '_intent_try', None)
+        now = self._mono()
+        if not st or st.get('run') != key:
+            st = self._intent_try = {'run': key, 'rid': None, 'sent': 0.0, 'fails': 0,
+                                     'first': now, 'n': 0}
+        if st['rid'] is not None:
+            got = dock_permit.INTENT.result(st['rid'])
+            age = now - st['sent']
+            if got is not None and got.get('ok') and age <= dock_permit.INTENT_USE_S:
+                self._intent_try = None
+                return True
+            if got is None and age < dock_permit.INTENT_WAIT_S:
+                self._last_idle_eval = 0.0      # the answer is on its way: next tick
+                return False
+            st['rid'] = None
+            if got is not None and not got.get('ok'):
+                why = 'refused:%s' % got.get('code')
+            elif got is None and age <= dock_permit.INTENT_ANSWER_S:
+                why = 'no_answer'
+            else:
+                why = None                      # interrupted meanwhile / stale: resend
+            if why:
+                st['fails'] += 1
+                self.log("[Master] Dock permit node did not confirm the exit intent "
+                         "(%s, %d/%d): %s." % (why, st['fails'],
+                                               dock_permit.INTENT_MAX_FAILS, prog))
+        capped = (st['n'] >= dock_permit.INTENT_MAX_SENT
+                  or now - st['first'] >= dock_permit.INTENT_MAX_WAIT_S)
+        if st['fails'] >= dock_permit.INTENT_MAX_FAILS or capped:
+            self._intent_try = None
+            if run.get('advice'):
+                # The advice is no longer in force: the calendar may stand in
+                # (agent_fallback_calendar) instead of its slots staying closed.
+                self._advice_mark(run.get('advice'), 'dropped', want=('pending', 'used'))
+                self._decide('advice', 'dropped', prog, source='agent',
+                             id=run.get('advice'), why='dock:intent_timeout')
+            self._journal('skipped', 'intent_timeout', prog, fails=st['fails'],
+                          sent=st['n'], waited_s=int(now - st['first']))
+            self._give_up(run, 'run_rejected', reason='dock:intent_timeout')
+            self._set_status("Idle (Agent: %s dropped, the dock permit node did "
+                             "not confirm the exit)" % prog, 'intent_timeout',
+                             program=prog)
+            return False
+        st['rid'] = dock_permit.INTENT.request(
+            'advice %s %s' % (run.get('advice') or run.get('reason') or '', prog))
+        st['sent'] = now
+        st['n'] += 1
+        got = dock_permit.INTENT.result(st['rid'])
+        if got is not None and got.get('ok'):  # already answered (same process)
+            self._intent_try = None
+            return True
+        if got is not None:
+            st['rid'] = None
+            st['fails'] += 1
+        self._set_status("Idle (Agent: %s, the dock permit node confirms the exit)"
+                         % prog, 'intent_wait', program=prog)
+        self._last_idle_eval = 0.0              # read the answer in the next tick
+        return False
 
     def _publish_run_active(self, value=None):
         if value is None:

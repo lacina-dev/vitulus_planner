@@ -9,6 +9,17 @@ na agentovi nezávisí (dřívější most přes `vitulus_agent.v2.ros_wire` odp
     allowed(now=None)    -> (ok, why, state)
     homeward()           -> dict | None   konec okna s robotem venku (D38)
     spend / give_back    -> True      no-op: výjezdy počítá uzel sám
+    intent_supported()   -> bool       umí uzel značku výjezdu (Q1)?
+    INTENT.request / result            značka bez čekání (FSM mastra)
+    exit_intent(reason)  -> (ok, why)  totéž s čekáním (nástroje, integrace)
+
+Q1 (owner 8. 11.): do „jen 1 výjezd“ / `max_exits` se počítají jen výjezdy
+agenta.  Master proto před startem běhu z rady agenta pošle uzlu značku
+`/dock_permit/exit_intent` (req_id, platnost `INTENT_TTL_S`) a vyjede, až ji
+uzel potvrdí na `/dock_permit/result` (vyhodnotí v dalším kroku FSM, nečeká).
+Jen když uzel značku umí (stav obsahuje klíč `exit_intent`); starý uzel
+počítá každý výjezd a master jede bez značky jako dřív.  Kalendář značku
+neposílá, jeho výjezd uzel nezapočte.
 
 Fail-closed: bez stavu, se stavem starším než `FRESH_S` nebo nečitelným je
 „nepovoleno".  Čte se JEN před výjezdem z doku (K1): jízdu, sečení ani návrat
@@ -21,8 +32,32 @@ import json
 import os
 import threading
 import time
+import uuid
 
 STATE_TOPIC = '/dock_permit/state'
+INTENT_TOPIC = '/dock_permit/exit_intent'
+RESULT_TOPIC = '/dock_permit/result'
+#: Q1: značka čeká na výjezd nejvýš tolik s; když se robot mezitím vydá
+#: z doku (manévr), platí až do výjezdu (nejvýš 30 min).  Uzel bere 10..600 s.
+INTENT_TTL_S = 120.0
+#: FSM: odpověď uzlu se čte v dalším kroku; dřív než po INTENT_WAIT_S se
+#: chybějící odpověď nepočítá za neúspěch.  Potvrzená značka se použije, jen
+#: když není starší než INTENT_USE_S (pak by mohla do výjezdu vypršet).
+#: 8 s: respawn uzlu (5 s + start) nesmí radu zahodit; 3 neúspěchy ≈ 25–30 s.
+INTENT_WAIT_S = 8.0
+INTENT_USE_S = 60.0
+#: Odpověď, která nepřišla do tolika s, se za neúspěch počítá; delší mezera
+#: mezi požadavkem a dalším pohledem = přerušení (STOP, konec okna), ne uzel.
+INTENT_ANSWER_S = 20.0
+#: Absolutní strop čekání běhu na značku (i když se přerušení nepočítají):
+#: 30 min od první značky nebo 20 odeslaných značek → intent_timeout.
+INTENT_MAX_WAIT_S = 1800.0
+INTENT_MAX_SENT = 20
+#: Po tolika nepotvrzených pokusech master běh rady ukončí (záskok kalendáře).
+INTENT_MAX_FAILS = 3
+#: Blokující varianta (exit_intent, nástroje): 2 s na odpověď, 2 pokusy.
+INTENT_TIMEOUT_S = 2.0
+INTENT_ATTEMPTS = 2
 #: Kontrakt §8: stav chybí nebo je starší než 30 s = nepovoleno.
 FRESH_S = 30.0
 #: Q2 výchozí: homeward jen pro běh, který spustila rada agenta.
@@ -87,6 +122,12 @@ class PermitView(object):
     def state(self, t=None):
         return self._fresh(t)[0]
 
+    def intent_supported(self, t=None):
+        """Umí uzel značku výjezdu (Q1)?  Nový uzel má ve stavu klíč
+        `exit_intent` (i s hodnotou null); starý ne."""
+        doc = self._fresh(t)[0]
+        return isinstance(doc, dict) and 'exit_intent' in doc
+
     def allowed(self, t=None, owners=None):
         """S7: povolení je jen otevřené okno podepsané ownerem ze souboru
         ownerů; why `no_owners_<stav>` / `not_owner`, když ne."""
@@ -127,7 +168,83 @@ class PermitView(object):
             return None
 
 
+class IntentLink(object):
+    """Q1: značka výjezdu agenta pro uzel a čekání na jeho potvrzení.
+
+    `setup(publish)` dostane funkci, která pošle JSON text na
+    `/dock_permit/exit_intent`; `on_result(text)` krmí odběr
+    `/dock_permit/result`.  `send()` vrátí (ok, why) a nikdy nevyhazuje.
+    Bez potvrzení master nevyjede (jinak by se výjezd agenta nezapočetl)."""
+
+    def __init__(self):
+        self._publish = None
+        self._cond = threading.Condition()
+        self._got = {}
+
+    def setup(self, publish):
+        self._publish = publish
+
+    def on_result(self, data):
+        try:
+            doc = json.loads(data) if isinstance(data, str) else data
+        except (TypeError, ValueError):
+            return
+        if not isinstance(doc, dict) or doc.get('cmd') != 'exit_intent' or \
+                doc.get('req_id') is None:
+            return
+        with self._cond:
+            self._got[str(doc['req_id'])] = doc
+            while len(self._got) > 50:
+                self._got.pop(next(iter(self._got)))
+            self._cond.notify_all()
+
+    def request(self, reason='', by='master', ttl_s=None, rid=None):
+        """Pošli značku a hned se vrať.  → req_id, nebo None (bez spojení /
+        chyba).  Odpověď později `result(req_id)`."""
+        try:
+            if self._publish is None:
+                return None
+            rid = rid or 'master-%s' % uuid.uuid4().hex[:12]
+            ttl_s = INTENT_TTL_S if ttl_s is None else ttl_s
+            self._publish(json.dumps({'by': by, 'req_id': rid, 'ttl_s': float(ttl_s),
+                                      'reason': str(reason or '')[:200]}, sort_keys=True))
+            return rid
+        except Exception:                               # noqa: BLE001
+            return None
+
+    def result(self, rid):
+        """Odpověď uzlu na značku `rid` (dict, jednou), nebo None."""
+        with self._cond:
+            return self._got.pop(str(rid), None) if rid is not None else None
+
+    def send(self, reason='', by='master', ttl_s=None, timeout=None, attempts=None):
+        """Blokující varianta (nástroje, integrace; FSM mastra ne)."""
+        ttl_s = INTENT_TTL_S if ttl_s is None else ttl_s
+        timeout = INTENT_TIMEOUT_S if timeout is None else timeout
+        attempts = INTENT_ATTEMPTS if attempts is None else attempts
+        try:
+            if self._publish is None:
+                return False, 'no_link'
+            rid = 'master-%s' % uuid.uuid4().hex[:12]
+            for _ in range(max(1, int(attempts))):
+                self.request(reason, by, ttl_s, rid=rid)
+                end = time.monotonic() + float(timeout)
+                with self._cond:
+                    while rid not in self._got:
+                        left = end - time.monotonic()
+                        if left <= 0:
+                            break
+                        self._cond.wait(left)
+                    got = self._got.pop(rid, None)
+                if got is not None:
+                    return bool(got.get('ok')), str(got.get('code') or '')
+            return False, 'intent_timeout'
+        except Exception as exc:                        # noqa: BLE001
+            return False, 'intent_error: %s' % exc
+
+
 VIEW = PermitView()
+INTENT = IntentLink()
 
 
 def on_state(data):
@@ -157,6 +274,16 @@ def homeward_for(value):
 def spend(release):
     """No-op (T18): výjezd započte uzel, až robot dok opustí."""
     return True
+
+
+def intent_supported():
+    return VIEW.intent_supported()
+
+
+def exit_intent(reason=''):
+    """Q1: řekni uzlu, že další výjezd z doku je agentův, a počkej na
+    potvrzení.  → (ok, why).  Bez potvrzení nevyjíždět."""
+    return INTENT.send(reason=reason)
 
 
 def give_back(release):
