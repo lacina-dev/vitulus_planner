@@ -153,13 +153,15 @@ mission_lost_grace_s: 20.0
 agent_status_max_age_s: 15.0
 
 # Global allowed time-window ("don't mow at night"), DEFAULTS only: the owner's
-# setting (UI: Programs > Calendar > Allowed mowing time, or /scheduler/set_window,
+# setting (UI: Autonomy > Plan > Allowed mowing time, or /scheduler/set_window,
 # std_msgs/String with JSON {"enabled": true, "start": "HH:MM", "end": "HH:MM"})
-# is kept in ~/.vitulus/scheduler_state.json ("allowed_window"), wins over these
-# and works at once. Outside the window the calendar never starts/resumes and
-# the robot sleeps until it opens. It does not limit a manual Run or the agent.
-# enabled=false relies solely on calendar times. May wrap midnight (start > end);
-# start = end is refused.
+# is kept in ~/.vitulus/autonomy.json (and scheduler_state.json "allowed_window"),
+# wins over these and works at once.
+# Outside the window neither the calendar nor the agent starts/resumes (for the
+# agent it is its night limit) and the robot sleeps until it opens. It does not
+# limit a manual Run. enabled=false: time of day holds neither the calendar
+# (its own times) nor the agent. May wrap midnight (start > end); start = end is
+# refused.
 allowed_window_enabled: true
 allowed_window_start: "07:00"
 allowed_window_end: "21:00"
@@ -177,8 +179,7 @@ limits_in_calendar: false
 limit_after_rain_h: 3.0       # hours since the last rain (radar + Open-Meteo)
 limit_min_temp_c: 5.0         # no start below this air temperature
 limit_zone_gap_days: 2.0      # the same zone again only after this; resumes exempt
-limit_day_start: "08:00"      # starts only between these (inside the window above)
-limit_day_end: "20:00"
+# The night limit is the allowed window above (no hours of its own).
 
 # Default inhibit state if none is present in the persistent state file.
 default_inhibit: false

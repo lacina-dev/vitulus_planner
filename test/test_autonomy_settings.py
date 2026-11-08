@@ -203,8 +203,7 @@ class Defaults(Base):
             'run_max_age_h': 48.0, 'off_dock_wait_min': 20.0, 'auto_hw_reset': False,
             # calendar or agent (docs/AUTONOMY.md section 6): calendar unchanged
             'agent_fallback_calendar': True, 'limits_in_calendar': False,
-            'limit_rain_h': 3.0, 'limit_temp_min_c': 5.0, 'limit_zone_gap_days': 2.0,
-            'limit_day_start': '08:00', 'limit_day_end': '20:00'}
+            'limit_rain_h': 3.0, 'limit_temp_min_c': 5.0, 'limit_zone_gap_days': 2.0}
         self.assertEqual(v, today)
         self.assertEqual(set(v), set(A.BY_KEY))
         self.assertEqual(self.mc.wake_lead_s,
@@ -270,6 +269,24 @@ class Store(Base):
         self.assertEqual(mc.settings['temp_wait_h'], 2.0)
         self.assertEqual(mc.settings['resume_max'], 12)
         self.assertEqual(len(glob.glob(self.path() + '.bad-*')), 1)
+
+    def test_retired_agent_hours_dropped_quietly(self):
+        # T4 wave 2 stored the agent's own start hours; the night limit is the
+        # window now (owner 2026-11-08): dropped without a fault, file rewritten.
+        with open(self.path(), 'w') as f:
+            json.dump({'version': 1, 'values': {'temp_wait_h': 2.0, 'limit_day_start': '09:00',
+                                                'limit_day_end': '19:00'}}, f)
+        mc = self.make()
+        self.assertEqual(mc.settings['temp_wait_h'], 2.0)
+        self.assertNotIn('limit_day_start', mc.settings)
+        self.assertNotIn('limit_day_end', mc.settings)
+        self.assertEqual(glob.glob(self.path() + '.bad-*'), [])
+        self.assertIsNone(mc._settings_problem)
+        with open(self.path()) as f:
+            self.assertEqual(json.load(f)['values'], {'temp_wait_h': 2.0})
+        self.assertEqual(self.set(limit_day_start='09:00')['rejected'],
+                         {'limit_day_start': 'unknown'})
+        self.assertNotIn('limit_day_start', A.schema())
 
     def test_stored_values_cannot_undercut(self):
         with open(self.path(), 'w') as f:

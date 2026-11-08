@@ -101,7 +101,7 @@ until the owner switches.
 |---|---|---|
 | `/scheduler/set_mode` | in, `std_msgs/String` | `"agent"` \| `"calendar"`, or `{"mode","by","enable"}`; `enable: true` also turns the automation on |
 | `/scheduler/set_agent_mode` | service `std_srvs/SetBool` | `true` = agent, `false` = calendar |
-| `/scheduler/mode` | latched `String` | `{"mode","state","automation","held","fallback","limits_apply","changed":{t,by},"advice":{...,"state","fresh"},"last_decision":{t,kind,code,program,source,vars},"limit_now":{code,vars,program}\|null,"limits":{day_start,day_end,rain_h,temp_min_c,zone_gap_days,in_calendar},"weather":{hours_since_rain,rain_last_h,temp_now},"last_mow":{zones,programs}}`; also `report.mode` |
+| `/scheduler/mode` | latched `String` | `{"mode","state","automation","held","fallback","limits_apply","changed":{t,by},"advice":{...,"state","fresh"},"last_decision":{t,kind,code,program,source,vars},"limit_now":{code,vars,program}\|null,"limits":{window:{enabled,start,end,min_left_min},day_start,day_end,rain_h,temp_min_c,zone_gap_days,in_calendar},"weather":{hours_since_rain,rain_last_h,temp_now},"last_mow":{zones,programs}}`; also `report.mode` |
 | `/scheduler/advice` | in, `String` JSON | `{"id","action":"mow"\|"skip","program":"Name"\|"MAP\|\|\|Name","from","to","until","ttl_s":60..172800 \| "expires","reason","confidence":0..1,"by"}`; times local `YYYY-MM-DDTHH:MM[:SS]` |
 | `/scheduler/advice_result` | latched `String` | `{"id","ok","code"}`: `stored`, `duplicate`, `mode_calendar`, `action`, `ttl`, `window`, `program`, `not_on_map`, `invalid` |
 | `/scheduler/command_result` | latched | `{"cmd":"set_mode","ok","code":"changed\|same\|invalid"}` |
@@ -114,7 +114,8 @@ held back by the zone gap).
 Agent mode, IDLE in the dock, no run open:
 - Fresh mow advice in its window: the same gate as Run next (`_start_blocker`, every check of the report,
   allowed window and `no_mow_until` included) plus the hard limits plus **the owner's dock permission**
-  (below); then a run with `event_id advice:<id>`
+  (below); a closed window is said and slept as the night limit (`advice/waiting why=limit:limit_night`,
+  sleep until the window opens); then a run with `event_id advice:<id>`
   opens and goes through `_idle_run` like a calendar run (battery, map, resume after rain...). Before the window:
   wait (sleep until it opens). Window over unstarted: `missed`.
 - Fresh skip advice: nothing starts until `until`; calendar slots in that time are closed (`skipped
@@ -122,7 +123,8 @@ Agent mode, IDLE in the dock, no run open:
 - While any advice is in force, calendar slots are the agent's (`skipped advice_mow`).
 - No fresh advice: `agent_fallback_calendar` on (default) = the calendar decides, with the hard limits; off =
   nothing starts (`agent_no_advice`).
-- Sleeps are capped at the next `limit_day_start`, so the agent gets its morning look.
+- Sleeps are capped at the next start of the allowed window (its start also while it is off), so the
+  agent gets its morning look.
 
 Dock permission (owner, 2026-11-08: granting the dock stays with him). One question, one function:
 `node_planner/dock_permit.allowed()` → `vitulus_agent.v2.ros_wire.dock_permitted('mower.program_run')`
@@ -136,13 +138,17 @@ a start that did not leave the dock (rejected, given up) gives it back (`give_ba
 also as the agent's fallback, do not ask (the owner planned those slots). The agent asks the same
 function before sending: no permission = no advice, one message to the owner.
 
-Hard limits (`_limit_verdict`), settings group `agent`: `limit_day_start/end` 08:00–20:00 (starts only),
-`limit_rain_h` 3 (hours since rain from `weather_alert.history.summary`), `limit_temp_min_c` 5, `limit_zone_gap_days`
+Hard limits (`_limit_verdict`), settings group `agent`: night = **the allowed window** (`window_enabled/_start/_end`,
+group `plan`; owner 2026-11-08: one window for the calendar and the agent, `_night_verdict` = `_window_verdict`: closed,
+or less than `window_min_left_min` left, over midnight too; detail `start, end, cause, min_left_min`; window off = no
+night limit, time does not hold the agent), `limit_rain_h` 3 (hours since rain from `weather_alert.history.summary`), `limit_temp_min_c` 5, `limit_zone_gap_days`
 2 (fresh starts only, from `last_mow`). In the agent mode always; in the calendar mode only with
 `limits_in_calendar` (default off). Never for a Run by hand or Run next (`run.manual`). In the agent
 mode, no weather at all or radar AND forecast both stale = `limit_weather_unknown` (no start); a single
-missing value never refuses, and in the calendar mode missing weather never refuses. `limit_day_end`
-only stops new starts: a run already out ends with the allowed window (default 21:00, `_check_window_end`). A zone gap gives the start up (`skipped limit_zone_gap`); the others wait (`waited limit_*`) and sleep
+missing value never refuses, and in the calendar mode missing weather never refuses. A run already out
+ends with the allowed window (`_check_window_end`), as in the calendar. The former agent-only
+`limit_day_start/_end` (T4 wave 2) are retired: a stored value is dropped quietly
+(`autonomy.RETIRED`), `/scheduler/mode` `limits.day_start/day_end` now carry the window (None while off). A zone gap gives the start up (`skipped limit_zone_gap`); the others wait (`waited limit_*`) and sleep
 until the limit can lift.
 
 Journal (new codes, UI translates): `mode/agent|calendar`; `advice/received|rejected|run|skip|waiting|missed|

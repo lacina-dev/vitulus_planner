@@ -31,9 +31,10 @@ and this node reacts to them:
 
 Recovery is capped so the robot always wakes before the next scheduled
 program. A global allowed time-window ("don't mow at night") gates all
-calendar starts/resumes; it does not concern a manual Run or the agent. Its
-defaults are in the yaml, the owner's setting is in the state file
-("allowed_window", /scheduler/set_window, in force at once).
+calendar starts/resumes and the agent's (there it is the night limit); off,
+time of day holds neither. It does not concern a manual Run. Its defaults are
+in the yaml, the owner's setting is in the state file ("allowed_window",
+/scheduler/set_window, in force at once).
 
 Owner's settings: ~/.vitulus/autonomy.json, /scheduler/settings and
 /scheduler/set_settings (docs/AUTONOMY.md, node_planner/autonomy.py). A setting
@@ -48,8 +49,9 @@ Who decides (docs/AUTONOMY.md "Calendar or agent"): scheduler_state.json
 the agent sends /scheduler/advice (JSON with a TTL: mow program X in a window,
 or skip until T); a fresh advice is carried out like Run next (_start_blocker:
 every check), without one the calendar decides when agent_fallback_calendar is
-on. Hard limits of an autonomous start (_limit_verdict: night, after rain, cold,
-the same zone too soon; weather from weather_alert.history) apply in the agent
+on. Hard limits of an autonomous start (_limit_verdict: night = the allowed
+window, after rain, cold, the same zone too soon; weather from
+weather_alert.history) apply in the agent
 mode and, with limits_in_calendar, in the calendar mode; never to a Run by hand.
 Every decision goes to the journal.
 
@@ -887,6 +889,10 @@ class MasterController(object):
         doc, self._settings_problem = self.settings_store.load()
         stored, bad = autonomy.clean_stored(
             doc['values'], self.settings_defaults, self._now())
+        retired = autonomy.retired_in(doc['values'])
+        if retired:
+            rospy.loginfo("autonomy.json: %s retired (the night limit is the window)",
+                          retired)
         if bad:
             self.settings_store.keep_copy()
             self._settings_problem = 'keys:' + ','.join(sorted(bad))
@@ -900,7 +906,7 @@ class MasterController(object):
                              'changed_at': doc.get('changed_at'), 'by': doc.get('by')}
         self.settings = dict(self.settings_defaults)
         self.settings.update(stored)
-        if moved or bad or self._settings_problem:
+        if moved or bad or retired or self._settings_problem:
             self._save_settings()
         self._apply_settings(self.settings)
 
@@ -2564,6 +2570,12 @@ class MasterController(object):
                              'agent_advice_done', program=prog)
             return True
         code, detail, limit = self._start_blocker(now), {}, None
+        if code is not None and code.startswith('window:'):
+            # The allowed window is the agent's night limit (owner 2026-11-08):
+            # said and slept as that limit, with the window's own times.
+            limit = self._night_verdict(now)
+            if limit is not None:
+                code, detail = 'limit:' + limit[0], limit[1]
         if code is None:
             limit = self._limit_verdict(now, prog, advice.get('site'), fresh=True)
             if limit is not None:
@@ -2646,8 +2658,9 @@ class MasterController(object):
         return self._find_event(run.get('event_id'))
 
     def _next_day_start(self, now):
-        start = autonomy.parse_hhmm(self.settings['limit_day_start']) or (8, 0)
-        return MowerScheduler.next_window_start(now, start)
+        """When the allowed window next opens (its start also while it is off:
+        the agent's morning look)."""
+        return MowerScheduler.next_window_start(now, self._window()[1])
 
     def _agent_rest(self, now, until):
         """Sleep while the agent waits: outside the window until it opens, else
@@ -2687,11 +2700,9 @@ class MasterController(object):
         detail) or None. Missing data never refuses (the mission's own rain
         checks stay); a resume (fresh=False) is not held by the zone gap."""
         st = self.settings
-        start = autonomy.parse_hhmm(st['limit_day_start'])
-        end = autonomy.parse_hhmm(st['limit_day_end'])
-        if start and end and start != end and not MowerScheduler.within_window(
-                now, start, end):
-            return 'limit_night', {'start': st['limit_day_start'], 'end': st['limit_day_end']}
+        night = self._night_verdict(now)
+        if night is not None:
+            return night
         wx = self._weather_summary() or {}
         stale = wx.get('stale') or {}
         if self.mow_mode == 'agent' and (not wx or (stale.get('forecast')
@@ -2716,6 +2727,18 @@ class MasterController(object):
                     return 'limit_zone_gap', {'zone': last[0], 'days': round(days, 1),
                                               'need_days': gap}
         return None
+
+    def _night_verdict(self, now):
+        """The night limit: the allowed window, judged as for the calendar
+        (_window_verdict: closed, or less than window_min_left_min of it left;
+        over midnight too). Window off = never. ('limit_night', detail) or None."""
+        verdict = self._window_verdict(now)
+        if verdict is None:
+            return None
+        _, start, end = self._window()
+        return 'limit_night', {'start': "%02d:%02d" % start, 'end': "%02d:%02d" % end,
+                               'cause': verdict,
+                               'min_left_min': self.start_min_left_s / 60.0}
 
     def _run_limited(self, run, now):
         """A hard limit holds this run back. True = held here (said, waits or
@@ -2810,6 +2833,7 @@ class MasterController(object):
         if advice:
             advice['fresh'] = self._advice_fresh(now) is not None
         st = self.settings
+        win_on, win_start, win_end = self._window()
         program, site = self._next_target(now)
         limit = (self._limit_verdict(now, program, site)
                  if program and self._limits_apply() else None)
@@ -2830,7 +2854,14 @@ class MasterController(object):
             'last_decision': decision,
             'limit_now': ({'code': limit[0], 'vars': limit[1], 'program': program}
                           if limit else None),
-            'limits': {'day_start': st['limit_day_start'], 'day_end': st['limit_day_end'],
+            # the night limit is the allowed window; day_start/day_end stay for
+            # older readers (the agent's mow_advisor), None while it is off
+            'limits': {'window': {'enabled': win_on,
+                                  'start': "%02d:%02d" % win_start,
+                                  'end': "%02d:%02d" % win_end,
+                                  'min_left_min': self.start_min_left_s / 60.0},
+                       'day_start': "%02d:%02d" % win_start if win_on else None,
+                       'day_end': "%02d:%02d" % win_end if win_on else None,
                        'rain_h': st['limit_rain_h'], 'temp_min_c': st['limit_temp_min_c'],
                        'zone_gap_days': st['limit_zone_gap_days'],
                        'in_calendar': bool(st['limits_in_calendar'])},
@@ -2856,7 +2887,7 @@ class MasterController(object):
         wake up (the caller has one), and a refused sleep just means waiting
         awake.
 
-        In the agent mode never past the next morning (limit_day_start): the
+        In the agent mode never past the next morning (the window's start): the
         agent decides on a robot that is up, a sleep to a slot days ahead would
         silence it."""
         if self.mow_mode == 'agent':

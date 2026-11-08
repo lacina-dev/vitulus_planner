@@ -348,15 +348,82 @@ class Limits(Base):
         self.assertEqual(self.starts(), [])
         self.assertEqual(self.mode()['limit_now']['code'], 'limit_cold')
 
-    def test_night_limit_is_inside_the_window(self):
-        self.at(2026, 6, 10, 7, 30)               # window 07-21 open, limit 08-20 not
+    def test_night_limit_is_the_window(self):
+        # One window (owner 2026-11-08): the agent's night limit is the allowed
+        # window of the calendar, with its times; no hours of its own.
+        self.at(2026, 6, 10, 6, 30)               # window 07-21 closed
+        self.agent()
+        self.advise(ttl_s=6 * 3600)
+        self.tick()
+        self.assertEqual(self.starts(), [])
+        self.assertEqual(self.mode()['limit_now']['code'], 'limit_night')
+        self.assertEqual(self.mode()['limit_now']['vars'],
+                         {'start': '07:00', 'end': '21:00', 'cause': 'outside_window',
+                          'min_left_min': 30.0})
+        self.assertEqual(self.mc._code, 'agent_blocked')
+        self.assertEqual(self.mc._code_detail['why'], 'limit:limit_night')
+        self.assertIn(('advice', 'waiting', 'Mow'), self.journal('advice'))
+        self.assertEqual(self.mc.persistent['last_decision']['vars']['why'], 'limit:limit_night')
+        self.assertEqual(self.mc.persistent['last_decision']['vars']['start'], '07:00')
+        self.at(2026, 6, 10, 7, 1)                # 07:30 was the old agent-only limit: gone
+        self.tick()
+        self.assertEqual(self.starts(), ['Mow'])
+
+    def test_night_limit_sleeps_until_the_window(self):
+        self.at(2026, 6, 10, 5, 0)
+        self.agent()
+        self.advise(ttl_s=6 * 3600)
+        self.tick()
+        self.assertEqual(self.starts(), [])
+        self.assertTrue(self.sleeps)
+        ms = self.sleeps[-1][0]
+        self.assertEqual(ms, int((2 * 3600 - self.mc.wake_lead_s) * 1000))   # to 07:00
+
+    def test_night_limit_too_little_left_like_the_calendar(self):
+        self.at(2026, 6, 10, 20, 45)              # 15 min of 07-21 left, 30 needed
         self.agent()
         self.advise()
         self.tick()
         self.assertEqual(self.starts(), [])
-        self.at(2026, 6, 10, 8, 1)
+        self.assertEqual(self.mode()['limit_now']['vars']['cause'], 'too_little_left')
+
+    def test_night_limit_over_midnight(self):
+        self.agent(window_start='22:00', window_end='05:00', window_min_left_min=10.0)
+        self.at(2026, 6, 10, 12, 0)
+        self.advise()
+        self.tick()
+        self.assertEqual(self.starts(), [])
+        self.assertEqual(self.mode()['limit_now']['vars']['start'], '22:00')
+        self.at(2026, 6, 11, 1, 0)
+        self.advise(ttl_s=3600)
         self.tick()
         self.assertEqual(self.starts(), ['Mow'])
+
+    def test_window_off_time_does_not_hold_the_agent(self):
+        self.at(2026, 6, 10, 23, 30)
+        self.agent(window_enabled=False)
+        self.assertIsNone(self.mc._limit_verdict(self.clock[0], 'Mow'))
+        lim = self.mc._mode_view(self.clock[0])['limits']
+        self.assertEqual(lim['window']['enabled'], False)
+        self.assertIsNone(lim['day_start'])
+        self.advise()
+        self.tick()
+        self.assertEqual(self.starts(), ['Mow'])
+
+    def test_mode_view_carries_the_window(self):
+        self.agent(window_start='06:30', window_end='20:15')
+        lim = self.mc._mode_view(self.clock[0])['limits']
+        self.assertEqual(lim['window'], {'enabled': True, 'start': '06:30', 'end': '20:15',
+                                         'min_left_min': 30.0})
+        self.assertEqual((lim['day_start'], lim['day_end']), ('06:30', '20:15'))
+        self.assertNotIn('limit_day_start', self.mc.settings)
+
+    def test_agent_sleep_cap_is_the_window_start(self):
+        self.agent(window_start='06:00')
+        self.at(2026, 6, 10, 22, 0)
+        self.mc._sleep_for('test', 3 * 86400)
+        ms = self.sleeps[-1][0]
+        self.assertEqual(ms, int((8 * 3600 - self.mc.wake_lead_s) * 1000))   # to 06:00
 
     def test_unknown_weather_does_not_refuse(self):
         self.agent()

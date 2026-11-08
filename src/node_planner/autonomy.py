@@ -97,10 +97,15 @@ FIELDS = [
     _f('limit_rain_h', 'float', 'agent', 'limit_after_rain_h', 3.0, 0, 48, 'h'),
     _f('limit_temp_min_c', 'float', 'agent', 'limit_min_temp_c', 5.0, -10, 25, 'C'),
     _f('limit_zone_gap_days', 'float', 'agent', 'limit_zone_gap_days', 2.0, 0, 14, 'd'),
-    _f('limit_day_start', 'time', 'agent', 'limit_day_start', '08:00'),
-    _f('limit_day_end', 'time', 'agent', 'limit_day_end', '20:00'),
+    # The night limit has no keys of its own: it is the allowed window above
+    # (window_enabled/_start/_end, group plan), for the calendar and the agent
+    # alike (owner 2026-11-08). Off = time does not hold the agent either.
 ]
 BY_KEY = {f['key']: f for f in FIELDS}
+
+# Keys that were settings once: a stored value is dropped quietly, not a fault.
+# limit_day_start/_end: the agent's own start hours (T4 wave 2), now the window.
+RETIRED = ('limit_day_start', 'limit_day_end')
 
 # Shown, never settable. Only what the robot really enforces, with where it does;
 # values are read from nowhere here and feed no decision. The agent's battery
@@ -140,7 +145,7 @@ def defaults(get_param):
         if f.get('invert'):
             value = not value
         out[f['key']] = value
-    for key in ('window_start', 'window_end', 'limit_day_start', 'limit_day_end'):
+    for key in ('window_start', 'window_end'):
         out[key] = str(out[key])
     out['wake_before_min'] = (get_param('~wake_before_program_s', 600.0)
                               + get_param('~boot_time_buffer_s', 120.0)) / 60.0
@@ -254,8 +259,7 @@ def _clean_value(f, value, now):
 # so an old value (a short window from /scheduler/set_window) cannot block the rest.
 GROUPS = (('battery_start_pct', 'battery_return_pct', 'battery_resume_pct'),
           ('window_enabled', 'window_start', 'window_end', 'window_min_left_min'),
-          ('catchup_max_h', 'wake_before_min'),
-          ('limit_day_start', 'limit_day_end'))
+          ('catchup_max_h', 'wake_before_min'))
 
 
 def _group(key):
@@ -282,9 +286,6 @@ def cross_check(values, boot_grace_s=300.0):
         length = ((end[0] - begin[0]) * 60 + end[1] - begin[1]) % 1440
         if values['window_min_left_min'] >= length:
             bad['window_min_left_min'] = 'window_too_short'
-    if ('limit_day_start' in values
-            and values['limit_day_start'] == values.get('limit_day_end')):
-        bad['limit_day_end'] = 'window_equal'
     # A robot that wakes for a slot and is late must still catch it after booting.
     if values['catchup_max_h'] * 3600.0 < values['wake_before_min'] * 60.0 + boot_grace_s:
         bad['catchup_max_h'] = 'catchup_under_wake'
@@ -322,9 +323,12 @@ def clean(request, current, now, touched=None, boot_grace_s=300.0):
 
 def clean_stored(stored, base, now):
     """Keys of a file that are usable. A one-shot in the past is simply over; a
-    key that does not pass is dropped. Returns (values, bad keys)."""
+    key that does not pass is dropped. A RETIRED key is dropped too, but is no
+    fault (retired_in). Returns (values, bad keys)."""
     out, bad = {}, []
     for key, value in stored.items():
+        if key in RETIRED:
+            continue
         f = BY_KEY.get(key)
         if f is None:
             bad.append(key)
@@ -351,6 +355,11 @@ def clean_stored(stored, base, now):
                 del out[k]
                 bad.append(k)
     return out, bad
+
+
+def retired_in(stored):
+    """The RETIRED keys a stored file still has (the file is rewritten without)."""
+    return sorted(k for k in stored if k in RETIRED)
 
 
 class Journal(object):
