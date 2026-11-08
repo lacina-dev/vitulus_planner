@@ -1277,12 +1277,129 @@ class Journal(Base):
         self.assertEqual(len(mc.journal.entries()), 100)
         self.assertEqual(mc.journal.entries()[-1]['vars']['n'], 449)
 
+    def test_cut_lines_are_archived_not_lost(self):
+        mc = self.mc
+        for i in range(450):
+            mc._journal('settings', 'changed', n=i)
+        vit = os.path.join(_HOME, '.vitulus')
+        archived = []
+        for path in sorted(glob.glob(os.path.join(vit, 'autonomy_journal.archive', '*.jsonl'))):
+            self.assertRegex(os.path.basename(path), r'^\d{4}-\d{2}\.jsonl$')
+            with open(path) as f:
+                archived += [json.loads(l) for l in f]
+        with open(os.path.join(vit, 'autonomy_journal.jsonl')) as f:
+            live = [json.loads(l) for l in f]
+        ns = [j['vars']['n'] for j in archived + live if 'n' in j['vars']]
+        self.assertEqual(ns, list(range(450)))
+        self.assertTrue(archived)
+
     def test_torn_line(self):
         path = os.path.join(_HOME, '.vitulus', 'autonomy_journal.jsonl')
         self.mc._journal('settings', 'changed')
         with open(path, 'a') as f:
             f.write('{"t": "2026')
         self.assertEqual(len(self.make().journal.entries()), 1)
+
+
+class JournalArchive(unittest.TestCase):
+    """autonomy.Journal cut-back: nothing lost, nothing archived twice."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix='journal_')
+        self.path = os.path.join(self.dir, 'autonomy_journal.jsonl')
+        self.logs = []
+
+    def tearDown(self):
+        os.chmod(self.dir, 0o755)
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def make(self):
+        return A.Journal(self.path, log=self.logs.append)
+
+    def item(self, n):
+        return {'t': '2026-11-%02dT10:00:%02d' % (1 + n // 300, n % 60),
+                'kind': 'k', 'code': 'c', 'vars': {'n': n}, 'program': ''}
+
+    def ns(self):
+        out = []
+        for p in sorted(glob.glob(os.path.join(self.dir, 'autonomy_journal.archive', '*.jsonl'))):
+            with open(p, errors='replace') as f:
+                for l in f:
+                    try:
+                        out.append(json.loads(l)['vars']['n'])
+                    except ValueError:
+                        pass  # a line a crash tore
+        with open(self.path, errors='replace') as f:
+            for l in f:
+                try:
+                    out.append(json.loads(l)['vars']['n'])
+                except ValueError:
+                    out.append(l.strip())
+        return out
+
+    def fill(self, j, a, b):
+        for n in range(a, b):
+            j.add(self.item(n))
+
+    def test_months_and_exactly_once(self):
+        j = self.make()
+        self.fill(j, 0, 900)
+        self.assertEqual(self.ns(), list(range(900)))
+        self.assertEqual(sorted(os.listdir(j.archive_dir)), ['2026-11.jsonl'])
+
+    def test_crash_after_archive_before_rewrite(self):
+        j = self.make()
+        self.fill(j, 0, 400)
+        real = os.replace
+        with mock.patch.object(A.os, 'replace', side_effect=OSError('power cut')):
+            j.add(self.item(400))  # archived, not cut, line appended
+        self.assertTrue(any('rewrite' in m for m in self.logs))
+        j = self.make()            # restart
+        self.fill(j, 401, 450)
+        self.assertIs(A.os.replace, real)
+        self.assertEqual(self.ns(), list(range(450)))
+
+    def test_crash_in_the_middle_of_archiving(self):
+        j = self.make()
+        self.fill(j, 0, 400)
+        with open(self.path) as f:
+            lines = f.read().splitlines()
+        os.makedirs(j.archive_dir)
+        with open(os.path.join(j.archive_dir, '2026-11.jsonl'), 'w') as f:
+            f.write('\n'.join(lines[:120]) + '\n' + lines[120][:25])  # torn
+        self.make().add(self.item(400))
+        ns = [n for n in self.ns() if isinstance(n, int)]
+        self.assertEqual(ns, list(range(401)))
+
+    def test_archive_failure_does_not_cut(self):
+        j = self.make()
+        with open(j.archive_dir, 'w') as f:
+            f.write('in the way')  # makedirs fails
+        self.fill(j, 0, 410)
+        self.assertTrue(any('archive' in m for m in self.logs))
+        with open(self.path) as f:
+            self.assertEqual(len(f.readlines()), 410)
+
+    def test_read_failure_does_not_cut(self):
+        j = self.make()
+        self.fill(j, 0, 400)
+        with mock.patch.object(A.Journal, '_archive', side_effect=AssertionError('no')):
+            with mock.patch('builtins.open', side_effect=[OSError('eio'), open(self.path, 'a')]):
+                j.add(self.item(400))
+        self.assertTrue(any('read' in m for m in self.logs))
+        self.assertEqual(self.ns(), list(range(401)))
+
+    def test_bad_bytes_and_lines_missing_in_items(self):
+        j = self.make()
+        self.fill(j, 0, 300)
+        with open(self.path, 'ab') as f:  # written by someone else, not in items
+            f.write(b'{"t": "2026-11-02T00:00:00", "vars": {"n": "\xff"}}\n')
+            for n in range(300, 399):
+                f.write((json.dumps(self.item(n)) + '\n').encode())
+        self.fill(j, 399, 420)
+        ns = self.ns()
+        self.assertEqual(len(ns), 421)
+        self.assertEqual([n for n in ns if isinstance(n, int)], list(range(420)))
 
 
 class Notify(Base):

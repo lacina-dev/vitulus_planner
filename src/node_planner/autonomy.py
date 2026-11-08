@@ -336,8 +336,11 @@ def clean_stored(stored, base, now):
 
 
 class Journal(object):
-    """Last events, ~/.vitulus/autonomy_journal.jsonl. Appended, cut back when it
-    has grown; a line a power cut tore is skipped."""
+    """Last events, ~/.vitulus/autonomy_journal.jsonl. Appended; when it has grown
+    the older lines move to ~/.vitulus/autonomy_journal.archive/YYYY-MM.jsonl (by
+    their 't') and the file keeps the last KEEP. Nothing is thrown away: the
+    archive is the long history the agent learns from. A line a power cut tore
+    is skipped."""
     KEEP = 100
     MAX_LINES = 400
 
@@ -348,9 +351,9 @@ class Journal(object):
         self.lines = 0
         self.items = []
         try:
-            with open(path) as f:
+            with open(path, encoding='utf-8', errors='replace') as f:
                 raw = f.read().splitlines()
-        except (OSError, UnicodeDecodeError):
+        except OSError:
             raw = []
         self.lines = len(raw)
         for line in raw:
@@ -371,24 +374,118 @@ class Journal(object):
             self.items = (self.items + [item])[-self.KEEP:]
             try:
                 line = json.dumps(item, sort_keys=True, default=str)
-                if self.lines >= self.MAX_LINES:
-                    self._rewrite()
-                else:
-                    with open(self.path, 'a') as f:
-                        f.write(line + '\n')
-                    self.lines += 1
-            except (OSError, ValueError, TypeError) as e:
+            except (ValueError, TypeError) as e:
+                self.log('journal: %s' % e)
+                return
+            if self.lines >= self.MAX_LINES and self._rewrite(line):
+                return
+            try:
+                with open(self.path, 'a') as f:
+                    f.write(line + '\n')
+                self.lines += 1
+            except OSError as e:
                 self.log('journal: %s' % e)
 
-    def _rewrite(self):
+    # -- cutting back: archive first, then rewrite; any failure = no cut ------
+    @property
+    def archive_dir(self):
+        root, _ = os.path.splitext(self.path)
+        return root + '.archive'
+
+    @staticmethod
+    def _month(line):
+        """YYYY-MM of a line's 't'; a line that does not parse goes to now."""
+        try:
+            month = str(json.loads(line).get('t') or '')[:7]
+        except (ValueError, AttributeError):
+            month = ''
+        if len(month) == 7 and month[4] == '-' and month[:4].isdigit():
+            return month
+        return time.strftime('%Y-%m')
+
+    def _archive(self, lines):
+        """Append ``lines`` (raw, in order) to the monthly archive files.
+
+        Idempotent: a block that a crash left fully or partly in the archive
+        (archived, but the journal not yet rewritten) is recognised by the
+        archive's tail and not written twice. Raises on a disk problem."""
+        months = []
+        for line in lines:
+            month = self._month(line)
+            if months and months[-1][0] == month:
+                months[-1][1].append(line)
+            else:
+                months.append((month, [line]))
+        os.makedirs(self.archive_dir, exist_ok=True)
+        for month, chunk in months:
+            path = os.path.join(self.archive_dir, month + '.jsonl')
+            tail, torn = self._tail(path, len(chunk))
+            done = 0
+            for k in range(min(len(tail), len(chunk)), 0, -1):
+                if tail[-k:] == chunk[:k]:
+                    done = k
+                    break
+            rest = chunk[done:]
+            if not rest:
+                continue
+            with open(path, 'a') as f:
+                f.write(('\n' if torn else '') + '\n'.join(rest) + '\n')
+                f.flush()
+                os.fsync(f.fileno())
+
+    @staticmethod
+    def _tail(path, n):
+        """Last ``n`` complete lines of a file, and whether it ends torn."""
+        try:
+            with open(path, 'rb') as f:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                f.seek(max(0, size - 64 * 1024 * max(1, n // 64 + 1)))
+                data = f.read()
+        except FileNotFoundError:
+            return [], False
+        text = data.decode('utf-8', errors='replace')
+        torn = bool(text) and not text.endswith('\n')
+        lines = text.split('\n')
+        lines = lines[:-1]  # '' after the last newline, or the torn piece
+        if size > len(data) and lines:
+            lines = lines[1:]  # the first may be cut by the seek
+        return lines[-n:] if n else [], torn
+
+    def _rewrite(self, line):
+        """Cut the file back to the last KEEP lines incl. ``line``; the cut ones
+        go to the archive. Works on the FILE's lines (not self.items), so every
+        stored line ends up either kept or archived. False = nothing cut, the
+        caller appends instead."""
+        try:
+            with open(self.path, encoding='utf-8', errors='replace') as f:
+                raw = [l for l in f.read().splitlines() if l.strip()]
+        except FileNotFoundError:
+            raw = []
+        except OSError as e:
+            self.log('journal read: %s' % e)
+            return False
+        lines = raw + [line]
+        keep, drop = lines[-self.KEEP:], lines[:-self.KEEP]
+        try:
+            self._archive(drop)
+        except (OSError, ValueError) as e:
+            self.log('journal archive: %s' % e)
+            return False
         tmp = self.path + '.tmp'
-        with open(tmp, 'w') as f:
-            for item in self.items:
-                f.write(json.dumps(item, sort_keys=True, default=str) + '\n')
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, self.path)
-        self.lines = len(self.items)
+        try:
+            with open(tmp, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(keep) + '\n')
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self.path)
+        except OSError as e:
+            # archived but not cut: the next cut finds the block in the
+            # archive's tail and does not write it twice
+            self.log('journal rewrite: %s' % e)
+            return False
+        self.lines = len(keep)
+        return True
 
 
 class Store(object):
