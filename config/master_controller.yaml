@@ -164,5 +164,21 @@ allowed_window_enabled: true
 allowed_window_start: "07:00"
 allowed_window_end: "21:00"
 
+# --- Calendar or agent (docs/AUTONOMY.md) ----------------------------------
+# Who decides is scheduler_state.json "mow_mode" (calendar by default; switched
+# by /scheduler/set_mode or the agent's chat). DEFAULTS of the Autonomy settings
+# below; the owner's values are in ~/.vitulus/autonomy.json.
+# No fresh advice of the agent: the calendar decides meanwhile.
+agent_fallback_calendar: true
+# Hard limits of an autonomous start: always in the agent mode, in the calendar
+# mode only with limits_in_calendar (off = the calendar works as before). Never
+# for a Run by hand or Run next. Unknown weather never refuses.
+limits_in_calendar: false
+limit_after_rain_h: 3.0       # hours since the last rain (radar + Open-Meteo)
+limit_min_temp_c: 5.0         # no start below this air temperature
+limit_zone_gap_days: 2.0      # the same zone again only after this; resumes exempt
+limit_day_start: "08:00"      # starts only between these (inside the window above)
+limit_day_end: "20:00"
+
 # Default inhibit state if none is present in the persistent state file.
 default_inhibit: false

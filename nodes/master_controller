@@ -42,6 +42,17 @@ values are pushed as rosparams by _param_worker. What could the robot do now and
 why not: /scheduler/report "checks" and "sleep.checks", built from the very
 predicates the decisions use.
 
+Who decides (docs/AUTONOMY.md "Calendar or agent"): scheduler_state.json
+"mow_mode" calendar (default) | agent; /scheduler/set_mode (String) and
+/scheduler/set_agent_mode (SetBool), /scheduler/mode latched. In the agent mode
+the agent sends /scheduler/advice (JSON with a TTL: mow program X in a window,
+or skip until T); a fresh advice is carried out like Run next (_start_blocker:
+every check), without one the calendar decides when agent_fallback_calendar is
+on. Hard limits of an autonomous start (_limit_verdict: night, after rain, cold,
+the same zone too soon; weather from weather_alert.history) apply in the agent
+mode and, with limits_in_calendar, in the calendar mode; never to a Run by hand.
+Every decision goes to the journal.
+
 Activation: one persisted switch (scheduler_state.json "automation_enabled",
 default OFF; /scheduler/set_enabled topic + service, /scheduler/enabled
 latched). OFF = state DISABLED: nothing is started, nothing sleeps.
@@ -76,12 +87,17 @@ _PKG_SRC = os.path.join(os.path.dirname(os.path.dirname(
     os.path.realpath(__file__))), 'src')
 if _PKG_SRC not in sys.path:
     sys.path.insert(0, _PKG_SRC)
-from node_planner import autonomy, hw_reset, sleep_manager  # noqa: E402
+from node_planner import autonomy, dock_permit, hw_reset, sleep_manager  # noqa: E402
 try:
     # The rule the mission decides with, so the page cannot say otherwise.
     from mower_unit_smach import rain_rule  # noqa: E402
 except ImportError:                 # vitulus_navi missing: the rain check says unknown
     rain_rule = None
+try:
+    # Rain history and temperature of the hard limits; files only, no rospy.
+    from weather_alert import history as weather_history  # noqa: E402
+except ImportError:                 # no weather: those limits say unknown, never refuse
+    weather_history = None
 
 
 # ---------------------------------------------------------------------------
@@ -565,6 +581,10 @@ class MasterController(object):
         self._report_last = None
         self._timeline_last = None
         self._report_t = 0.0
+        self._wx = None               # weather_alert.history.summary(), cached
+        self._wx_t = -1e12
+        self._said = {}               # journal once: key -> what was last said
+        self._mode_last = None
 
         # ---- persistent state ----------------------------------------------
         self.persistent = self._load_state()
@@ -574,6 +594,9 @@ class MasterController(object):
         self.calendar = MowerScheduler.validate_calendar(
             self.persistent.get('calendar', []))
         self.persistent['calendar'] = self.calendar
+        if self.persistent.get('mow_mode') not in self.MODES:
+            self.persistent['mow_mode'] = 'calendar'
+        self.mow_mode = self.persistent['mow_mode']
         self._load_window()
         self.journal = autonomy.Journal(
             os.path.join(self.state_dir, 'autonomy_journal.jsonl'), log=rospy.logerr)
@@ -616,6 +639,11 @@ class MasterController(object):
             '/scheduler/notify', String, queue_size=10)
         self.sleep_countdown_pub = rospy.Publisher(
             '/scheduler/sleep_countdown', String, latch=True, queue_size=1)
+        # Who decides: calendar | agent, the advice in force, the last decision.
+        self.mode_pub = rospy.Publisher(
+            '/scheduler/mode', String, latch=True, queue_size=1)
+        self.advice_result_pub = rospy.Publisher(
+            '/scheduler/advice_result', String, latch=True, queue_size=1)
         self.finish_after_path_pub = rospy.Publisher(
             '/mower_smach/finish_after_path', Bool, queue_size=1)
         self.return_home_pub = rospy.Publisher(
@@ -706,6 +734,10 @@ class MasterController(object):
         rospy.Subscriber('/dock_manager/dock_program', DockProgram,
                          self.dock_program_callback)
         rospy.Subscriber('/client_count', Int32, self.client_count_callback)
+        rospy.Subscriber('/scheduler/set_mode', String, self.set_mode_callback)
+        self.mode_srv = rospy.Service('/scheduler/set_agent_mode', SetBool,
+                                      self.set_mode_service)
+        rospy.Subscriber('/scheduler/advice', String, self.advice_callback)
 
         # initial publishes
         self.inhibit_status_pub.publish(Bool(self.is_inhibited))
@@ -714,6 +746,7 @@ class MasterController(object):
         self.run_active_pub.publish(Bool(False))
         self._publish_settings()
         self._publish_journal()
+        self._publish_mode(force=True)
         self.sleep_countdown_pub.publish(String(json.dumps({'active': False})))
         if self._settings_problem:
             self._issue('settings_bad', detail=self._settings_problem)
@@ -745,6 +778,11 @@ class MasterController(object):
             "interrupted_event_id": None,
             "interrupted_reason": None,
             "inhibit": self.default_inhibit,
+            "mow_mode": "calendar",       # who decides: calendar | agent
+            "mode_changed": None,         # {'t', 'by'}
+            "advice": None,               # the agent's last advice (see advice_callback)
+            "last_decision": None,        # what the last autonomous decision was
+            "last_mow": {"zones": {}, "programs": {}},   # 'site|zone' -> ISO time
         }
 
     def _load_state(self):
@@ -1239,6 +1277,15 @@ class MasterController(object):
         if (link and new and run is None
                 and self._t() - self.node_start_time > self.MOWER_LINK_LATCH_S):
             self._issue('mower_link', self.active_program_name.strip(), reason=link)
+        # Any mission that finished its program, a Run by hand too: when a zone
+        # was last mowed (the zone gap). Only a finished one: an unfinished
+        # program is to be finished, the gap must not hold it back.
+        if (msg.data == 'succeeded' and new
+                and self._t() - self.node_start_time > self.MOWER_LINK_LATCH_S):
+            with self.lock:
+                name = (self.mission_started_name or self.active_program_name).strip()
+            if name:
+                self._note_mowed(name)
 
     def active_program_callback(self, msg):
         with self.lock:
@@ -1725,6 +1772,9 @@ class MasterController(object):
             pending = list(self._pending_view)
         if run:
             return run.get('program'), run.get('site')
+        advice = self._advice_fresh(now)
+        if advice is not None and advice['action'] == 'mow' and advice.get('state') == 'pending':
+            return advice['program'], advice.get('site')
         if pending:
             return pending[0]['program'], pending[0].get('site')
         _, ev = self._next_slot(now)
@@ -1928,6 +1978,8 @@ class MasterController(object):
                 'critical': run.get('critical'),
                 'checkpoint': run.get('checkpoint'),
             }
+        rep['mode'] = self._mode_view(now)
+        self._publish_mode(view=rep['mode'])
         if hasattr(self, 'sleep_report'):
             rep['sleep'] = self.sleep_report(fresh=not force)
         timeline = json.dumps(self._timeline(now), sort_keys=True)
@@ -2202,6 +2254,7 @@ class MasterController(object):
         manual Resume, free the calendar for the next slot."""
         self._issue(code, run.get('program', ''), slot=run.get('slot'),
                     checkpoint=run.get('checkpoint'), **detail)
+        self._dock_give_back(run)
         self._clear_interrupted()
 
     def _program_checkpoint(self, prog_name, site=None):
@@ -2224,13 +2277,594 @@ class MasterController(object):
         """The planner's list is the list of `site` (lock held)."""
         return any(getattr(p, 'map_name', '') == site for p in self.program_list)
 
+
+    # =====================================================================
+    # who decides: calendar | agent (docs/AUTONOMY.md "Calendar or agent")
+    # =====================================================================
+    MODES = ('calendar', 'agent')
+    ADVICE_TTL_MIN_S = 60.0
+    ADVICE_TTL_MAX_S = 48 * 3600.0
+    ADVICE_TTL_DEFAULT_S = 6 * 3600.0
+    WEATHER_CACHE_S = 300.0
+    ISO = "%Y-%m-%dT%H:%M:%S"
+
+    @staticmethod
+    def _parse_iso(text):
+        """Local 'YYYY-MM-DDTHH:MM[:SS]', None when it is not one."""
+        if not isinstance(text, str):
+            return None
+        for size, fmt in ((19, "%Y-%m-%dT%H:%M:%S"), (16, "%Y-%m-%dT%H:%M")):
+            try:
+                return datetime.datetime.strptime(text[:size], fmt)
+            except ValueError:
+                continue
+        return None
+
+    def set_mode_callback(self, msg):
+        """/scheduler/set_mode: "agent" | "calendar", or JSON {"mode", "by",
+        "enable"}. enable: true also switches the automation on: the owner's
+        "mow by yourself" means that it should really happen."""
+        raw = (msg.data or '').strip()
+        req = {'mode': raw}
+        if raw.startswith('{'):
+            try:
+                req = json.loads(raw)
+                if not isinstance(req, dict):
+                    raise ValueError
+            except ValueError:
+                self._command_result('set_mode', False, 'invalid')
+                return
+        self.set_mode(str(req.get('mode') or ''), by=str(req.get('by') or 'owner')[:40],
+                      enable=req.get('enable') is True)
+
+    def set_mode_service(self, req):
+        ok, _code = self.set_mode('agent' if req.data else 'calendar', by='service')
+        return SetBoolResponse(success=ok, message='mode %s' % self.mow_mode)
+
+    def set_mode(self, mode, by='owner', enable=False):
+        """The one place the mode changes. Back to the calendar drops an advice
+        and an advice run that has not left yet; one that is out is followed to
+        its end like any run."""
+        if mode not in self.MODES:
+            self._command_result('set_mode', False, 'invalid')
+            return False, 'invalid'
+        dropped = None
+        with self.lock:
+            changed = mode != self.mow_mode
+            if changed:
+                self.mow_mode = mode
+                self.persistent['mow_mode'] = mode
+                self.persistent['mode_changed'] = {'t': self._now().strftime(self.ISO),
+                                                   'by': by}
+                if mode == 'calendar':
+                    advice = self.persistent.get('advice')
+                    if advice and advice.get('state') == 'pending':
+                        advice['state'] = 'dropped'
+                    run = self.persistent.get('run')
+                    if (run and run.get('advice') and not run.get('started')
+                            and not run.get('following')):
+                        dropped = dict(run)
+                self._save_state()
+        if dropped is not None:
+            self._clear_interrupted()
+            self._journal('advice', 'dropped', dropped.get('program', ''),
+                          id=dropped.get('advice'))
+        if changed:
+            self.log("[Master] Mowing decided by: %s (%s)." % (mode, by))
+            self._journal('mode', mode, by=by)
+            self._said.pop('agent', None)
+            self._last_idle_eval = 0.0
+            self._replan_sleep()
+        if enable and not self.automation_on:
+            self.set_automation(True)
+        self._command_result('set_mode', True, 'changed' if changed else 'same')
+        self._publish_mode(force=True)
+        self._publish_report(force=True)
+        return True, 'changed' if changed else 'same'
+
+    def advice_callback(self, msg):
+        ok, code, advice = self._take_advice(msg.data)
+        self.advice_result_pub.publish(String(json.dumps(
+            {'id': (advice or {}).get('id'), 'ok': ok, 'code': code}, default=str)))
+        self._publish_mode(force=True)
+        self._publish_report(force=True)
+
+    def _take_advice(self, raw):
+        """/scheduler/advice, JSON:
+          {"id": "...", "action": "mow" | "skip",
+           "program": "Name" | "MAP|||Name"   (mow),
+           "from": "YYYY-MM-DDTHH:MM", "to": "..."   (mow: start window, local),
+           "until": "..."                      (skip: no mowing until),
+           "ttl_s": 60..172800 | "expires": "...",
+           "reason": "...", "confidence": 0..1, "by": "agent"}
+        Returns (ok, code, advice). Nothing starts here: IDLE carries it out."""
+        now = self._now()
+        try:
+            req = json.loads(raw)
+            if not isinstance(req, dict):
+                raise ValueError
+        except (ValueError, TypeError):
+            return False, 'invalid', None
+        aid = str(req.get('id') or now.strftime('a%Y%m%dT%H%M%S'))[:64]
+        action = req.get('action')
+        program, site = '', (str(req['site']) if req.get('site') else None)
+        if action == 'mow':
+            ref = str(req.get('program') or '').strip()
+            if '|||' in ref:
+                site, program = (x.strip() for x in ref.split('|||', 1))
+            else:
+                program = ref
+        code = None
+        with self.lock:
+            current = self.persistent.get('advice')
+        if action not in ('mow', 'skip'):
+            code = 'action'
+        elif self.mow_mode != 'agent':
+            code = 'mode_calendar'
+        elif current and current.get('id') == aid:
+            return True, 'duplicate', current
+        if code is None:
+            if req.get('expires') is not None:
+                at = self._parse_iso(req.get('expires'))
+                ttl = MowerScheduler.real_seconds(now, at) if at else None
+            else:
+                ttl = req.get('ttl_s', self.ADVICE_TTL_DEFAULT_S)
+            if (isinstance(ttl, bool) or not isinstance(ttl, (int, float))
+                    or not self.ADVICE_TTL_MIN_S <= ttl <= self.ADVICE_TTL_MAX_S):
+                code = 'ttl'
+        if code is None:
+            expires = now + datetime.timedelta(seconds=float(ttl))
+            start = self._parse_iso(req.get('from')) or now
+            end = min(self._parse_iso(req.get('to')) or expires, expires)
+            until = min(self._parse_iso(req.get('until')) or expires, expires)
+            if action == 'skip':
+                expires = until         # a skip is over when its time is
+                if until <= now:
+                    code = 'window'
+            if code is not None:
+                pass
+            elif action == 'mow' and (end <= now or end <= start):
+                code = 'window'
+            elif action == 'mow' and not program:
+                code = 'program'
+            elif action == 'mow' and not self._program_on_map(program, site):
+                code = 'not_on_map'
+        if code is not None:
+            self._decide('advice', 'rejected', program, source='agent', id=aid, why=code)
+            return False, code, {'id': aid}
+        conf = req.get('confidence')
+        if isinstance(conf, bool) or not isinstance(conf, (int, float)) or not 0 <= conf <= 1:
+            conf = None
+        advice = {'id': aid, 'action': action, 'program': program or None,
+                  'site': site if action == 'mow' else None,
+                  'from': start.strftime(self.ISO) if action == 'mow' else None,
+                  'to': end.strftime(self.ISO) if action == 'mow' else None,
+                  'until': until.strftime(self.ISO) if action == 'skip' else None,
+                  'expires': expires.strftime(self.ISO),
+                  'reason': str(req.get('reason') or '')[:300],
+                  'confidence': conf, 'by': str(req.get('by') or 'agent')[:40],
+                  'received': now.strftime(self.ISO), 'state': 'pending'}
+        with self.lock:
+            self.persistent['advice'] = advice
+            self._save_state()
+        self._said.pop('agent', None)
+        self._decide('advice', 'received', program, source='agent', id=aid, action=action,
+                     start=advice['from'], end=advice['to'], until=advice['until'],
+                     reason=advice['reason'], confidence=conf)
+        self._last_idle_eval = 0.0
+        return True, 'stored', advice
+
+    def _advice_fresh(self, now):
+        """The advice in force: agent mode and not expired. No side effects."""
+        if self.mow_mode != 'agent':
+            return None
+        with self.lock:
+            advice = self.persistent.get('advice')
+        if not advice:
+            return None
+        expires = self._parse_iso(advice.get('expires'))
+        if expires is None or expires <= now or advice.get('state') == 'dropped':
+            return None
+        return dict(advice)
+
+    def _advice_mark(self, aid, state, want=('pending',), **fields):
+        """Change the state of advice `aid` under the lock, only from `want`
+        and only in the agent mode. False = it is not that advice any more
+        (replaced, dropped by a switch to the calendar)."""
+        with self.lock:
+            advice = self.persistent.get('advice')
+            if (self.mow_mode != 'agent' or not advice or advice.get('id') != aid
+                    or advice.get('state') not in want):
+                return False
+            advice['state'] = state
+            advice.update(fields)
+            self._save_state()
+        return True
+
+    def _expire_advice(self, now):
+        with self.lock:
+            advice = self.persistent.get('advice')
+            expires = self._parse_iso((advice or {}).get('expires'))
+            over = bool(advice and advice.get('state') == 'pending'
+                        and (expires is None or expires <= now))
+            if over:
+                advice['state'] = 'expired'
+                self._save_state()
+        if over:
+            self._decide('advice', 'expired', advice.get('program') or '', source='agent',
+                         id=advice.get('id'))
+
+    def _say_once(self, key, value):
+        """True the first time `key` says `value`: a wait is journalled once,
+        not every look."""
+        if self._said.get(key) == value:
+            return False
+        self._said[key] = value
+        return True
+
+    def _decide(self, kind, code, program='', source='', **detail):
+        """An autonomous decision: into the journal and /scheduler/mode."""
+        entry = {'t': self._now().strftime(self.ISO), 'kind': kind, 'code': code,
+                 'program': program or '', 'source': source, 'vars': detail}
+        with self.lock:
+            self.persistent['last_decision'] = entry
+            self._save_state()
+        self._journal(kind, code, program or '', source=source, **detail)
+        self._publish_mode()
+
+    def _agent_idle(self, now, pending, battery):
+        """IDLE in the agent mode, no run open. True = decided here; False = the
+        calendar decides (no fresh advice and agent_fallback_calendar)."""
+        self._expire_advice(now)
+        advice = self._advice_fresh(now)
+        if advice is None:
+            if self.settings['agent_fallback_calendar']:
+                if self._say_once('agent', 'fallback'):
+                    self._decide('advice', 'fallback', source='calendar')
+                return False
+            if self._say_once('agent', 'none'):
+                self._decide('advice', 'none', source='agent')
+            self._set_status("Idle (Agent: waiting for advice)", 'agent_no_advice')
+            self._agent_rest(now, None)
+            return True
+        self._said['agent'] = 'advice'
+        aid = advice['id']
+        # While an advice is in force the calendar's slots are the agent's to
+        # decide: closed as dealt with, never caught up later nor "missed".
+        for slot_dt, ev in pending:
+            self._close_slot(slot_dt, ev, 'advice_' + advice['action'], id=aid)
+        if advice['action'] == 'skip':
+            until = self._parse_iso(advice.get('until')) or self._parse_iso(advice['expires'])
+            if self._say_once(('advice', aid), 'skip'):
+                self._decide('advice', 'skip', source='agent', id=aid,
+                             until=advice.get('until'), reason=advice.get('reason'))
+            self._set_status("Idle (Agent: no mowing until %s)" % until.strftime("%d.%m. %H:%M"),
+                             'agent_skip', until=advice.get('until'))
+            self._agent_rest(now, until)
+            return True
+        prog = advice['program']
+        if advice.get('state') != 'pending':
+            self._set_status("Idle (Agent: %s done, waiting for advice)" % prog,
+                             'agent_advice_done', program=prog)
+            self._agent_rest(now, None)
+            return True
+        start = self._parse_iso(advice.get('from')) or now
+        end = self._parse_iso(advice.get('to')) or now
+        if now < start:
+            self._set_status("Idle (Agent: %s at %s)" % (prog, start.strftime("%H:%M")),
+                             'agent_wait_window', program=prog, at=advice.get('from'))
+            self._agent_rest(now, start)
+            return True
+        if now >= end:
+            if not self._advice_mark(aid, 'missed'):
+                return True
+            self._decide('advice', 'missed', prog, source='agent', id=aid,
+                         why=self._said.get(('advice', aid)))
+            self._set_status("Idle (Agent: %s missed its window)" % prog,
+                             'agent_advice_done', program=prog)
+            return True
+        code, detail, limit = self._start_blocker(now), {}, None
+        if code is None:
+            limit = self._limit_verdict(now, prog, advice.get('site'), fresh=True)
+            if limit is not None:
+                code, detail = 'limit:' + limit[0], limit[1]
+        if code is None:
+            # The owner's dock lock: an advice leaves the dock like any run of
+            # the agent, only with his permission (asked, not spent, here).
+            permitted, why, _rel = dock_permit.allowed()
+            if not permitted:
+                code, detail = 'dock:waiting_dock', {'dock': why}
+        if code is not None:
+            if self._say_once(('advice', aid), code):
+                self._decide('advice', 'waiting', prog, source='agent', id=aid,
+                             why=code, **detail)
+            if code.startswith('dock:'):
+                self._set_status("Idle (Agent: %s waits for the dock permission)" % prog,
+                                 'waiting_dock', program=prog, at=advice.get('to'))
+            else:
+                self._set_status("Idle (Agent: %s waits, %s)" % (prog, code),
+                                 'agent_blocked', program=prog, why=code)
+            if limit is not None:
+                self._limit_rest(now, limit[0], limit[1])
+            return True
+        if not self._advice_mark(aid, 'used', used=now.strftime(self.ISO)):
+            return True             # replaced or dropped meanwhile: nothing starts
+        self._decide('advice', 'run', prog, source='agent', id=aid,
+                     reason=advice.get('reason'), confidence=advice.get('confidence'))
+        ev = {'id': 'advice:' + aid, 'program_name': prog, 'site': advice.get('site'),
+              'enabled': True}
+        self._open_run(now, ev, advice=aid)
+        self._idle_run(self._run(), now, battery)
+        return True
+
+    def _dock_give_back(self, run):
+        """An advice run that spent the owner's permission and did not leave
+        the dock gives it back (owner: an unlock is used up only by leaving)."""
+        rel = (run or {}).get('dock_spent')
+        if rel and not run.get('started'):
+            dock_permit.give_back(rel)
+            if self.persistent.get('run') is not None:
+                self._update_run(dock_spent=None)
+
+    def _advice_run_may_go(self, run):
+        """An advice run goes only in the agent mode and with the dock permission.
+        False = held here (said, journalled once, or dropped)."""
+        prog = run.get('program', '')
+        self._dock_give_back(run)
+        if self.mow_mode != 'agent':
+            if not run.get('started'):
+                self._clear_interrupted()
+                self._journal('advice', 'dropped', prog, id=run.get('advice'))
+                return False
+        permitted, why, _rel = dock_permit.allowed()
+        if permitted:
+            return True
+        if self._say_once(('run', run.get('created')), 'waiting_dock'):
+            self._decide('advice', 'waiting', prog, source='agent', id=run.get('advice'),
+                         why='dock:waiting_dock', dock=why)
+        self._set_status("Idle (Agent: %s waits for the dock permission)" % prog,
+                         'waiting_dock', program=prog)
+        return False
+
+    def _close_slot(self, slot_dt, ev, why, **detail):
+        """A calendar slot the agent's advice has dealt with: never run later."""
+        with self.lock:
+            self.persistent.setdefault('closed_slot_by_event', {})[ev['id']] = \
+                slot_dt.strftime("%Y-%m-%d")
+            slot = slot_dt.strftime("%Y-%m-%dT%H:%M")
+            self._pending_view = [p for p in self._pending_view
+                                  if (p['event_id'], p['slot']) != (ev['id'], slot)]
+            self._save_state()
+        self._journal('skipped', why, ev.get('program_name', ''), slot=slot, **detail)
+
+    def _run_event(self, run):
+        """The event a run belongs to: the calendar's, or the advice's own."""
+        if run.get('advice'):
+            return {'id': run.get('event_id'), 'program_name': run.get('program', ''),
+                    'site': run.get('site'), 'enabled': True}
+        return self._find_event(run.get('event_id'))
+
+    def _next_day_start(self, now):
+        start = autonomy.parse_hhmm(self.settings['limit_day_start']) or (8, 0)
+        return MowerScheduler.next_window_start(now, start)
+
+    def _agent_rest(self, now, until):
+        """Sleep while the agent waits: outside the window until it opens, else
+        until `until` when there is one. In the window without one, stay up:
+        the agent may speak any time."""
+        if self._after_run_awake():
+            return
+        if not self._in_allowed_window(now):
+            self._sleep_until_window(now, 'agent')
+            return
+        if until is None:
+            return
+        seconds = MowerScheduler.real_seconds(now, until) - self.wake_lead_s
+        if seconds >= self.idle_sleep_threshold_s:
+            self._sleep_for('agent, %s' % until.strftime("%d.%m. %H:%M"), seconds)
+
+    # ---- hard limits of an autonomous start -------------------------------
+    def _limits_apply(self):
+        return self.mow_mode == 'agent' or bool(self.settings['limits_in_calendar'])
+
+    def _weather_summary(self):
+        """weather_alert.history.summary(), at most every WEATHER_CACHE_S."""
+        t = self._t()
+        if t - self._wx_t < self.WEATHER_CACHE_S:
+            return self._wx
+        self._wx_t = t
+        self._wx = None
+        if weather_history is not None:
+            try:
+                self._wx = weather_history.summary(t)
+            except Exception as e:  # noqa: BLE001 - no weather = the limits say unknown
+                rospy.logwarn("Weather summary failed: %s", str(e))
+        return self._wx
+
+    def _limit_verdict(self, now, program, site=None, fresh=True):
+        """The first hard limit that refuses this autonomous start: (code,
+        detail) or None. Missing data never refuses (the mission's own rain
+        checks stay); a resume (fresh=False) is not held by the zone gap."""
+        st = self.settings
+        start = autonomy.parse_hhmm(st['limit_day_start'])
+        end = autonomy.parse_hhmm(st['limit_day_end'])
+        if start and end and start != end and not MowerScheduler.within_window(
+                now, start, end):
+            return 'limit_night', {'start': st['limit_day_start'], 'end': st['limit_day_end']}
+        wx = self._weather_summary() or {}
+        stale = wx.get('stale') or {}
+        if self.mow_mode == 'agent' and (not wx or (stale.get('forecast')
+                                                    and stale.get('radar'))):
+            # The agent decides on weather: without a fresh word of radar or
+            # forecast it does not start. The calendar mode is unchanged.
+            return 'limit_weather_unknown', {'forecast_age_s': wx.get('forecast_age_s'),
+                                             'radar_age_s': wx.get('radar_age_s')}
+        need = float(st['limit_rain_h'])
+        since = 0.0 if wx.get('rain_last_h') else wx.get('hours_since_rain')
+        if need > 0 and isinstance(since, (int, float)) and since < need:
+            return 'limit_rain', {'hours_since_rain': round(since, 1), 'need_h': need}
+        temp = wx.get('temp_now')
+        if isinstance(temp, (int, float)) and temp < st['limit_temp_min_c']:
+            return 'limit_cold', {'temp': temp, 'min_c': st['limit_temp_min_c']}
+        gap = float(st['limit_zone_gap_days'])
+        if fresh and gap > 0 and program:
+            last = self._last_mowed(program, site)
+            if last is not None:
+                days = MowerScheduler.real_seconds(last[1], now) / 86400.0
+                if days < gap:
+                    return 'limit_zone_gap', {'zone': last[0], 'days': round(days, 1),
+                                              'need_days': gap}
+        return None
+
+    def _run_limited(self, run, now):
+        """A hard limit holds this run back. True = held here (said, waits or
+        the start is given up)."""
+        if run.get('manual') or not (run.get('advice') or self._limits_apply()):
+            return False
+        prog = run.get('program', '')
+        limit = self._limit_verdict(now, prog, run.get('site'), fresh=not run.get('started'))
+        if limit is None:
+            return False
+        code, detail = limit
+        source = 'agent' if run.get('advice') else 'calendar'
+        if code == 'limit_zone_gap':
+            # Too soon for this zone: this start is over, waiting would only
+            # hold the slots behind it.
+            self._clear_interrupted()
+            self._decide('skipped', code, prog, source=source, slot=run.get('slot'), **detail)
+            return True
+        if self._say_once(('run', run.get('created')), code):
+            self._decide('waited', code, prog, source=source, slot=run.get('slot'), **detail)
+        self._set_status("Idle (Limit %s, then %s)" % (code[len('limit_'):], prog), code,
+                         program=prog, **detail)
+        self._limit_rest(now, code, detail)
+        return True
+
+    def _limit_rest(self, now, code, detail):
+        if self._after_run_awake():
+            return
+        if code == 'limit_night':
+            seconds = MowerScheduler.real_seconds(now, self._next_day_start(now))
+        elif code == 'limit_rain':
+            seconds = (detail['need_h'] - detail['hours_since_rain']) * 3600.0
+        elif code == 'limit_cold':
+            seconds = self.temp_sleep_duration_s
+        else:
+            return
+        seconds -= self.wake_lead_s
+        if seconds >= self.idle_sleep_threshold_s:
+            self._sleep_for(code, seconds)
+
+    # ---- when a zone was last mowed ---------------------------------------
+    def _program_zones(self, prog, site=None):
+        """(site, [zone names]) of a program; ([], site) when not known."""
+        with self.lock:
+            for p in self.program_list:
+                if p.name == prog and (not site or getattr(p, 'map_name', '') == site):
+                    return (getattr(p, 'map_name', '') or site or '',
+                            [z.name for z in getattr(p, 'zone_list', None) or []])
+            for owner, progs in (self.site_programs or {}).items():
+                if site and owner != site:
+                    continue
+                for p in progs:
+                    if p.get('name') == prog:
+                        return owner, list(p.get('zone_names') or [])
+        return site or '', []
+
+    def _note_mowed(self, ref):
+        site, prog = (ref.split('|||', 1) if '|||' in ref else (None, ref))
+        site, zones = self._program_zones(prog.strip(), site)
+        at = self._now().strftime(self.ISO)
+        with self.lock:
+            last = self.persistent.setdefault('last_mow', {})
+            last.setdefault('programs', {})[prog.strip()] = at
+            for zone in zones:
+                last.setdefault('zones', {})['%s|%s' % (site, zone)] = at
+            self._save_state()
+
+    def _last_mowed(self, prog, site=None):
+        """(zone or program, datetime) of the newest mowing of what `prog` mows."""
+        site, zones = self._program_zones(prog, site)
+        with self.lock:
+            last = self.persistent.get('last_mow') or {}
+            by_zone = dict(last.get('zones') or {})
+            by_prog = dict(last.get('programs') or {})
+        seen = [(by_zone['%s|%s' % (site, z)], z) for z in zones
+                if '%s|%s' % (site, z) in by_zone]
+        if prog in by_prog:
+            seen.append((by_prog[prog], prog))
+        if not seen:
+            return None
+        at, what = max(seen)
+        when = self._parse_iso(at)
+        return (what, when) if when else None
+
+    # ---- what the UI and the agent read ------------------------------------
+    def _mode_view(self, now):
+        with self.lock:
+            advice = dict(self.persistent.get('advice') or {})
+            decision = self.persistent.get('last_decision')
+            changed = self.persistent.get('mode_changed')
+            last_mow = json.loads(json.dumps(self.persistent.get('last_mow') or {}))
+        if advice:
+            advice['fresh'] = self._advice_fresh(now) is not None
+        st = self.settings
+        program, site = self._next_target(now)
+        limit = (self._limit_verdict(now, program, site)
+                 if program and self._limits_apply() else None)
+        wx = self._weather_summary() or {}
+        permitted, why, _rel = (dock_permit.allowed() if self.mow_mode == 'agent'
+                                else (None, None, None))
+        return {
+            'mode': self.mow_mode,
+            'dock_permitted': permitted,      # the owner's dock lock (agent mode only)
+            'dock_why': why,
+            'state': self.state,
+            'automation': self.automation_on,
+            'held': self.is_inhibited,
+            'fallback': bool(st['agent_fallback_calendar']),
+            'limits_apply': self._limits_apply(),
+            'changed': changed,
+            'advice': advice or None,
+            'last_decision': decision,
+            'limit_now': ({'code': limit[0], 'vars': limit[1], 'program': program}
+                          if limit else None),
+            'limits': {'day_start': st['limit_day_start'], 'day_end': st['limit_day_end'],
+                       'rain_h': st['limit_rain_h'], 'temp_min_c': st['limit_temp_min_c'],
+                       'zone_gap_days': st['limit_zone_gap_days'],
+                       'in_calendar': bool(st['limits_in_calendar'])},
+            'weather': {'hours_since_rain': wx.get('hours_since_rain'),
+                        'rain_last_h': wx.get('rain_last_h'),
+                        'temp_now': wx.get('temp_now')} if wx else None,
+            'last_mow': last_mow,
+        }
+
+    def _publish_mode(self, view=None, force=False):
+        if view is None:
+            view = self._mode_view(self._now())
+        data = json.dumps(view, sort_keys=True, default=str)
+        if force or data != self._mode_last:
+            self._mode_last = data
+            self.mode_pub.publish(String(data))
+
     # =====================================================================
     # state: IDLE
     # =====================================================================
     def _sleep_for(self, reason, seconds):
         """Every idle decision to sleep comes here. Sleeping needs a reason to
         wake up (the caller has one), and a refused sleep just means waiting
-        awake."""
+        awake.
+
+        In the agent mode never past the next morning (limit_day_start): the
+        agent decides on a robot that is up, a sleep to a slot days ahead would
+        silence it."""
+        if self.mow_mode == 'agent':
+            look = self._next_day_start(self._now())
+            cap = MowerScheduler.real_seconds(self._now(), look) - self.wake_lead_s
+            if cap < seconds:
+                if cap < self.idle_sleep_threshold_s:
+                    return
+                seconds, reason = cap, reason + ', agent looks at ' + look.strftime("%H:%M")
         if self._execute_sleep(duration_ms=int(seconds * 1000)) is not False:
             self.log("[Master] Sleep (%s) for %.0fm." % (reason, seconds / 60.0))
 
@@ -2321,9 +2955,16 @@ class MasterController(object):
             self._idle_run(run, now, battery)
             return
 
+        # --- The agent decides: its advice, or the calendar standing in -----
+        if self.mow_mode == 'agent' and self._agent_idle(now, pending, battery):
+            return
+
         # --- A slot that is due (on time or caught up) ----------------------
         if pending and self._start_allowed(now):
             self._open_run(*pending[0])
+            if self.mow_mode == 'agent':
+                self._decide('advice', 'calendar', pending[0][1].get('program_name', ''),
+                             source='calendar', slot=pending[0][0].strftime("%Y-%m-%dT%H:%M"))
             self._idle_run(self._run(), now, battery)
             return
 
@@ -2357,15 +2998,18 @@ class MasterController(object):
                 self._sleep_for('next ' + next_ev['program_name'],
                                 time_until_s - self.wake_lead_s)
 
-    def _open_run(self, slot_dt, ev):
+    def _open_run(self, slot_dt, ev, **extra):
         run = self._new_run(ev, slot_dt)
+        run.update(extra)
         with self.lock:
             self.persistent['run'] = run
             self.persistent['interrupted_event_id'] = ev['id']
             self.persistent['interrupted_reason'] = None
-            # Whatever becomes of the run, this slot has been dealt with.
-            self.persistent['closed_slot_by_event'][ev['id']] = \
-                slot_dt.strftime("%Y-%m-%d")
+            # Whatever becomes of the run, this slot has been dealt with. An
+            # advice has no slot: nothing to close, nothing to keep for ever.
+            if not run.get('advice'):
+                self.persistent['closed_slot_by_event'][ev['id']] = \
+                    slot_dt.strftime("%Y-%m-%d")
             self._save_state()
             slot = slot_dt.strftime("%Y-%m-%dT%H:%M")
             self._pending_view = [p for p in self._pending_view
@@ -2380,19 +3024,7 @@ class MasterController(object):
         every check says it could start: no second set of rules, and a refusal
         says which check. Its slot is used up, it does not run again."""
         now = self._now()
-        code = None
-        if self.state != self.STATE_IDLE:
-            code = 'busy:%s' % self.state
-        elif self._run() is not None:
-            code = 'run_open'
-        elif self._countdown:
-            code = 'countdown'
-        else:
-            for c in self._start_checks(now):
-                if (c['state'] in ('block', 'wait')
-                        or (c['state'] == 'off' and c['key'] in ('automation', 'programs'))):
-                    code = '%s:%s' % (c['key'], c['code'])
-                    break
+        code = self._start_blocker(now)
         with self.lock:
             pending = list(self._pending_view)
         slot_dt, ev = self._next_slot(now)
@@ -2406,16 +3038,32 @@ class MasterController(object):
         if code is not None:
             self._command_result('run_next', False, code)
             return
-        self._open_run(slot_dt, ev)
+        # The owner's button: a start by hand, the hard limits are not asked.
+        self._open_run(slot_dt, ev, manual=True)
         self._command_result('run_next', True, 'starting')
         self._last_idle_eval = self._t()
         self._idle_run(self._run(), now, self.battery_capacity)
+
+    def _start_blocker(self, now):
+        """What stops a start right now, as 'key:code', or None. The one gate of
+        Run next and of the agent's advice: every check of the report."""
+        if self.state != self.STATE_IDLE:
+            return 'busy:%s' % self.state
+        if self._run() is not None:
+            return 'run_open'
+        if self._countdown:
+            return 'countdown'
+        for c in self._start_checks(now):
+            if (c['state'] in ('block', 'wait')
+                    or (c['state'] == 'off' and c['key'] in ('automation', 'programs'))):
+                return '%s:%s' % (c['key'], c['code'])
+        return None
 
     def _idle_run(self, run, now, battery):
         """The robot is free, in the dock, and a run is open: go or say why not."""
         prog = run.get('program', '')
         t = self._t()
-        ev = self._find_event(run.get('event_id'))
+        ev = self._run_event(run)
         if ev is None or not ev.get('enabled', False):
             self._give_up(run, 'run_event_removed')
             return
@@ -2472,6 +3120,12 @@ class MasterController(object):
             self._sleep_to_charge(prog)
             return
 
+        if self._run_limited(run, now):
+            return
+
+        if run.get('advice') and not self._advice_run_may_go(run):
+            return
+
         if not self._program_on_map(prog, run.get('site')):
             self._after_rejected(run, 'not_on_map')
             return
@@ -2487,6 +3141,13 @@ class MasterController(object):
             return
         prog = run['program']
         resume = bool(run.get('started'))
+        if run.get('advice'):
+            permitted, why, rel = dock_permit.allowed()
+            if not permitted or not dock_permit.spend(rel):
+                self._set_status("Idle (Agent: %s waits for the dock permission)" % prog,
+                                 'waiting_dock', program=prog)
+                return
+            self._update_run(dock_spent=rel)
         self.log("[Master] %s program: %s (%s)" % (
             "Resuming" if resume else "Starting scheduled", prog,
             run.get('reason') or 'slot'))
@@ -2678,8 +3339,10 @@ class MasterController(object):
             return
         day = (run.get('slot') or self._now().strftime("%Y-%m-%d"))[:10]
         with self.lock:
-            self.persistent['last_run_by_event'][run['event_id']] = day
+            if not run.get('advice'):
+                self.persistent['last_run_by_event'][run['event_id']] = day
             run['started'] = True
+            run['dock_spent'] = None      # really used: the mission left its checks
             self._save_state()
         self._journal('started', 'started', run.get('program', ''), slot=run.get('slot'))
 

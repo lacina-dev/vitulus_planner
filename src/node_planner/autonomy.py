@@ -85,6 +85,20 @@ FIELDS = [
     _f('run_max_age_h', 'float', 'recovery', 'run_max_age_h', 48.0, 1, 168, 'h', True),
     _f('off_dock_wait_min', 'float', 'recovery', 'off_dock_wait_s', 20.0, 1, 240,
        'min', True, div=60.0),
+    # --- agent (who decides: docs/AUTONOMY.md "Calendar or agent") ---
+    # No fresh advice of the agent: the calendar decides meanwhile (and the hard
+    # limits below apply to it). Off: without advice nothing starts.
+    _f('agent_fallback_calendar', 'bool', 'agent', 'agent_fallback_calendar', True),
+    # The hard limits of an autonomous start. Always in the agent mode (advice
+    # and the calendar standing in for it); in the calendar mode only with this
+    # on, so the calendar behaves as it did until the owner says otherwise.
+    # Never for a Run by hand, nor for Run next.
+    _f('limits_in_calendar', 'bool', 'agent', 'limits_in_calendar', False),
+    _f('limit_rain_h', 'float', 'agent', 'limit_after_rain_h', 3.0, 0, 48, 'h'),
+    _f('limit_temp_min_c', 'float', 'agent', 'limit_min_temp_c', 5.0, -10, 25, 'C'),
+    _f('limit_zone_gap_days', 'float', 'agent', 'limit_zone_gap_days', 2.0, 0, 14, 'd'),
+    _f('limit_day_start', 'time', 'agent', 'limit_day_start', '08:00'),
+    _f('limit_day_end', 'time', 'agent', 'limit_day_end', '20:00'),
 ]
 BY_KEY = {f['key']: f for f in FIELDS}
 
@@ -126,8 +140,8 @@ def defaults(get_param):
         if f.get('invert'):
             value = not value
         out[f['key']] = value
-    out['window_start'] = str(out['window_start'])
-    out['window_end'] = str(out['window_end'])
+    for key in ('window_start', 'window_end', 'limit_day_start', 'limit_day_end'):
+        out[key] = str(out[key])
     out['wake_before_min'] = (get_param('~wake_before_program_s', 600.0)
                               + get_param('~boot_time_buffer_s', 120.0)) / 60.0
     return out
@@ -240,7 +254,8 @@ def _clean_value(f, value, now):
 # so an old value (a short window from /scheduler/set_window) cannot block the rest.
 GROUPS = (('battery_start_pct', 'battery_return_pct', 'battery_resume_pct'),
           ('window_enabled', 'window_start', 'window_end', 'window_min_left_min'),
-          ('catchup_max_h', 'wake_before_min'))
+          ('catchup_max_h', 'wake_before_min'),
+          ('limit_day_start', 'limit_day_end'))
 
 
 def _group(key):
@@ -267,6 +282,9 @@ def cross_check(values, boot_grace_s=300.0):
         length = ((end[0] - begin[0]) * 60 + end[1] - begin[1]) % 1440
         if values['window_min_left_min'] >= length:
             bad['window_min_left_min'] = 'window_too_short'
+    if ('limit_day_start' in values
+            and values['limit_day_start'] == values.get('limit_day_end')):
+        bad['limit_day_end'] = 'window_equal'
     # A robot that wakes for a slot and is late must still catch it after booting.
     if values['catchup_max_h'] * 3600.0 < values['wake_before_min'] * 60.0 + boot_grace_s:
         bad['catchup_max_h'] = 'catchup_under_wake'

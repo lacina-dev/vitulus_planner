@@ -90,3 +90,65 @@ No commit, push, restarts, publishing to live ROS. Worktrees `<repo>/.claude/wor
 Tests without a ROS master, once at the end, per file. UI text through i18n en + cs in the same step, help en +
 cs. Notebook first, phone must work. Panel anatomy: one layout, no left stripe, nothing jumps, state
 remembered. `tools/build_index.py` is never run. Questions via SendMessage to "main".
+
+## 6. Calendar or agent (2026-11-08)
+
+Owner: "Agent to má umět. Uživatel mu řekne, že to má dělat, nebo uživatel může přepínat Kalendář/Agent."
+The robot keeps the hard limits; the agent only advises. Default after deploy: `calendar`, nothing changes
+until the owner switches.
+
+| Topic / service | Dir | Payload |
+|---|---|---|
+| `/scheduler/set_mode` | in, `std_msgs/String` | `"agent"` \| `"calendar"`, or `{"mode","by","enable"}`; `enable: true` also turns the automation on |
+| `/scheduler/set_agent_mode` | service `std_srvs/SetBool` | `true` = agent, `false` = calendar |
+| `/scheduler/mode` | latched `String` | `{"mode","state","automation","held","fallback","limits_apply","changed":{t,by},"advice":{...,"state","fresh"},"last_decision":{t,kind,code,program,source,vars},"limit_now":{code,vars,program}\|null,"limits":{day_start,day_end,rain_h,temp_min_c,zone_gap_days,in_calendar},"weather":{hours_since_rain,rain_last_h,temp_now},"last_mow":{zones,programs}}`; also `report.mode` |
+| `/scheduler/advice` | in, `String` JSON | `{"id","action":"mow"\|"skip","program":"Name"\|"MAP\|\|\|Name","from","to","until","ttl_s":60..172800 \| "expires","reason","confidence":0..1,"by"}`; times local `YYYY-MM-DDTHH:MM[:SS]` |
+| `/scheduler/advice_result` | latched `String` | `{"id","ok","code"}`: `stored`, `duplicate`, `mode_calendar`, `action`, `ttl`, `window`, `program`, `not_on_map`, `invalid` |
+| `/scheduler/command_result` | latched | `{"cmd":"set_mode","ok","code":"changed\|same\|invalid"}` |
+
+State (`scheduler_state.json`): `mow_mode`, `mode_changed`, `advice` (states `pending → used | missed | expired
+| dropped`), `last_decision`, `last_mow` (`{"zones":{"site|zone":ISO},"programs":{name:ISO}}`, written when a mission ends
+`succeeded`, a Run by hand too; an unfinished program is not recorded, so finishing it is never
+held back by the zone gap).
+
+Agent mode, IDLE in the dock, no run open:
+- Fresh mow advice in its window: the same gate as Run next (`_start_blocker`, every check of the report,
+  allowed window and `no_mow_until` included) plus the hard limits plus **the owner's dock permission**
+  (below); then a run with `event_id advice:<id>`
+  opens and goes through `_idle_run` like a calendar run (battery, map, resume after rain...). Before the window:
+  wait (sleep until it opens). Window over unstarted: `missed`.
+- Fresh skip advice: nothing starts until `until`; calendar slots in that time are closed (`skipped
+  advice_skip`), never caught up.
+- While any advice is in force, calendar slots are the agent's (`skipped advice_mow`).
+- No fresh advice: `agent_fallback_calendar` on (default) = the calendar decides, with the hard limits; off =
+  nothing starts (`agent_no_advice`).
+- Sleeps are capped at the next `limit_day_start`, so the agent gets its morning look.
+
+Dock permission (owner, 2026-11-08: granting the dock stays with him). One question, one function:
+`node_planner/dock_permit.allowed()` → `vitulus_agent.v2.ros_wire.dock_permitted('mower.program_run')`
+→ `(ok, why, release)`, nothing spent, fail-closed (no module or unreadable lock = no). It reads the
+owner's unlock (UI decision in `~/.vitulus/agent/v2/work.db` `dock_release`, fallback
+`/etc/vitulus/dock_release.yaml`); when the lock becomes a time window, only `read_release` /
+`dock_permitted` change. An advice run asks before it opens and again before every start and resume
+(`_advice_run_may_go`); without it: status `waiting_dock`, journal `advice/waiting why=dock:waiting_dock`
+once, the advice stays pending. `_go` spends one use (`dock_permit.spend`) right before the program;
+a start that did not leave the dock (rejected, given up) gives it back (`give_back`). Calendar runs,
+also as the agent's fallback, do not ask (the owner planned those slots). The agent asks the same
+function before sending: no permission = no advice, one message to the owner.
+
+Hard limits (`_limit_verdict`), settings group `agent`: `limit_day_start/end` 08:00–20:00 (starts only),
+`limit_rain_h` 3 (hours since rain from `weather_alert.history.summary`), `limit_temp_min_c` 5, `limit_zone_gap_days`
+2 (fresh starts only, from `last_mow`). In the agent mode always; in the calendar mode only with
+`limits_in_calendar` (default off). Never for a Run by hand or Run next (`run.manual`). In the agent
+mode, no weather at all or radar AND forecast both stale = `limit_weather_unknown` (no start); a single
+missing value never refuses, and in the calendar mode missing weather never refuses. `limit_day_end`
+only stops new starts: a run already out ends with the allowed window (default 21:00, `_check_window_end`). A zone gap gives the start up (`skipped limit_zone_gap`); the others wait (`waited limit_*`) and sleep
+until the limit can lift.
+
+Journal (new codes, UI translates): `mode/agent|calendar`; `advice/received|rejected|run|skip|waiting|missed|
+expired|dropped|fallback|none|calendar`; `waited/limit_night|limit_rain|limit_cold|limit_weather_unknown`; `skipped/limit_zone_gap|
+advice_skip|advice_mow`. Status codes: `agent_no_advice`, `agent_skip`, `agent_wait_window`, `agent_blocked`,
+`agent_advice_done`, `waiting_dock`, `limit_night|limit_rain|limit_cold|limit_weather_unknown`.
+`/scheduler/mode` also has `dock_permitted`, `dock_why` (agent mode). Advice state changes go through
+`_advice_mark` under the lock (only from `pending`, only in the agent mode): a switch to the calendar
+wins over a tick that read the old mode; `_advice_fresh` returns a copy.

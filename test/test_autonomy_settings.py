@@ -200,7 +200,11 @@ class Defaults(Base):
             'idle_sleep_threshold_min': 20.0, 'wake_before_min': 12.0,
             'sleep_after_run': True, 'stay_awake_until': None, 'temp_wait_h': 1.0,
             'temp_spike_wait_min': 5.0, 'error_retry_max': 3, 'resume_max': 12,
-            'run_max_age_h': 48.0, 'off_dock_wait_min': 20.0, 'auto_hw_reset': False}
+            'run_max_age_h': 48.0, 'off_dock_wait_min': 20.0, 'auto_hw_reset': False,
+            # calendar or agent (docs/AUTONOMY.md section 6): calendar unchanged
+            'agent_fallback_calendar': True, 'limits_in_calendar': False,
+            'limit_rain_h': 3.0, 'limit_temp_min_c': 5.0, 'limit_zone_gap_days': 2.0,
+            'limit_day_start': '08:00', 'limit_day_end': '20:00'}
         self.assertEqual(v, today)
         self.assertEqual(set(v), set(A.BY_KEY))
         self.assertEqual(self.mc.wake_lead_s,
