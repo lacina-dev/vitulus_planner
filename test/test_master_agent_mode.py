@@ -596,5 +596,68 @@ class Sleep(Base):
         self.assertLessEqual(ms / 1000.0, 20 * 3600 + 1)   # to 08:00 tomorrow
 
 
+class ReasonCode(Base):
+    """T22 (N6): the advice's reason also as a code for the UI; never decides."""
+
+    def test_code_and_vars_go_to_mode_and_journal(self):
+        self.agent()
+        res = self.advise(reason='pršelo před 1.0 h', reason_code='rain_recent',
+                          reason_vars={'h': 1.0, 'need': 3})
+        self.assertEqual(res['code'], 'stored')
+        adv = self.mode()['advice']
+        self.assertEqual((adv['reason'], adv['reason_code'], adv['reason_vars']),
+                         ('pršelo před 1.0 h', 'rain_recent', {'h': 1.0, 'need': 3}))
+        rows = [json.loads(x) for x in published('/scheduler/journal')][-1]['entries']
+        got = [e['vars'] for e in rows if (e['kind'], e['code']) == ('advice', 'received')]
+        self.assertEqual((got[-1]['reason_code'], got[-1]['reason_vars']),
+                         ('rain_recent', {'h': 1.0, 'need': 3}))
+        self.tick()
+        self.assertEqual(self.starts(), ['Mow'])        # the code changes nothing
+        self.assertEqual(self.mode()['last_decision']['vars']['reason_code'], 'rain_recent')
+
+    def test_old_agent_and_bad_codes(self):
+        self.agent()
+        self.advise(reason='plain words')
+        self.assertNotIn('reason_code', self.mode()['advice'])
+        for bad in ('Rain', '1x', 'a b', 'x' * 41, 7, ''):
+            self.advise(reason='r', reason_code=bad)
+            self.assertNotIn('reason_code', self.mode()['advice'], bad)
+        self.advise(reason='r', reason_code='mow', reason_vars={'s': 'x' * 2000})
+        self.assertEqual(self.mode()['advice']['reason_vars'], {})
+        self.advise(reason='r', reason_code='mow', reason_vars=['not', 'a', 'dict'])
+        self.assertEqual(self.mode()['advice']['reason_vars'], {})
+
+
+class WeatherCache(Base):
+    """T22 (N8): summary() is read at most every WEATHER_CACHE_S, timed, and
+    read again when the clock went back."""
+
+    def test_cache_cost_and_clock_back(self):
+        calls = []
+        saved = M.weather_history
+        M.weather_history = type('H', (), {'summary': staticmethod(
+            lambda t: calls.append(t) or dict(DRY))})
+        try:
+            mc = self.make()
+            del mc._weather_summary                  # the real, cached one
+            mc._wx_t = -1e12
+            del calls[:]                             # the constructor read it on the real clock
+            mc._weather_summary()
+            mc._weather_summary()
+            self.assertEqual(len(calls), 1)
+            self.assertIsNotNone(mc._wx_cost_s)
+            self.at(2026, 6, 10, 9, 4, 59)
+            mc._weather_summary()
+            self.assertEqual(len(calls), 1)
+            self.at(2026, 6, 10, 9, 5, 0)
+            mc._weather_summary()
+            self.assertEqual(len(calls), 2)
+            self.at(2026, 6, 10, 8, 0)               # the clock was fixed backwards
+            self.assertEqual(mc._weather_summary(), DRY)
+            self.assertEqual(len(calls), 3)
+        finally:
+            M.weather_history = saved
+
+
 if __name__ == '__main__':
     unittest.main()

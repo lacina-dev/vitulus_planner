@@ -592,6 +592,7 @@ class MasterController(object):
         self._report_t = 0.0
         self._wx = None               # weather_alert.history.summary(), cached
         self._wx_t = -1e12
+        self._wx_cost_s = None        # T22 (N8): the last summary() read, s
         self._said = {}               # journal once: key -> what was last said
         self._mode_last = None
 
@@ -2323,6 +2324,9 @@ class MasterController(object):
     ADVICE_TTL_MAX_S = 48 * 3600.0
     ADVICE_TTL_DEFAULT_S = 6 * 3600.0
     WEATHER_CACHE_S = 300.0
+    # T22 (N8): summary() runs in the 1 Hz main loop (a sleep countdown counts
+    # ticks); a slower read is said in the log, the value is used as before.
+    WEATHER_SLOW_S = 0.1
     ISO = "%Y-%m-%dT%H:%M:%S"
 
     @staticmethod
@@ -2413,7 +2417,10 @@ class MasterController(object):
            "from": "YYYY-MM-DDTHH:MM", "to": "..."   (mow: start window, local),
            "until": "..."                      (skip: no mowing until),
            "ttl_s": 60..172800 | "expires": "...",
-           "reason": "...", "confidence": 0..1, "by": "agent"}
+           "reason": "...", "confidence": 0..1, "by": "agent",
+           "reason_code": "rain_recent", "reason_vars": {...}   (T22, optional)}
+        reason is the agent's own words (its language); reason_code/vars say
+        the same as data for the UI to translate. Neither decides anything.
         Returns (ok, code, advice). Nothing starts here: IDLE carries it out."""
         now = self._now()
         try:
@@ -2481,15 +2488,47 @@ class MasterController(object):
                   'reason': str(req.get('reason') or '')[:300],
                   'confidence': conf, 'by': str(req.get('by') or 'agent')[:40],
                   'received': now.strftime(self.ISO), 'state': 'pending'}
+        why_code, why_vars = self._reason_code(req)
+        if why_code:
+            advice.update(reason_code=why_code, reason_vars=why_vars)
         with self.lock:
             self.persistent['advice'] = advice
             self._save_state()
         self._said.pop('agent', None)
         self._decide('advice', 'received', program, source='agent', id=aid, action=action,
                      start=advice['from'], end=advice['to'], until=advice['until'],
-                     reason=advice['reason'], confidence=conf)
+                     reason=advice['reason'], confidence=conf, **self._reason_of(advice))
         self._last_idle_eval = 0.0
         return True, 'stored', advice
+
+    REASON_CODE_MAX = 40
+    REASON_VARS_MAX = 1000          # bytes of JSON
+
+    @classmethod
+    def _reason_code(cls, req):
+        """T22: (code, vars) of the advice's reason as data, (None, None) when
+        missing or malformed. Only shown by the UI, never decides."""
+        code = req.get('reason_code')
+        if (not isinstance(code, str) or not code or len(code) > cls.REASON_CODE_MAX
+                or not all(c.islower() or c.isdigit() or c == '_' for c in code)
+                or not code[0].isalpha()):
+            return None, None
+        got = req.get('reason_vars')
+        got = got if isinstance(got, dict) else {}
+        try:
+            if len(json.dumps(got)) > cls.REASON_VARS_MAX:
+                got = {}
+        except (TypeError, ValueError):
+            got = {}
+        return code, got
+
+    @staticmethod
+    def _reason_of(advice):
+        """The reason code of a stored advice for a journal entry, or nothing."""
+        if not advice.get('reason_code'):
+            return {}
+        return {'reason_code': advice['reason_code'],
+                'reason_vars': advice.get('reason_vars') or {}}
 
     def _advice_fresh(self, now):
         """The advice in force: agent mode and not expired. No side effects."""
@@ -2574,7 +2613,8 @@ class MasterController(object):
             until = self._parse_iso(advice.get('until')) or self._parse_iso(advice['expires'])
             if self._say_once(('advice', aid), 'skip'):
                 self._decide('advice', 'skip', source='agent', id=aid,
-                             until=advice.get('until'), reason=advice.get('reason'))
+                             until=advice.get('until'), reason=advice.get('reason'),
+                             **self._reason_of(advice))
             self._set_status("Idle (Agent: no mowing until %s)" % until.strftime("%d.%m. %H:%M"),
                              'agent_skip', until=advice.get('until'))
             self._agent_rest(now, until)
@@ -2634,7 +2674,8 @@ class MasterController(object):
         if not self._advice_mark(aid, 'used', used=now.strftime(self.ISO)):
             return True             # replaced or dropped meanwhile: nothing starts
         self._decide('advice', 'run', prog, source='agent', id=aid,
-                     reason=advice.get('reason'), confidence=advice.get('confidence'))
+                     reason=advice.get('reason'), confidence=advice.get('confidence'),
+                     **self._reason_of(advice))
         ev = {'id': 'advice:' + aid, 'program_name': prog, 'site': advice.get('site'),
               'enabled': True}
         self._open_run(now, ev, advice=aid)
@@ -2715,17 +2756,24 @@ class MasterController(object):
         return self.mow_mode == 'agent' or bool(self.settings['limits_in_calendar'])
 
     def _weather_summary(self):
-        """weather_alert.history.summary(), at most every WEATHER_CACHE_S."""
+        """weather_alert.history.summary(), at most every WEATHER_CACHE_S.
+        A clock that went back (GNSS/NTP fixing the time) reads again: the
+        cache must not hold until the clock catches up (T22)."""
         t = self._t()
-        if t - self._wx_t < self.WEATHER_CACHE_S:
+        if 0.0 <= t - self._wx_t < self.WEATHER_CACHE_S:
             return self._wx
         self._wx_t = t
         self._wx = None
         if weather_history is not None:
+            t0 = time.monotonic()
             try:
                 self._wx = weather_history.summary(t)
             except Exception as e:  # noqa: BLE001 - no weather = the limits say unknown
                 rospy.logwarn("Weather summary failed: %s", str(e))
+            self._wx_cost_s = time.monotonic() - t0
+            if self._wx_cost_s > self.WEATHER_SLOW_S:
+                rospy.logwarn("Weather summary took %.0f ms (the main loop waited).",
+                              self._wx_cost_s * 1000.0)
         return self._wx
 
     def _limit_verdict(self, now, program, site=None, fresh=True):
