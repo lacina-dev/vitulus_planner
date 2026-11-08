@@ -2582,8 +2582,9 @@ class MasterController(object):
                 self._set_status("Idle (Agent: %s waits for the dock permission)" % prog,
                                  'waiting_dock', program=prog, at=advice.get('to'))
             else:
+                # the limit's numbers go along: the UI says "1.5 h since rain, 3 h needed"
                 self._set_status("Idle (Agent: %s waits, %s)" % (prog, code),
-                                 'agent_blocked', program=prog, why=code)
+                                 'agent_blocked', program=prog, why=code, **detail)
             if limit is not None:
                 self._limit_rest(now, limit[0], limit[1])
             return True

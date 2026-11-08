@@ -310,6 +310,9 @@ class Limits(Base):
         self.tick(3)
         self.assertEqual(self.starts(), [])
         self.assertEqual(self.mc._code, 'agent_blocked')
+        # the UI writes the limit with its numbers: they go along with the code
+        self.assertEqual(self.mc._code_detail.get('why'), 'limit:limit_rain')
+        self.assertEqual((self.mc._code_detail.get('hours_since_rain'), self.mc._code_detail.get('need_h')), (1.0, 3.0))
         waits = [e for e in self.journal('advice') if e[1] == 'waiting']
         self.assertEqual(len(waits), 1)            # once, not every look
         self.wx = dict(DRY)
