@@ -126,17 +126,27 @@ Agent mode, IDLE in the dock, no run open:
 - Sleeps are capped at the next start of the allowed window (its start also while it is off), so the
   agent gets its morning look.
 
-Dock permission (owner, 2026-11-08: granting the dock stays with him). One question, one function:
-`node_planner/dock_permit.allowed()` → `vitulus_agent.v2.ros_wire.dock_permitted('mower.program_run')`
-→ `(ok, why, release)`, nothing spent, fail-closed (no module or unreadable lock = no). It reads the
-owner's unlock (UI decision in `~/.vitulus/agent/v2/work.db` `dock_release`, fallback
-`/etc/vitulus/dock_release.yaml`); when the lock becomes a time window, only `read_release` /
-`dock_permitted` change. An advice run asks before it opens and again before every start and resume
-(`_advice_run_may_go`); without it: status `waiting_dock`, journal `advice/waiting why=dock:waiting_dock`
-once, the advice stays pending. `_go` spends one use (`dock_permit.spend`) right before the program;
-a start that did not leave the dock (rejected, given up) gives it back (`give_back`). Calendar runs,
-also as the agent's fallback, do not ask (the owner planned those slots). The agent asks the same
-function before sending: no permission = no advice, one message to the owner.
+Dock permission (owner, 2026-11-08: granting the dock stays with him; T18: a time window held by the
+robot layer, not the agent). The `dock_permit` node (`vitulus_dock`, contract `t18-kontrakt.md`)
+publishes latched `/dock_permit/state`; the master subscribes and asks one function:
+`node_planner/dock_permit.allowed()` → `(ok, why, state)`, nothing spent, fail-closed (no state, a state
+older than 30 s or unreadable = no). The master no longer depends on the agent. It is read only before the
+robot leaves the dock (K1): driving, mowing or coming home are never blocked by it. An advice run asks
+before it opens and again right before every start and resume (`_advice_run_may_go`, `_go`); without it:
+status `waiting_dock`, journal `advice/waiting why=dock:waiting_dock` once, the advice stays pending. The
+node counts the exits itself (a start that did not leave the dock never counts), so nothing is spent or
+given back (`spend`/`give_back` are no-ops). Calendar runs, also as the agent's fallback, and Run next by
+hand do not ask (D37); the report's checks show a `permit` line only for a run that asks it.
+
+End of a window with the robot out (D38): the node sets `homeward` {since, deadline = +300 s}. For a run
+of the agent's advice (`~dock_permit_homeward`, default `agent`; `all` = calendar runs too, `none` = never;
+open question Q2) the master asks the mission to finish the path (`/mower_smach/finish_after_path`) and at
+the deadline sends it home (`/mower_smach/return_home` "dock_permit"); journal `dock_permit/homeward`. The
+run ends interrupted with the reason `dock_permit` (also when the path boundary reports
+`interrupted:window`) and resumes only with a new permit. A new window from now drops `homeward`: the
+request is taken back (`dock_permit/homeward_cancel`). `/scheduler/mode` has `dock_homeward` (agent mode).
+The agent asks the same permit (the node's state file, `dock_permit.reader`) before sending: no permission
+= no advice, one message to the owner.
 
 Hard limits (`_limit_verdict`), settings group `agent`: night = **the allowed window** (`window_enabled/_start/_end`,
 group `plan`; owner 2026-11-08: one window for the calendar and the agent, `_night_verdict` = `_window_verdict`: closed,
@@ -155,6 +165,6 @@ Journal (new codes, UI translates): `mode/agent|calendar`; `advice/received|reje
 expired|dropped|fallback|none|calendar`; `waited/limit_night|limit_rain|limit_cold|limit_weather_unknown`; `skipped/limit_zone_gap|
 advice_skip|advice_mow`. Status codes: `agent_no_advice`, `agent_skip`, `agent_wait_window`, `agent_blocked`,
 `agent_advice_done`, `waiting_dock`, `limit_night|limit_rain|limit_cold|limit_weather_unknown`.
-`/scheduler/mode` also has `dock_permitted`, `dock_why` (agent mode). Advice state changes go through
+`/scheduler/mode` also has `dock_permitted`, `dock_why`, `dock_homeward` (agent mode). Advice state changes go through
 `_advice_mark` under the lock (only from `pending`, only in the agent mode): a switch to the calendar
 wins over a tick that read the old mode; `_advice_fresh` returns a copy.

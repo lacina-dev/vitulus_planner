@@ -405,6 +405,10 @@ class MasterController(object):
         self.no_progress_max = rospy.get_param('~resume_no_progress_max', 3)
         self.window_overrun_s = rospy.get_param(
             '~window_overrun_max_min', 30.0) * 60.0
+        # T18 Q2 (owner decides): which run the end of a dock permit window
+        # sends home (D38).  agent (default) | all | none -- one place.
+        self.dock_permit_homeward = dock_permit.homeward_for(rospy.get_param(
+            '~dock_permit_homeward', dock_permit.HOMEWARD_FOR))
         self.mission_lost_grace_s = rospy.get_param(
             '~mission_lost_grace_s', 20.0)
         self.agent_status_max_age_s = rospy.get_param(
@@ -573,6 +577,9 @@ class MasterController(object):
         self._window_end_sent = 0.0
         self._window_end_first = 0.0
         self._window_moved = False    # changed while mowing: _check_window_end
+        # T18 homeward (D38): the dock permit ended with the robot out.
+        self._homeward = {'key': None, 'first': 0.0, 'sent': 0.0, 'due': 0.0,
+                          'home_sent': False}
         self._window_error = None     # the last refused /scheduler/set_window
         self._sleep_replan = False    # changed during a sleep sequence
         self._attached = False
@@ -683,6 +690,9 @@ class MasterController(object):
         # ---- subscribers ---------------------------------------------------
         rospy.Subscriber('/dock_manager/is_in_dock_confirmed', Bool,
                          self.dock_callback)
+        # T18: the owner's dock permit, straight from the robot layer (no agent).
+        rospy.Subscriber(dock_permit.STATE_TOPIC, String,
+                         lambda m: dock_permit.on_state(m.data), queue_size=1)
         rospy.Subscriber('/web_plan/program_list', PlannerProgramList,
                          self.programs_callback)
         rospy.Subscriber('/mapping_manager/status', String,
@@ -1786,6 +1796,12 @@ class MasterController(object):
         _, ev = self._next_slot(now)
         return (ev.get('program_name'), ev.get('site')) if ev else (None, None)
 
+    def _advice_pending(self, now):
+        """A fresh \"mow\" advice not started yet (what the next run would be)."""
+        advice = self._advice_fresh(now)
+        return bool(advice is not None and advice['action'] == 'mow'
+                    and advice.get('state') == 'pending')
+
     def _start_checks(self, now):
         """Could it start now, key by key. Every line asks the predicate the
         decision asks; nothing is judged here."""
@@ -1812,6 +1828,14 @@ class MasterController(object):
         add('hold', 'block' if self.is_inhibited else 'ok',
             'held' if self.is_inhibited else 'clear')
         add('dock', 'ok' if in_dock else 'block', 'in_dock' if in_dock else 'not_in_dock')
+        # T18: the owner's dock permit, only for what asks it (an advice run,
+        # D36/D37); a calendar run never shows (nor asks) it.
+        if (self._permit_needed(run) if run else
+                (self.mow_mode == 'agent' and self._advice_pending(now))):
+            p_ok, p_why, p_state = dock_permit.allowed()
+            act = (p_state or {}).get('active') or {}
+            add('permit', 'ok' if p_ok else 'wait', 'open' if p_ok else p_why,
+                to=act.get('to'), exits_left=act.get('exits_left'))
 
         busy = self._busy_verdict(hold=False)
         grace = self.boot_grace_period_s - (t - self.node_start_time)
@@ -2260,7 +2284,6 @@ class MasterController(object):
         manual Resume, free the calendar for the next slot."""
         self._issue(code, run.get('program', ''), slot=run.get('slot'),
                     checkpoint=run.get('checkpoint'), **detail)
-        self._dock_give_back(run)
         self._clear_interrupted()
 
     def _program_checkpoint(self, prog_name, site=None):
@@ -2610,21 +2633,20 @@ class MasterController(object):
         self._idle_run(self._run(), now, battery)
         return True
 
-    def _dock_give_back(self, run):
-        """An advice run that spent the owner's permission and did not leave
-        the dock gives it back (owner: an unlock is used up only by leaving)."""
-        rel = (run or {}).get('dock_spent')
-        if rel and not run.get('started'):
-            dock_permit.give_back(rel)
-            if self.persistent.get('run') is not None:
-                self._update_run(dock_spent=None)
+    @staticmethod
+    def _permit_needed(run):
+        """Does this run leave the dock only with the owner's dock permit?
+        An advice run always (D36); a run the end of a permit window sent home
+        (homeward, reason dock_permit) too, or it would go straight out again.
+        A calendar run never (D37).  The dock_permit node counts the exits."""
+        return bool(run.get('advice')) or run.get('reason') == 'dock_permit'
 
     def _advice_run_may_go(self, run):
-        """An advice run goes only in the agent mode and with the dock permission.
+        """An advice run goes only in the agent mode and with the dock permission
+        (T18: /dock_permit/state, asked in the dock, right before it leaves).
         False = held here (said, journalled once, or dropped)."""
         prog = run.get('program', '')
-        self._dock_give_back(run)
-        if self.mow_mode != 'agent':
+        if run.get('advice') and self.mow_mode != 'agent':
             if not run.get('started'):
                 self._clear_interrupted()
                 self._journal('advice', 'dropped', prog, id=run.get('advice'))
@@ -2633,8 +2655,11 @@ class MasterController(object):
         if permitted:
             return True
         if self._say_once(('run', run.get('created')), 'waiting_dock'):
-            self._decide('advice', 'waiting', prog, source='agent', id=run.get('advice'),
-                         why='dock:waiting_dock', dock=why)
+            if run.get('advice'):
+                self._decide('advice', 'waiting', prog, source='agent',
+                             id=run.get('advice'), why='dock:waiting_dock', dock=why)
+            else:
+                self._journal('waited', 'dock_permit', prog, dock=why)
         self._set_status("Idle (Agent: %s waits for the dock permission)" % prog,
                          'waiting_dock', program=prog)
         return False
@@ -2842,8 +2867,10 @@ class MasterController(object):
                                 else (None, None, None))
         return {
             'mode': self.mow_mode,
-            'dock_permitted': permitted,      # the owner's dock lock (agent mode only)
+            'dock_permitted': permitted,      # the owner's dock permit (agent mode only)
             'dock_why': why,
+            'dock_homeward': (dock_permit.homeward() if self.mow_mode == 'agent'
+                              else None),
             'state': self.state,
             'automation': self.automation_on,
             'held': self.is_inhibited,
@@ -3086,6 +3113,11 @@ class MasterController(object):
         if self._countdown:
             return 'countdown'
         for c in self._start_checks(now):
+            if c['key'] == 'permit':
+                # The dock permit is asked by the advice itself, right after
+                # this gate (status waiting_dock); Run next by hand is the
+                # owner's button and never asks it (D37/D39).
+                continue
             if (c['state'] in ('block', 'wait')
                     or (c['state'] == 'off' and c['key'] in ('automation', 'programs'))):
                 return '%s:%s' % (c['key'], c['code'])
@@ -3155,7 +3187,7 @@ class MasterController(object):
         if self._run_limited(run, now):
             return
 
-        if run.get('advice') and not self._advice_run_may_go(run):
+        if self._permit_needed(run) and not self._advice_run_may_go(run):
             return
 
         if not self._program_on_map(prog, run.get('site')):
@@ -3173,13 +3205,15 @@ class MasterController(object):
             return
         prog = run['program']
         resume = bool(run.get('started'))
-        if run.get('advice'):
-            permitted, why, rel = dock_permit.allowed()
-            if not permitted or not dock_permit.spend(rel):
+        self._homeward_reset()          # a new start: no homeward of an old one
+        if self._permit_needed(run):
+            # Asked once more right before it leaves the dock (K1); nothing is
+            # spent here: the dock_permit node counts the exit when it happens.
+            permitted, why, _state = dock_permit.allowed()
+            if not permitted:
                 self._set_status("Idle (Agent: %s waits for the dock permission)" % prog,
                                  'waiting_dock', program=prog)
                 return
-            self._update_run(dock_spent=rel)
         self.log("[Master] %s program: %s (%s)" % (
             "Resuming" if resume else "Starting scheduled", prog,
             run.get('reason') or 'slot'))
@@ -3313,6 +3347,7 @@ class MasterController(object):
         self.terminal_error_since = None
 
         self._check_window_end()
+        self._check_homeward(in_dock)
 
         # SMACH returned to "Ready" -> program ended (with a reason)
         if smach_status == "Ready":
@@ -3374,7 +3409,6 @@ class MasterController(object):
             if not run.get('advice'):
                 self.persistent['last_run_by_event'][run['event_id']] = day
             run['started'] = True
-            run['dock_spent'] = None      # really used: the mission left its checks
             self._save_state()
         self._journal('started', 'started', run.get('program', ''), slot=run.get('slot'))
 
@@ -3400,6 +3434,81 @@ class MasterController(object):
             self.finish_after_path_pub.publish(Bool(True))
         if (t - self._window_end_first) > self.window_overrun_s:
             self.return_home_pub.publish(String("window"))
+
+    def _homeward_applies(self, run):
+        """Q2: is this run sent home when the dock permit ends?  One place:
+        ~dock_permit_homeward (agent = only a run of the agent's advice)."""
+        mode = self.dock_permit_homeward
+        if run is None or mode == 'none':
+            return False
+        return mode == 'all' or bool(run.get('advice'))
+
+    def _check_homeward(self, in_dock):
+        """D38: the owner's dock permit window ended with the robot out
+        (dock_permit state `homeward`, latched): finish the path being mown,
+        at most until the node's deadline (~5 min), then go home; the run
+        stays interrupted (checkpoint) and resumes with the next permit.
+
+        Never blocks the way home or stops the robot on the spot (K1): it is
+        the same finish_after_path / return_home the time window uses.  A new
+        window from now cancels it (the node drops `homeward`): the request
+        is taken back unless the time window wants it too.  A silent node
+        (state missing or older than 30 s) is NOT a cancel: the stored
+        deadline still counts down."""
+        hw = dock_permit.homeward()
+        run = self._run()
+        st = self._homeward
+        if in_dock:
+            return          # home (or not out yet); the program end reads the state
+        if not self._homeward_applies(run):
+            self._homeward_reset()
+            return
+        if hw is None:
+            if not st['first']:
+                return
+            if not dock_permit.fresh():
+                # The node fell silent mid-homeward: that is not a cancel.
+                # Keep counting to the stored deadline (D38), then home.
+                pass
+            elif not st['home_sent']:
+                # A fresh state without homeward: a new window from now
+                # cancelled it.  Mow on, unless the time window wants home too.
+                if not self._window_end_first:
+                    self.finish_after_path_pub.publish(Bool(False))
+                self.log("[Master] Dock permit homeward cancelled: mowing on.")
+                self._journal('dock_permit', 'homeward_cancel',
+                              (run or {}).get('program', ''))
+                self._homeward_reset()
+                return
+            else:
+                self._homeward_reset()
+                return
+        t = self._t()
+        if hw is not None and st['key'] != hw['key']:
+            st.update(key=hw['key'], first=t, sent=0.0,
+                      due=t + float(hw.get('left_s') or 0.0), home_sent=False)
+            self.log("[Master] Dock permit ended with the robot out: finishing "
+                     "this path (max %.0f s), then home." % hw.get('left_s', 0.0))
+            self._journal('dock_permit', 'homeward', (run or {}).get('program', ''),
+                          window=hw.get('window'), left_s=int(hw.get('left_s') or 0))
+        if st['home_sent']:
+            return
+        if (t - st['sent']) >= 30.0:
+            st['sent'] = t
+            self.finish_after_path_pub.publish(Bool(True))
+        if t >= st['due']:
+            st['home_sent'] = True
+            self.return_home_pub.publish(String("dock_permit"))
+            self.log("[Master] Dock permit: the path did not end in time, home now.")
+
+    def _homeward_reset(self):
+        self._homeward.update(key=None, first=0.0, sent=0.0, due=0.0,
+                              home_sent=False)
+
+    def _homeward_run(self):
+        """Did the dock permit's end send this run home (it ends interrupted
+        with the reason dock_permit, so it waits for a permit to resume)?"""
+        return bool(self._homeward['first'])
 
     def _handle_terminal(self, in_dock):
         if self.terminal_error_since is None:
@@ -3455,6 +3564,12 @@ class MasterController(object):
             # The robot could not put it right.  Without a run: stop_reason_callback.
             if run is not None:
                 self._issue('mower_link', program, reason='mower_link')
+        elif stop_reason == "interrupted:dock_permit" or (
+                stop_reason == "interrupted:window" and self._homeward_run()):
+            # T18 homeward (D38): home at the end of the dock permit; the
+            # path boundary reports it as "window" (mower_smach).  The run
+            # resumes only with a new permit (_permit_needed).
+            recovery = 'dock_permit'
         elif stop_reason == "interrupted:window":
             recovery = 'window'
         elif stop_reason.startswith("critical:"):
@@ -3539,7 +3654,7 @@ class MasterController(object):
         checkpoint = self._program_checkpoint(run.get('program'), run.get('site'))
         resumes = run.get('resumes', 0) + 1
         no_progress = run.get('no_progress', 0)
-        if reason not in ('weather', 'window') and checkpoint is not None:
+        if reason not in ('weather', 'window', 'dock_permit') and checkpoint is not None:
             no_progress = no_progress + 1 if checkpoint == run.get('checkpoint') else 0
         critical = run.get('critical', 0) + (1 if reason in ('critical', 'gps') else 0)
         if critical >= self.critical_max:

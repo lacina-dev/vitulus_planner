@@ -146,6 +146,12 @@ resume_no_progress_max: 3
 # Window closed while mowing: finish the path, go home, resume in the next
 # window. If the path does not end within this, go home at once.
 window_overrun_max_min: 30.0
+# T18 (D38): the owner's dock permit window ended with the robot out
+# (/dock_permit/state homeward): finish the path (max ~5 min), go home, the
+# run resumes with the next permit.  Which run: agent = only a run of the
+# agent's advice (default, open question Q2), all = calendar runs too,
+# none = never (the robot finishes as before).
+dock_permit_homeward: agent
 # The mission ended without a stop_reason (stack restart): how long Ready + not
 # busy must hold before the run counts as lost and gets resumed.
 mission_lost_grace_s: 20.0

@@ -75,11 +75,31 @@ def program(name, zones, site='S'):
 
 DRY = {'hours_since_rain': 30.0, 'rain_last_h': False, 'temp_now': 18.0,
        'stale': {'forecast': False, 'radar': False}}
-DOCK = {'ok': True, 'spent': [], 'back': []}
-M.dock_permit.allowed = lambda now=None: (
-    (True, None, {'id': 'ui#1'}) if DOCK['ok'] else (False, 'majitel dok nepovolil', None))
-M.dock_permit.spend = lambda rel: DOCK['spent'].append(rel['id']) or True
-M.dock_permit.give_back = lambda rel: DOCK['back'].append(rel['id']) or True
+DOCK = {'ok': True, 'spent': [], 'back': [], 'asked': 0}
+_real_allowed = M.dock_permit.allowed
+# S8: the owners file (one source of truth) with a made-up owner.
+M.dock_permit.OWNERS_FILE = os.path.join(_HOME, 'dock_permit_owners')
+with open(M.dock_permit.OWNERS_FILE, 'w') as _fh:
+    _fh.write('owner\n')
+
+
+def _permit_allowed(now=None):
+    """T18: the master reads /dock_permit/state (dock_permit node); here the
+    test feeds that latched state (DOCK['ok']) and asks the real module."""
+    DOCK['asked'] += 1
+    M.dock_permit.on_state(json.dumps({
+        'v': 1, 'stamp': time.time(), 'allowed': DOCK['ok'],
+        'why': 'open' if DOCK['ok'] else 'locked',
+        'active': ({'id': 'p1-1', 'by': 'owner', 'to': time.time() + 3600, 'exits': 0,
+                    'max_exits': None, 'exits_left': None} if DOCK['ok'] else None),
+        'homeward': None, 'enforced_by': []}))
+    return _real_allowed(now)
+
+
+M.dock_permit.allowed = _permit_allowed
+# Nothing may be spent or given back any more: the node counts the exits.
+M.dock_permit.spend = lambda rel: DOCK['spent'].append(rel) or True
+M.dock_permit.give_back = lambda rel: DOCK['back'].append(rel) or True
 
 
 class Base(unittest.TestCase):
@@ -88,7 +108,7 @@ class Base(unittest.TestCase):
         del EVENTS[:]
         self.clock = [D(2026, 6, 10, 9, 0, 0)]
         self.wx = dict(DRY)
-        DOCK.update(ok=True, spent=[], back=[])
+        DOCK.update(ok=True, spent=[], back=[], asked=0)
         self.mc = self.make()
 
     def make(self):
@@ -516,13 +536,15 @@ class Dock(Base):
         DOCK['ok'] = True
         self.tick()
         self.assertEqual(self.starts(), ['Mow'])
-        self.assertEqual(DOCK['spent'], ['ui#1'])
+        self.assertEqual(DOCK['spent'], [])       # T18: the node counts the exit
 
-    def test_rejected_start_gives_the_permission_back(self):
+    def test_rejected_start_spends_nothing(self):
+        """T18: nothing is spent before the start, so a start that did not
+        leave the dock has nothing to give back (the node never counted it)."""
         self.agent()
         self.advise()
         self.tick()
-        self.assertEqual(DOCK['spent'], ['ui#1'])
+        self.assertEqual(self.starts(), ['Mow'])
         mc = self.mc
         mc._mowing_grace_until = 0
         mc._mission_seen = True
@@ -530,7 +552,8 @@ class Dock(Base):
         self.tick()
         self.assertEqual(mc.state, mc.STATE_IDLE)
         self.tick()
-        self.assertEqual(DOCK['back'], ['ui#1'])
+        self.assertEqual((DOCK['spent'], DOCK['back']), ([], []))
+        self.assertNotIn('dock_spent', mc.persistent.get('run') or {})
 
     def test_calendar_runs_do_not_ask_the_lock(self):
         self.at(2026, 6, 10, 8, 0)
