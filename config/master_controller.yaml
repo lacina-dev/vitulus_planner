@@ -115,6 +115,8 @@ mower_link_wait_min: 10.0    # interrupted:mower_link: stays awake this long, th
 # Hardware reset of a silent mower board, in the dock on the charger: node_planner/hw_reset.py.
 # The setting auto_hw_reset (Autonomy) switches it.  W = hw_reset_wait_s, T = W + hw_reset_off_s.
 auto_hw_reset: false
+auto_hw_reset_idle: false     # the same with no run waiting for the board; a setting of its own
+hw_reset_idle_check_claude: true   # with no run: no cut while a Claude Code session works (it has no tty)
 hw_reset_wait_s: 20.0
 hw_reset_off_s: 60.0
 hw_reset_final_grace_s: 5.0   # from the armed PM to the OS stop, must stay under W

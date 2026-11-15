@@ -202,6 +202,7 @@ class Defaults(Base):
             'sleep_after_run': True, 'stay_awake_until': None, 'temp_wait_h': 1.0,
             'temp_spike_wait_min': 5.0, 'error_retry_max': 3, 'resume_max': 12,
             'run_max_age_h': 48.0, 'off_dock_wait_min': 20.0, 'auto_hw_reset': False,
+            'auto_hw_reset_idle': False,
             # calendar or agent (docs/AUTONOMY.md section 6): calendar unchanged
             'agent_fallback_calendar': True, 'limits_in_calendar': False,
             'limit_rain_h': 3.0, 'limit_temp_min_c': 5.0, 'limit_zone_gap_days': 2.0}
@@ -1108,6 +1109,203 @@ class HwReset(Base):
         mc._hw_reset_cancelled()
         self.assertEqual(mc.persistent.get('hw_resets'), [])
         self.assertEqual(mc._run()['hw_reset'], 'cancelled')
+
+
+class HwResetIdle(Base):
+    """auto_hw_reset_idle: the same cut with no run (T37).  Off: exactly as before."""
+
+    def setUp(self):
+        super().setUp()
+        self.on()
+        mc = self.mc
+        self.set(sleep_ignore_ssh=True, sleep_ignore_ui=True)
+        mc.mower_link = {'state': 'silent', 'silent_s': 500.0}
+        mc.mower_link_t = mc._t()
+        mc.pm_status = type('P', (), dict(supply_status='ONLINE', sleep_status=False,
+                                          sleep_charged_status=False, sleep_wait_standby=180000,
+                                          sleep_time_interval=900000, battery_capacity=90,
+                                          charger_status='CHARGING'))()
+        mc.pm_status_time = mc._t()
+        mc.tty_active = lambda logins: []
+        self.claude = []
+        mc.claude_busy = lambda: list(self.claude)
+
+    def cd(self):
+        return lastj('/scheduler/sleep_countdown')
+
+    def issues(self):
+        return [i['code'] for i in self.mc.persistent.get('issues') or []]
+
+    def test_h4_off_by_default(self):
+        self.assertIs(M.autonomy.defaults(lambda k, d=None: d)['auto_hw_reset_idle'], False)
+        self.assertIs(self.make().auto_hw_reset_idle, False)
+
+    def test_off_no_run_nothing_as_before(self):
+        mc = self.mc
+        before = json.dumps(mc.persistent, sort_keys=True, default=str)
+        self.assertIsNone(mc._hw_reset_wanted())
+        self.assertFalse(mc._tick_hw_reset())
+        self.assertEqual(mc._hw_reset_gate(), 'link_back')
+        self.assertFalse(self.cd()['active'])
+        self.assertEqual(json.dumps(mc.persistent, sort_keys=True, default=str), before)
+        self.assertEqual(self.issues(), [])
+
+    def test_off_even_with_the_run_switch_on(self):
+        self.set(auto_hw_reset=True)
+        self.assertFalse(self.mc._tick_hw_reset())
+        self.assertNotIn('hw_reset_idle', self.mc.persistent)
+
+    def test_off_a_cancel_or_a_spend_writes_no_record(self):
+        mc = self.mc
+        mc._hw_reset_cancelled()
+        mc._hw_reset_spend()
+        self.assertNotIn('hw_reset_idle', mc.persistent)
+
+    def test_on_alone_does_not_touch_a_waiting_run(self):
+        mc = self.mc
+        self.set(auto_hw_reset_idle=True)
+        mc.persistent['run'] = dict(mc._new_run({'id': 'e', 'program_name': 'Mow'}, None),
+                                    reason='mower_link', started=True, wait_until=mc._t() + 600)
+        self.assertFalse(mc._tick_hw_reset())       # that one is auto_hw_reset's
+        mc.persistent['run']['reason'] = 'weather'
+        self.set(auto_hw_reset=True)
+        self.assertFalse(mc._tick_hw_reset())       # nor a run that waits for the rain
+
+    def test_on_no_run_announced(self):
+        mc = self.mc
+        self.set(auto_hw_reset_idle=True)
+        self.assertTrue(mc._tick_hw_reset())
+        self.assertEqual(self.cd()['reason'], 'hw_reset')
+        note = lastj('/scheduler/notify')
+        self.assertEqual((note['code'], note['vars']['issue'], note['program']),
+                         ('mower_link', 'hw_reset', ''))
+        self.assertIsNone(mc.persistent['run'])
+        self.assertTrue(mc._tick_hw_reset())        # the countdown holds IDLE
+        self.assertEqual(self.issues(), ['hw_reset'])
+
+    def test_on_the_guards_hold(self):
+        mc = self.mc
+        self.set(auto_hw_reset_idle=True)
+        mc.is_in_dock = False
+        self.assertFalse(mc._tick_hw_reset())
+        mc.is_in_dock = True
+        mc.pm_status.supply_status = 'OFFLINE'
+        self.assertFalse(mc._tick_hw_reset())
+        mc.pm_status.supply_status = 'ONLINE'
+        mc.mower_link = {'state': 'silent', 'silent_s': mc.hw_reset_silent_s - 1.0}
+        self.assertFalse(mc._tick_hw_reset())
+        mc.mower_link = {'state': 'silent', 'silent_s': 500.0}
+        mc.mower_link_t = mc._t() - mc.MOWER_LINK_AGE_S - 1.0
+        self.assertFalse(mc._tick_hw_reset())
+        mc.mower_link_t = mc._t()
+        self.logins = ['pts/1']
+        mc.tty_active = lambda logins: list(logins)
+        self.assertFalse(mc._tick_hw_reset())
+        self.assertFalse(mc._tick_hw_reset())
+        self.assertEqual(self.issues(), ['hw_reset_person'])    # told once
+        self.assertFalse(self.cd()['active'])
+        self.assertEqual(self.starts, [])
+
+    def test_on_a_person_not_ignored_stops_it(self):
+        mc = self.mc
+        self.set(auto_hw_reset_idle=True, sleep_ignore_ssh=False)
+        self.logins = ['pts/1']
+        self.assertFalse(mc._tick_hw_reset())
+        self.assertEqual(self.issues(), ['hw_reset_person'])
+
+    def test_on_the_day_limit_holds(self):
+        mc = self.mc
+        self.set(auto_hw_reset_idle=True)
+        mc.persistent['hw_resets'] = [mc._t() - 10, mc._t() - 20]
+        self.assertFalse(mc._tick_hw_reset())
+        self.assertFalse(mc._tick_hw_reset())
+        self.assertEqual(self.issues(), ['hw_reset_spent'])
+        self.assertEqual(lastj('/scheduler/notify')['code'], 'hw_reset_spent')
+
+    def test_on_one_per_silence(self):
+        mc = self.mc
+        self.set(auto_hw_reset_idle=True)
+        mc._sleep_go(M.sleep_manager.MODE_TIMED, mc.hw_reset_ms, 'hw_reset', {})
+        self.assertEqual(len(mc.persistent['hw_resets']), 1)
+        self.assertIs(mc.persistent['hw_reset_idle']['hw_reset'], True)
+        mc._countdown = None
+        mc = self.mc = self.remake()                # the boot after: still silent
+        self.assertFalse(mc._tick_hw_reset())
+        self.assertEqual(self.issues()[-1], 'hw_reset_spent')
+        mc.mower_link = {'state': 'ok', 'silent_s': 0.0}
+        self.assertFalse(mc._tick_hw_reset())
+        self.assertNotIn('hw_reset_idle', mc.persistent)
+        mc.mower_link = {'state': 'silent', 'silent_s': 500.0}
+        self.assertTrue(mc._tick_hw_reset())        # a new silence, the day allows it
+
+    def remake(self):
+        old = self.mc
+        mc = self.make()
+        mc.state = mc.STATE_IDLE
+        mc.mower_link, mc.mower_link_t = old.mower_link, mc._t()
+        mc.pm_status, mc.pm_status_time = old.pm_status, mc._t()
+        mc.tty_active = lambda logins: []
+        mc.claude_busy = lambda: list(self.claude)
+        return mc
+
+    def test_on_a_claude_session_without_a_tty_stops_it(self):
+        mc = self.mc
+        self.set(auto_hw_reset_idle=True)
+        self.assertIs(mc.hw_reset_idle_check_claude, True)
+        self.claude = [4711, 4712]
+        self.assertEqual(mc._hw_reset_gate(), 'claude:2')
+        self.assertFalse(mc._tick_hw_reset())
+        self.assertFalse(mc._tick_hw_reset())
+        self.assertFalse(self.cd()['active'])
+        self.assertEqual(self.issues(), ['hw_reset_person'])    # seen, and told once
+        note = lastj('/scheduler/notify')
+        self.assertEqual((note['vars']['issue'], note['vars']['who']),
+                         ('hw_reset_person', 'claude:2'))
+        self.claude = []
+        self.assertTrue(mc._tick_hw_reset())                    # gone: now it may
+        self.assertEqual(self.issues(), ['hw_reset_person', 'hw_reset'])
+
+    def test_on_a_claude_session_that_comes_in_the_countdown(self):
+        mc = self.mc
+        self.set(auto_hw_reset_idle=True)
+        self.assertTrue(mc._tick_hw_reset())
+        self.claude = [4711]
+        mc._tick_sleep_requests()
+        self.assertFalse(self.cd()['active'])
+        self.assertEqual(self.starts, [])
+
+    def test_on_not_knowing_counts_as_a_session(self):
+        self.set(auto_hw_reset_idle=True)
+        self.claude = ['unknown']
+        self.assertFalse(self.mc._tick_hw_reset())
+
+    def test_on_the_claude_check_has_its_own_switch(self):
+        mc = self.mc
+        self.set(auto_hw_reset_idle=True)
+        mc.hw_reset_idle_check_claude = False
+        self.claude = [4711]
+        self.assertTrue(mc._tick_hw_reset())
+
+    def test_a_waiting_run_does_not_ask_for_claude(self):
+        """auto_hw_reset with a run: as it was, whatever Claude does."""
+        mc = self.mc
+        asked = []
+        mc.claude_busy = lambda: asked.append(1) or [4711]
+        self.set(auto_hw_reset=True, auto_hw_reset_idle=True)
+        mc.persistent['run'] = dict(mc._new_run({'id': 'e', 'program_name': 'Mow'}, None),
+                                    reason='mower_link', started=True, wait_until=mc._t() + 600)
+        self.assertTrue(mc._tick_hw_reset())
+        self.assertEqual(asked, [])
+
+    def test_on_a_cancel_is_not_asked_again_nor_counted(self):
+        mc = self.mc
+        self.set(auto_hw_reset_idle=True)
+        self.assertTrue(mc._tick_hw_reset())
+        mc._countdown = None
+        mc._hw_reset_cancelled()
+        self.assertEqual(mc.persistent.get('hw_resets') or [], [])
+        self.assertFalse(mc._tick_hw_reset())
+        self.assertEqual(self.issues(), ['hw_reset'])
 
 
 class Countdown(Base):

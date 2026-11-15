@@ -485,6 +485,11 @@ class MasterController(object):
         self.sleep_countdown_s = rospy.get_param('~sleep_countdown_s', 60.0)
         # Hardware reset: node_planner/hw_reset.py, _tick_hw_reset.
         self.auto_hw_reset = rospy.get_param('~auto_hw_reset', False)
+        self.auto_hw_reset_idle = rospy.get_param('~auto_hw_reset_idle', False)
+        # With no run only: a Claude session has no terminal for tty_active to see.
+        self.hw_reset_idle_check_claude = rospy.get_param(
+            '~hw_reset_idle_check_claude', True)
+        self.claude_busy = sleep_manager.claude_sessions
         self.hw_cfg = sleep_manager.SleepConfig(**vars(self.sleep_cfg))
         self.hw_cfg.wait_before_standby_s = rospy.get_param('~hw_reset_wait_s', 20.0)
         self.hw_cfg.final_grace_s = rospy.get_param('~hw_reset_final_grace_s', 5.0)
@@ -968,6 +973,8 @@ class MasterController(object):
             self.sleep_after_run = self.settings['sleep_after_run']
         if 'auto_hw_reset' in changed:
             self.auto_hw_reset = self.settings['auto_hw_reset']
+        if 'auto_hw_reset_idle' in changed:
+            self.auto_hw_reset_idle = self.settings['auto_hw_reset_idle']
         if any(k in changed for k in self.WINDOW_KEYS):
             start = autonomy.parse_hhmm(self.settings['window_start'])
             end = autonomy.parse_hhmm(self.settings['window_end'])
@@ -4489,14 +4496,45 @@ class MasterController(object):
     # hardware reset: the mower MCU hangs, only the 19 V rail cures it
     # =====================================================================
     def _hw_reset_wanted(self):
-        """The run that waits for a mower which is silent, or None."""
+        """The run that waits for a mower which is silent, or None.  With
+        auto_hw_reset_idle and no run at all: the record of this silence instead."""
         with self.lock:
             link = self.mower_link
             age = self._t() - self.mower_link_t
         if age > self.MOWER_LINK_AGE_S:
             return None         # no node: that is no hung MCU
+        run = self._hw_reset_rec()
+        idle = bool(run and run.get('no_run'))
+        return run if hw_reset.wanted(None if idle else run, link,
+                                      self.hw_reset_silent_s, idle=idle) else None
+
+    def _hw_reset_rec(self):
+        """What carries 'one per run': the run, or with auto_hw_reset_idle and no run
+        the record of this silence (no_run marks it).  Switch off: the run or None."""
         run = self._run()
-        return run if hw_reset.wanted(run, link, self.hw_reset_silent_s) else None
+        if run is None and self.auto_hw_reset_idle:
+            with self.lock:
+                return dict(self.persistent.get('hw_reset_idle') or {}, no_run=True)
+        return run
+
+    def _hw_reset_mark(self, rec, **fields):
+        if not (rec or {}).get('no_run'):
+            return self._update_run(**fields)
+        with self.lock:
+            self.persistent['hw_reset_idle'] = dict(
+                self.persistent.get('hw_reset_idle') or {}, **fields)
+            self._save_state()
+
+    def _hw_reset_idle_over(self):
+        """The silence with no run is over: the link answers, or a run took over."""
+        with self.lock:
+            if not self.persistent.get('hw_reset_idle'):
+                return
+            link = self.mower_link or {}
+            fresh = self._t() - self.mower_link_t <= self.MOWER_LINK_AGE_S
+            if (fresh and link.get('state') == 'ok') or self.persistent.get('run'):
+                self.persistent.pop('hw_reset_idle', None)
+                self._save_state()
 
     def _hw_reset_gate(self):
         """What only a hardware reset asks, over _sleep_gate.  The flag is the sequence's
@@ -4510,11 +4548,18 @@ class MasterController(object):
             return 'pm_armed'
         if self.persistent.get('pm_cancel_pending'):
             return 'pm_cancel_pending'
-        if self._hw_reset_wanted() is None:
+        run = self._hw_reset_wanted()
+        if run is None:
             return 'link_back'
         # Ignored or not, nobody debugging on a live terminal is ever cut.
         busy = self.tty_active(self._logins())
-        return 'login:%s' % ','.join(busy) if busy else None
+        if busy:
+            return 'login:%s' % ','.join(busy)
+        if run.get('no_run') and self.hw_reset_idle_check_claude:
+            work = self.claude_busy()       # no terminal, and often work under it
+            if work:
+                return 'claude:%d' % len(work)
+        return None
 
     def _tick_hw_reset(self):
         """From IDLE, past the boot grace, in the dock.  True: IDLE starts nothing now.
@@ -4524,8 +4569,10 @@ class MasterController(object):
         and the sequence asks it too up to the last moment."""
         if self._countdown:
             return self._countdown['source'] == 'hw_reset'
+        self._hw_reset_idle_over()
         run = self._hw_reset_wanted()
-        if run is None or not self.auto_hw_reset:
+        if run is None or not (self.auto_hw_reset_idle if run.get('no_run')
+                               else self.auto_hw_reset):
             return False
         program = run.get('program', '')
         with self.lock:
@@ -4536,7 +4583,7 @@ class MasterController(object):
             return False
         block = self._sleep_gate('hw_reset')
         if block:
-            if block.startswith(('login:', 'ui:')):
+            if block.startswith(('login:', 'ui:', 'claude:')):
                 self._hw_reset_tell(run, 'hw_reset_person', program, who=block)
             return False
         self._hw_reset_tell(run, 'hw_reset', program,
@@ -4547,16 +4594,17 @@ class MasterController(object):
 
     def _hw_reset_tell(self, run, code, program, **detail):
         if run.get('hw_reset_told') != code:
-            self._update_run(hw_reset_told=code)
+            self._hw_reset_mark(run, hw_reset_told=code)
             self._issue(code, program, **detail)
 
     def _hw_reset_spend(self):
         """Before the arm: the power is gone a few seconds later, and an attempt that
         fails counts as well.  No loop whatever happens."""
-        if (self._run() or {}).get('hw_reset'):
+        rec = self._hw_reset_rec() or {}
+        if rec.get('hw_reset'):
             return              # announced anew for a person who just came
         st, _ = self._pm_status()
-        self._update_run(hw_reset=True)
+        self._hw_reset_mark(rec, hw_reset=True)
         with self.lock:
             self.persistent['hw_resets'] = hw_reset.recent(
                 self.persistent.get('hw_resets'), self._t()) + [self._t()]
@@ -4566,11 +4614,11 @@ class MasterController(object):
 
     def _hw_reset_cancelled(self):
         """A person said no: not asked again for this run, and not counted."""
-        run = self._run() or {}
+        run = self._hw_reset_rec() or {}
         if run.get('hw_reset') is True:         # already in the sequence
             with self.lock:
                 self.persistent['hw_resets'] = (self.persistent.get('hw_resets') or [])[:-1]
-        self._update_run(hw_reset='cancelled', hw_reset_told='hw_reset_spent')
+        self._hw_reset_mark(run, hw_reset='cancelled', hw_reset_told='hw_reset_spent')
         self._journal('waited', 'hw_reset_cancelled', run.get('program', ''))
 
     def _tick_hw_restore(self):

@@ -134,6 +134,37 @@ def busy_ttys(logins, active_s, now=None, stat=os.stat):
     return busy
 
 
+# Claude Code that only waits: the daemon and its spare terminals.  Everything else
+# named claude is somebody's work, with a terminal or without one.
+CLAUDE_IDLE_ARGS = ('daemon', 'bg-pty-host', 'bg-spare')
+
+
+def claude_sessions(proc='/proc'):
+    """Pids of Claude Code processes that work (sessions, `claude -p`, the agents
+    view), read from /proc: a background session has no terminal, so `who` and
+    busy_ttys never see it.  ['unknown'] when /proc cannot be read."""
+    try:
+        names = os.listdir(proc)
+    except OSError:
+        return ['unknown']
+    out = []
+    for name in names:
+        if not name.isdigit():
+            continue
+        try:
+            with open(os.path.join(proc, name, 'cmdline'), 'rb') as f:
+                words = f.read(4096).decode('utf-8', 'replace').replace('\0', ' ').split()
+        except (IOError, OSError):
+            continue            # gone meanwhile, or not ours to read
+        if not words or (os.path.basename(words[0]) != 'claude'
+                         and '/claude/versions/' not in words[0]):
+            continue
+        if any(w.lstrip('-') in CLAUDE_IDLE_ARGS for w in words[1:3]):
+            continue
+        out.append(int(name))
+    return sorted(out)
+
+
 def read_boot_id(path='/proc/sys/kernel/random/boot_id'):
     try:
         with open(path) as f:

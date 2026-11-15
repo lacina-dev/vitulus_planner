@@ -10,7 +10,9 @@ T = W + 60 s, read back through /pm/power_status before the arm, the OS stopped 
 as W allows.  See master_controller._tick_hw_reset for the guards.
 
     wanted      the persisted run waits for the mower, and the link says silent for
-                silent_s.  No run: nothing to go back to, a person's business.
+                silent_s.  No run: nothing to go back to, a person's business, unless
+                idle says so (the setting auto_hw_reset_idle, off by default: the board
+                hangs 2^26 ms after its reset whether a run waits or not).
     spent       one per run, max_day in 24 h, both persisted.  A reset that did not
                 help is not repeated: the next one is a person's.
 """
@@ -18,8 +20,11 @@ RECOVERY = 'mower_link'
 DAY_S = 86400.0
 
 
-def wanted(run, link, silent_s):
-    if not run or RECOVERY not in (run.get('reason'), run.get('reject')):
+def wanted(run, link, silent_s, idle=False):
+    if not run:
+        if not idle:
+            return False
+    elif RECOVERY not in (run.get('reason'), run.get('reject')):
         return False
     link = link or {}
     return link.get('state') == 'silent' and (link.get('silent_s') or 0.0) >= silent_s
