@@ -111,6 +111,7 @@ mower_idle_notify: true
 mower_idle_confirm_s: 30.0          # the master sees the silence itself this long first (monotonic)
 mower_idle_repeat_first_min: 60.0   # said again while it lasts: /scheduler/notify is not latched
 mower_idle_repeat_h: 4.0            # and then every this many hours; 0 = never again
+mower_idle_repeat_max: 2            # repeats per silence after the first word (0 = none); link ok starts anew
 mower_link_wait_min: 10.0    # interrupted:mower_link: stays awake this long, then resume (capped as any resume)
 # Hardware reset of a silent mower board, in the dock on the charger: node_planner/hw_reset.py.
 # The setting auto_hw_reset (Autonomy) switches it.  W = hw_reset_wait_s, T = W + hw_reset_off_s.

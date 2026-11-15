@@ -836,6 +836,7 @@ class MowerIdle(Base):
         self.assertIs(self.mc.mower_idle_notify, True)
         self.assertEqual((self.mc.mower_idle_confirm_s, self.mc.mower_idle_repeat_first_s,
                           self.mc.mower_idle_repeat_s), (30.0, 3600.0, 14400.0))
+        self.assertEqual(self.mc.mower_idle_repeat_max, 2)
 
     def test_told_once_however_many_ticks(self):
         for _ in range(5):
@@ -908,11 +909,66 @@ class MowerIdle(Base):
         self.assertEqual(len(self.notes()), 2)
         self.later(minutes=3)
         mc._step()
-        self.later(hours=4, minutes=1)
-        mc._step()
         notes = self.notes()
-        self.assertEqual([n['vars']['repeat'] for n in notes], [0, 1, 2, 3])
+        self.assertEqual([n['vars']['repeat'] for n in notes], [0, 1, 2])
         self.assertEqual(set(n['vars']['since'] for n in notes), {'2026-06-10T11:51'})
+        for _ in range(4):                          # mower_idle_repeat_max: and no more
+            self.later(hours=4, minutes=1)
+            mc._step()
+        self.assertEqual(len(self.notes()), 3)
+
+    def test_after_ok_the_repeats_count_anew(self):
+        mc = self.mc
+        mc._step()
+        for _ in range(4):
+            self.later(hours=4, minutes=1)
+            mc._step()
+        self.assertEqual(len(self.notes()), 3)
+        self.link('ok')
+        mc._step()
+        del EVENTS[:]
+        self.link('silent', 300.0)
+        self.seen()
+        mc._step()
+        for _ in range(4):
+            self.later(hours=4, minutes=1)
+            mc._step()
+        self.assertEqual([n['vars']['repeat'] for n in self.notes()], [0, 1, 2])
+
+    def test_a_repeat_updates_its_issue_and_adds_none(self):
+        mc = self.mc
+        mc._step()
+        mc._issue('run_failed', 'Mow')              # something else in between
+        rows = len([j for j in self.journal() if j['code'] == 'mower_link_idle'])
+        for _ in range(3):
+            self.later(hours=4, minutes=1)
+            mc._step()
+        self.assertEqual(len(self.notes()), 4)      # run_failed and three of ours
+        self.assertEqual([i['code'] for i in mc.persistent['issues']],
+                         ['mower_link_idle', 'run_failed'])
+        issue = self.told()[0]
+        self.assertEqual(issue['detail']['repeat'], 2)
+        self.assertEqual(issue['t'], '2026-06-10T20:02')
+        self.assertEqual(issue['detail']['silent_s'], 8 * 3600 + 11 * 60)   # from since
+        self.assertEqual(len([j for j in self.journal() if j['code'] == 'mower_link_idle']),
+                         rows)
+
+    def test_an_issue_cleared_by_the_owner_comes_back_with_the_repeat(self):
+        mc = self.mc
+        mc._step()
+        mc.clear_issues_callback(Bool(True))
+        self.later(hours=1, minutes=1)
+        mc._step()
+        self.assertEqual(len(self.told()), 1)
+
+    def test_repeat_max_zero_says_it_once(self):
+        mc = self.mc
+        mc.mower_idle_repeat_max = 0
+        mc._step()
+        for _ in range(3):
+            self.later(hours=5)
+            mc._step()
+        self.assertEqual(len(self.notes()), 1)
 
     def test_repeat_survives_a_restart_of_the_node(self):
         self.mc._step()
@@ -1027,11 +1083,16 @@ class MowerIdle(Base):
         with open(mc.boot_id_file, 'w') as f:
             f.write('boot-2')
         self.arm()
-        self.link('silent', 200.0)
+        self.later(minutes=30)
+        self.link('silent', 200.0)                  # the link node counts from its start
         self.seen()
         for _ in range(3):
             mc._step()
-        self.assertEqual(len(self.notes()), 1)
+        notes = self.notes()
+        self.assertEqual(len(notes), 1)
+        self.assertEqual(notes[0]['vars']['since'], '2026-06-10T11:51')
+        self.assertEqual(notes[0]['vars']['silent_s'], 39 * 60)     # from since, not 200
+        self.assertEqual(notes[0]['vars']['repeat'], 1)
 
 
 class HwReset(Base):

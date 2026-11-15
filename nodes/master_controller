@@ -434,6 +434,8 @@ class MasterController(object):
         self.mower_idle_repeat_first_s = rospy.get_param(
             '~mower_idle_repeat_first_min', 60.0) * 60.0
         self.mower_idle_repeat_s = rospy.get_param('~mower_idle_repeat_h', 4.0) * 3600.0
+        # At most this many repeats per silence (0 = none): then it has been said.
+        self.mower_idle_repeat_max = int(rospy.get_param('~mower_idle_repeat_max', 2))
         self._mower_idle_seen = None
         self._boot_id = None
         self.critical_sleep_duration_s = rospy.get_param(
@@ -1230,15 +1232,25 @@ class MasterController(object):
         'sleep_failed': ('error', 'sleep_failed', 'slept'),
     }
 
-    def _issue(self, code, program='', **detail):
+    def _issue(self, code, program='', _again=False, **detail):
         """Something the owner should see. Kept (last 20), shown until cleared.
-        The one way out for bad news: the journal and /scheduler/notify too."""
+        The one way out for bad news: the journal and /scheduler/notify too.
+        _again: the same thing said once more.  Its issue is brought up to date in
+        place and the journal has it already: repeats must not push the rest out."""
         self.log("[Master] %s %s %s" % (code, program, detail or ''))
         level, notify, kind = self.ISSUE_ROUTES.get(code, ('warn', None, None))
         with self.lock:
-            self.persistent['issues'] = (self.persistent.get('issues') or [])[-19:] + [{
-                't': self._now().strftime("%Y-%m-%dT%H:%M"), 'level': level,
-                'code': code, 'program': program, 'detail': detail}]
+            issues = list(self.persistent.get('issues') or [])
+            item = {'t': self._now().strftime("%Y-%m-%dT%H:%M"), 'level': level,
+                    'code': code, 'program': program, 'detail': detail}
+            old = [i for i, x in enumerate(issues)
+                   if x.get('code') == code and x.get('program') == program]
+            if _again and old:
+                issues[old[-1]] = item
+                kind = None
+            else:
+                issues = issues[-19:] + [item]
+            self.persistent['issues'] = issues
             self._save_state()
         if kind:
             self._journal(kind, code, program, **detail)
@@ -1315,6 +1327,8 @@ class MasterController(object):
             self._boot_id = sleep_manager.read_boot_id(self.boot_id_file)
         told = told if isinstance(told, dict) else None
         n = 0
+        if told and int(told.get('n') or 0) >= self.mower_idle_repeat_max:
+            return              # said, and said again: enough for one silence
         if told and told.get('boot') == self._boot_id:
             n = int(told.get('n') or 0) + 1
             gap = self.mower_idle_repeat_first_s if n == 1 else self.mower_idle_repeat_s
@@ -1327,12 +1341,18 @@ class MasterController(object):
             return              # a run: interrupted:mower_link and the resume tell
         since = (told or {}).get('since') or (
             self._now() - datetime.timedelta(seconds=silent)).strftime("%Y-%m-%dT%H:%M")
+        try:    # the link node counts from its own start: after a boot that is too short
+            if told:
+                silent = max(silent, (self._now() - datetime.datetime.strptime(
+                    since, "%Y-%m-%dT%H:%M")).total_seconds())
+        except (TypeError, ValueError):
+            pass
         with self.lock:
             in_dock = bool(self.is_in_dock)
             self.persistent['mower_idle_told'] = {
                 'boot': self._boot_id, 't': self._t(), 'n': n, 'since': since}
             self._save_state()
-        self._issue('mower_link_idle', silent_s=int(silent), since=since,
+        self._issue('mower_link_idle', _again=n > 0, silent_s=int(silent), since=since,
                     in_dock=in_dock, repeat=n)
 
     def programs_callback(self, msg):

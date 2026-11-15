@@ -82,7 +82,9 @@ rules. Advanced timing stays under `advanced: true`.
   `mower_idle_told` is in the state file, so a node restart says nothing again; link `ok` clears it (journal
   `waited`/`mower_link_back`), a new boot still silent tells once more. /scheduler/notify is not latched, so
   while the silence lasts it is said again after `mower_idle_repeat_first_min` (60) and then every
-  `mower_idle_repeat_h` (4), `repeat` counting up. In every state, automation off too.
+  `mower_idle_repeat_h` (4), `repeat` counting up, at most `mower_idle_repeat_max` (2) repeats per silence
+  (a new boot still silent counts as one); link `ok` starts anew. A repeat brings its issue up to date in place
+  and adds nothing to the journal; its `silent_s` counts from `since`. In every state, automation off too.
 
 ## 4. Safety
 
