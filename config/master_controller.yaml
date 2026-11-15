@@ -105,6 +105,12 @@ temp_sleep_duration_h: 1.0
 # Temperature sensor spikes sent the mission home (temp_watch.py). The motor is
 # cold: no sleep, resume after this many minutes.
 temp_spike_wait_min: 5.0
+# The board silent for hw_reset_silent_s with no run: the owner is told once per silence
+# (master_controller._tick_mower_idle).  The setting mower_idle_notify switches it.
+mower_idle_notify: true
+mower_idle_confirm_s: 30.0          # the master sees the silence itself this long first (monotonic)
+mower_idle_repeat_first_min: 60.0   # said again while it lasts: /scheduler/notify is not latched
+mower_idle_repeat_h: 4.0            # and then every this many hours; 0 = never again
 mower_link_wait_min: 10.0    # interrupted:mower_link: stays awake this long, then resume (capped as any resume)
 # Hardware reset of a silent mower board, in the dock on the charger: node_planner/hw_reset.py.
 # The setting auto_hw_reset (Autonomy) switches it.  W = hw_reset_wait_s, T = W + hw_reset_off_s.

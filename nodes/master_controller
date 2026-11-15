@@ -424,6 +424,18 @@ class MasterController(object):
             '~temp_spike_wait_min', 5.0) * 60.0
         self.mower_link_wait_s = rospy.get_param(
             '~mower_link_wait_min', 10.0) * 60.0
+        # The board silent with no run: told once, _tick_mower_idle.
+        self.mower_idle_notify = rospy.get_param('~mower_idle_notify', True)
+        self.mower_idle_silent_s = rospy.get_param('~hw_reset_silent_s', 120.0)
+        # Seen silent by the master itself this long (monotonic) before a word:
+        # one sample after a clock step is no silence.
+        self.mower_idle_confirm_s = rospy.get_param('~mower_idle_confirm_s', 30.0)
+        # /scheduler/notify is not latched: said again while it lasts (0 = never).
+        self.mower_idle_repeat_first_s = rospy.get_param(
+            '~mower_idle_repeat_first_min', 60.0) * 60.0
+        self.mower_idle_repeat_s = rospy.get_param('~mower_idle_repeat_h', 4.0) * 3600.0
+        self._mower_idle_seen = None
+        self._boot_id = None
         self.critical_sleep_duration_s = rospy.get_param(
             '~critical_error_sleep_duration_h', 0.5) * 3600.0
         self.terminal_short_wait_s = rospy.get_param(
@@ -944,6 +956,8 @@ class MasterController(object):
                 setattr(self, attr, self.settings[key] * factor)
         if 'charge_sleep_max_h' in changed:
             self.sleep_cfg.charge_max_h = self.settings['charge_sleep_max_h']
+        if 'mower_idle_notify' in changed:
+            self.mower_idle_notify = self.settings['mower_idle_notify']
         if 'sleep_ignore_ssh' in changed:
             self.sleep_check_logins = not self.settings['sleep_ignore_ssh']
         if 'sleep_ignore_ui' in changed:
@@ -1201,6 +1215,8 @@ class MasterController(object):
         'run_event_removed': ('warn', None, 'finished'),
         # The run waits, nothing has failed yet; only the last one wants a person.
         'mower_link': ('error', 'mower_link', 'waited'),
+        # No run to wait: the robot cannot cure it, the owner has to know.
+        'mower_link_idle': ('error', 'mower_link_idle', 'waited'),
         'hw_reset': ('warn', 'mower_link', 'waited'),
         'hw_reset_person': ('warn', 'mower_link', 'waited'),
         'hw_reset_spent': ('error', 'hw_reset_spent', 'waited'),
@@ -1249,6 +1265,68 @@ class MasterController(object):
         with self.lock:
             self.mower_link = link
             self.mower_link_t = self._t()
+
+    def _tick_mower_idle(self):
+        """The mower board silent while no run waits for it: nobody was told (15. 11.
+        2026, 7.5 h unseen until the power-off).  One issue per silence: the mark is
+        kept in the state file, so a restart of the node says nothing again; a link
+        that answers, or a new boot that did not cure it, re-arms it.  While the
+        silence lasts it is said again after mower_idle_repeat_first_min and then
+        every mower_idle_repeat_h: nobody may have been listening.  The master has to
+        see the silence itself for mower_idle_confirm_s first.  The switch is the
+        setting mower_idle_notify."""
+        with self.lock:
+            link = dict(self.mower_link or {})
+            age = self._t() - self.mower_link_t
+            told = self.persistent.get('mower_idle_told')
+            busy = self.mission_busy
+        if not link or age > self.MOWER_LINK_AGE_S:
+            self._mower_idle_seen = None
+            return              # no node: that is no hung MCU
+        if link.get('state') != 'silent':
+            self._mower_idle_seen = None
+        if link.get('state') == 'ok':
+            if told:
+                with self.lock:
+                    self.persistent.pop('mower_idle_told', None)
+                    self._save_state()
+                self._journal('waited', 'mower_link_back')
+            return
+        try:
+            silent = float(link.get('silent_s') or 0.0)
+        except (TypeError, ValueError):
+            return
+        if (not self.mower_idle_notify or link.get('state') != 'silent'
+                or silent < self.mower_idle_silent_s):
+            self._mower_idle_seen = None
+            return
+        if self._mower_idle_seen is None:
+            self._mower_idle_seen = self._mono()
+        if self._mono() - self._mower_idle_seen < self.mower_idle_confirm_s:
+            return
+        if self._boot_id is None:
+            self._boot_id = sleep_manager.read_boot_id(self.boot_id_file)
+        told = told if isinstance(told, dict) else None
+        n = 0
+        if told and told.get('boot') == self._boot_id:
+            n = int(told.get('n') or 0) + 1
+            gap = self.mower_idle_repeat_first_s if n == 1 else self.mower_idle_repeat_s
+            waited = self._t() - float(told.get('t') or 0.0)
+            if gap <= 0 or 0 <= waited < gap:
+                return          # a clock put back: said again rather than never
+        elif told:
+            n = int(told.get('n') or 0) + 1     # a new boot did not cure it
+        if busy or self.state == self.STATE_MOWING or self._run() is not None:
+            return              # a run: interrupted:mower_link and the resume tell
+        since = (told or {}).get('since') or (
+            self._now() - datetime.timedelta(seconds=silent)).strftime("%Y-%m-%dT%H:%M")
+        with self.lock:
+            in_dock = bool(self.is_in_dock)
+            self.persistent['mower_idle_told'] = {
+                'boot': self._boot_id, 't': self._t(), 'n': n, 'since': since}
+            self._save_state()
+        self._issue('mower_link_idle', silent_s=int(silent), since=since,
+                    in_dock=in_dock, repeat=n)
 
     def programs_callback(self, msg):
         with self.lock:
@@ -2043,6 +2121,7 @@ class MasterController(object):
             self._sleep_start_check()
         self._expire_settings(self._now())
         self._tick_ignore_rain()
+        self._tick_mower_idle()
         self._tick_pm_cancel()
         self._tick_hw_restore()
         self._tick_sleep_requests()

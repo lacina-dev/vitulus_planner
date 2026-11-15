@@ -85,6 +85,8 @@ FIELDS = [
     _f('run_max_age_h', 'float', 'recovery', 'run_max_age_h', 48.0, 1, 168, 'h', True),
     _f('off_dock_wait_min', 'float', 'recovery', 'off_dock_wait_s', 20.0, 1, 240,
        'min', True, div=60.0),
+    # The mower board silent with no run: one message to the owner per silence.
+    _f('mower_idle_notify', 'bool', 'recovery', 'mower_idle_notify', True),
     # --- agent (who decides: docs/AUTONOMY.md "Calendar or agent") ---
     # No fresh advice of the agent: the calendar decides meanwhile (and the hard
     # limits below apply to it). Off: without advice nothing starts.

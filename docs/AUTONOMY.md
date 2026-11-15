@@ -74,6 +74,14 @@ rules. Advanced timing stays under `advanced: true`.
 - `/scheduler/run_now` not needed: Run stays in Programs. Add "Skip next" and "Run next planned now".
 - Events worth a person go to `/scheduler/notify` JSON `{"level","code","vars","program"}`: missed, stranded,
   run failed, sleep failed. Agent or Discord picks it up.
+- Mower board silent with no run (`mower_idle_notify`, on by default; `master_controller._tick_mower_idle`):
+  /mower/link says silent for `hw_reset_silent_s`, seen by the master itself for `mower_idle_confirm_s` (30 s,
+  monotonic: a clock step is no silence), no persisted run, not MOWING, no mission. Issue `mower_link_idle`
+  (level error, notify code `mower_link_idle`, vars `silent_s`, `since`, `in_dock`, `repeat`). The mark
+  `mower_idle_told` is in the state file, so a node restart says nothing again; link `ok` clears it (journal
+  `waited`/`mower_link_back`), a new boot still silent tells once more. /scheduler/notify is not latched, so
+  while the silence lasts it is said again after `mower_idle_repeat_first_min` (60) and then every
+  `mower_idle_repeat_h` (4), `repeat` counting up. In every state, automation off too.
 
 ## 4. Safety
 

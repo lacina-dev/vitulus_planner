@@ -192,6 +192,7 @@ class Defaults(Base):
         today = {
             'window_enabled': True, 'window_start': '07:00', 'window_end': '21:00',
             'window_min_left_min': 30.0, 'catchup_max_h': 4.0, 'skip_next': None,
+            'mower_idle_notify': True,
             'no_mow_until': None, 'rain_mode': 'always', 'rain_after_min': 60,
             'rain_forecast_min': 30, 'rain_retry_h': 2.0, 'rain_return_home': True,
             'rain_stale_ok': True, 'battery_start_pct': 40, 'battery_return_pct': 25,
@@ -792,6 +793,244 @@ class SleepGates(Base):
         mc._route_after_program(None, True)
         mc._step()
         self.assertEqual(len(slept), 1)
+
+
+class MowerIdle(Base):
+    """The mower board silent with no run: one issue per silence (T37, 15. 11. 2026)."""
+
+    def setUp(self):
+        super().setUp()
+        self.mono = [1000.0]
+        self.arm()
+        self.link('silent', 500.0)
+        self.seen()
+
+    def arm(self):
+        self.mc._mono = lambda: self.mono[0]
+        self.on()
+
+    def link(self, state, silent_s=0.0):
+        self.mc.mower_link = {'state': state, 'silent_s': silent_s}
+        self.mc.mower_link_t = self.mc._t()
+
+    def seen(self):
+        """The master watched it for the confirmation time."""
+        self.mc._tick_mower_idle()
+        self.mono[0] += self.mc.mower_idle_confirm_s + 1.0
+
+    def later(self, **delta):
+        self.clock[0] += dt.timedelta(**delta)
+        self.mono[0] += dt.timedelta(**delta).total_seconds()
+        self.mc.mower_link_t = self.mc._t()
+
+    def told(self):
+        return [i for i in self.mc.persistent.get('issues') or []
+                if i['code'] == 'mower_link_idle']
+
+    def notes(self):
+        return [json.loads(m.data) for t, m in EVENTS if t == '/scheduler/notify']
+
+    def test_on_by_default(self):
+        self.assertIs(M.autonomy.defaults(lambda k, d=None: d)['mower_idle_notify'], True)
+        self.assertIs(self.mc.mower_idle_notify, True)
+        self.assertEqual((self.mc.mower_idle_confirm_s, self.mc.mower_idle_repeat_first_s,
+                          self.mc.mower_idle_repeat_s), (30.0, 3600.0, 14400.0))
+
+    def test_told_once_however_many_ticks(self):
+        for _ in range(5):
+            self.mc._step()
+        self.assertEqual(len(self.told()), 1)
+        notes = self.notes()
+        self.assertEqual(len(notes), 1)
+        self.assertEqual(notes[0]['code'], 'mower_link_idle')
+        self.assertEqual(notes[0]['level'], 'error')
+        self.assertEqual(notes[0]['vars']['issue'], 'mower_link_idle')
+        self.assertEqual(notes[0]['vars']['silent_s'], 500)
+        self.assertEqual(notes[0]['vars']['since'], '2026-06-10T11:51')
+        self.assertIs(notes[0]['vars']['in_dock'], True)
+        self.assertEqual(notes[0]['vars']['repeat'], 0)
+
+    def test_not_before_the_master_saw_it_itself(self):
+        mc = self.mc = self.make()
+        self.arm()
+        self.link('silent', 500.0)
+        mc._step()
+        self.mono[0] += mc.mower_idle_confirm_s - 1.0
+        mc._step()
+        self.assertEqual(self.told(), [])
+        self.mono[0] += 2.0
+        mc._step()
+        self.assertEqual(len(self.told()), 1)
+
+    def test_a_clock_step_is_no_silence(self):
+        """ntpdate +48 s and worse: one sample says silent for long, the next is ok."""
+        mc = self.mc = self.make()
+        self.arm()
+        for _ in range(3):
+            self.link('ok')
+            mc._step()
+            self.mono[0] += 20.0
+            self.link('silent', 3000.0)     # the step, as the link node counts it
+            mc._step()
+            self.mono[0] += 20.0
+        self.link('ok')
+        mc._step()
+        self.assertEqual(self.told(), [])
+        self.assertEqual(self.notes(), [])
+        self.assertNotIn('mower_idle_told', mc.persistent)
+
+    def test_a_gap_in_the_link_starts_the_watch_anew(self):
+        mc = self.mc = self.make()
+        self.arm()
+        self.link('silent', 500.0)
+        mc._step()
+        self.mono[0] += 20.0
+        mc.mower_link_t = mc._t() - mc.MOWER_LINK_AGE_S - 1.0     # the node gone
+        mc._step()
+        self.mono[0] += 20.0
+        self.link('silent', 540.0)
+        mc._step()
+        self.assertEqual(self.told(), [])
+
+    def test_said_again_while_it_lasts(self):
+        mc = self.mc
+        mc._step()
+        self.later(minutes=59)
+        mc._step()
+        self.assertEqual(len(self.notes()), 1)
+        self.later(minutes=2)
+        mc._step()
+        mc._step()
+        self.assertEqual([n['vars']['repeat'] for n in self.notes()], [0, 1])
+        self.later(hours=3, minutes=58)
+        mc._step()
+        self.assertEqual(len(self.notes()), 2)
+        self.later(minutes=3)
+        mc._step()
+        self.later(hours=4, minutes=1)
+        mc._step()
+        notes = self.notes()
+        self.assertEqual([n['vars']['repeat'] for n in notes], [0, 1, 2, 3])
+        self.assertEqual(set(n['vars']['since'] for n in notes), {'2026-06-10T11:51'})
+
+    def test_repeat_survives_a_restart_of_the_node(self):
+        self.mc._step()
+        self.later(minutes=50)
+        self.mc = self.make()
+        self.arm()
+        self.link('silent', 3600.0)
+        self.seen()
+        self.mc._step()
+        self.assertEqual(len(self.notes()), 1)
+        self.later(minutes=11)
+        self.mc._step()
+        self.assertEqual([n['vars']['repeat'] for n in self.notes()], [0, 1])
+
+    def test_repeat_off(self):
+        mc = self.mc
+        mc.mower_idle_repeat_first_s = 0.0
+        mc._step()
+        self.later(hours=30)
+        mc._step()
+        self.assertEqual(len(self.notes()), 1)
+
+    def test_told_when_automation_is_off_too(self):
+        self.mc.set_automation(False)
+        self.mc._step()
+        self.assertEqual(len(self.told()), 1)
+
+    def test_under_the_threshold_nothing(self):
+        self.link('silent', self.mc.mower_idle_silent_s - 1.0)
+        self.mc._step()
+        self.mono[0] += 100.0
+        self.mc._step()
+        self.assertEqual(self.told(), [])
+        self.link('silent', self.mc.mower_idle_silent_s)
+        self.seen()
+        self.mc._step()
+        self.assertEqual(len(self.told()), 1)
+
+    def test_unknown_or_no_node_nothing(self):
+        self.link('unknown', 500.0)
+        self.mc._step()
+        self.mc.mower_link = {'state': 'silent', 'silent_s': 500.0}
+        self.mc.mower_link_t = self.mc._t() - self.mc.MOWER_LINK_AGE_S - 1.0
+        self.mc._step()
+        self.mc.mower_link = None
+        self.mc._step()
+        self.assertEqual(self.told(), [])
+
+    def test_a_run_is_not_this_ones_business(self):
+        mc = self.mc
+        mc.persistent['run'] = dict(mc._new_run({'id': 'e', 'program_name': 'Mow'}, None),
+                                    reason='mower_link', started=True, wait_until=mc._t() + 600)
+        mc._tick_mower_idle()
+        self.assertEqual(self.told(), [])
+        self.assertNotIn('mower_idle_told', mc.persistent)
+        mc.persistent['run'] = None
+        mc.state = mc.STATE_MOWING
+        mc._tick_mower_idle()
+        mc.state = mc.STATE_IDLE
+        mc.mission_busy = True
+        mc._tick_mower_idle()
+        self.assertEqual(self.told(), [])
+
+    def test_ok_arms_it_again(self):
+        mc = self.mc
+        mc._step()
+        self.link('ok')
+        mc._step()
+        self.assertNotIn('mower_idle_told', mc.persistent)
+        self.assertEqual(self.journal()[-1]['code'], 'mower_link_back')
+        mc._step()
+        self.assertEqual(len(self.told()), 1)
+        self.link('silent', 130.0)
+        self.seen()
+        mc._step()
+        mc._step()
+        self.assertEqual(len(self.told()), 2)
+        notes = self.notes()
+        self.assertEqual([n['vars']['repeat'] for n in notes], [0, 0])
+        self.assertNotEqual(notes[0]['vars']['since'], notes[1]['vars']['since'])
+
+    def test_switch_off_nothing(self):
+        mc = self.mc = self.make()
+        self.arm()
+        self.assertTrue(self.set(mower_idle_notify=False)['ok'])
+        self.link('silent', 500.0)
+        self.seen()
+        for _ in range(3):
+            mc._step()
+        self.assertEqual(self.told(), [])
+        self.assertEqual(self.notes(), [])
+        self.assertTrue(self.set(mower_idle_notify=True)['ok'])
+        self.seen()
+        mc._step()
+        self.assertEqual(len(self.told()), 1)
+
+    def test_a_restart_of_the_node_says_nothing_again(self):
+        self.mc._step()
+        del EVENTS[:]
+        mc = self.mc = self.make()
+        self.arm()
+        self.link('silent', 900.0)
+        self.seen()
+        for _ in range(3):
+            mc._step()
+        self.assertEqual(self.notes(), [])
+
+    def test_a_new_boot_that_did_not_cure_it_tells_again(self):
+        self.mc._step()
+        del EVENTS[:]
+        mc = self.mc = self.make()
+        with open(mc.boot_id_file, 'w') as f:
+            f.write('boot-2')
+        self.arm()
+        self.link('silent', 200.0)
+        self.seen()
+        for _ in range(3):
+            mc._step()
+        self.assertEqual(len(self.notes()), 1)
 
 
 class HwReset(Base):
