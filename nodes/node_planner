@@ -34,6 +34,7 @@ from node_planner import run_path
 from node_planner import program_chain
 from node_planner import program_map
 from node_planner import coverage_rules
+from node_planner import grid_cache
 
 # Planner state lives under ~/.vitulus (created on first boot, see Node.__init__).
 _VITULUS_DIR = os.path.join(os.path.expanduser('~'), '.vitulus')
@@ -189,7 +190,11 @@ class Node:
         # subscriber exists (latched active_map / status / site_map), and they
         # publish lists + log lines — so every publisher must already exist.
         self.log_pub = rospy.Publisher("/web_plan/log", String, queue_size=1)
-        self.map_show_pub = rospy.Publisher("/web_plan/map_show", OccupancyGrid, queue_size=1)
+        # T39: latched and sent only when the shown grid changes (it used to be
+        # rebuilt from 2 million cells twice a second for nobody). A late
+        # subscriber (UI over rosbridge) gets the current map from the latch.
+        self.map_show_pub = rospy.Publisher("/web_plan/map_show", OccupancyGrid, latch=True, queue_size=1)
+        self._grid_cache = grid_cache.GridCache()
         self.map_data_pub = rospy.Publisher("/web_plan/map_data", MapEditMap, queue_size=1)
         self.map_poly_list_pub = rospy.Publisher("/web_plan/polygon_list", MapEditPolygonList, latch=True, queue_size=1)
         self.zone_list_pub = rospy.Publisher("/web_plan/zone_list", MapEditZoneList, latch=True, queue_size=1)
@@ -510,16 +515,37 @@ class Node:
                 self.rtabmap_map_received = True
 
     def map_show_publisher(self):
-        if self.map_data is not None and self.np_show is not None:
+        # Called at 2 Hz; publishes only when the shown grid (or where it lies)
+        # differs from what the latch already holds. np_show is read once: a
+        # callback may swap it meanwhile.
+        np_show = self.np_show
+        if self.map_data is not None and np_show is not None:
+            info = self.map_data.initial_map.info
+            if not self._grid_cache.changed(np_show, grid_cache.info_geometry(info)):
+                return
             map_msg = OccupancyGrid()
             map_msg.header.stamp = rospy.Time.now()
             map_msg.header.frame_id = "map"
             map_msg.info = self.map_data.initial_map.info
-            map_msg.info.width = self.np_show.shape[1]
-            map_msg.info.height = self.np_show.shape[0]
-            np_arr = self.np_show.reshape((self.np_show.size,))
-            map_msg.data = np_arr.tolist()
+            map_msg.info.width = np_show.shape[1]
+            map_msg.info.height = np_show.shape[0]
+            map_msg.data = self._grid_cache.cells(np_show)
             self.map_show_pub.publish(map_msg)
+            self._grid_cache.sent()
+        elif self._grid_cache.has_sent():
+            # The map is gone (serving stopped / site dropped). Before T39 the
+            # topic simply went silent, so a late subscriber got nothing and
+            # the editor framed its default view. A latch would keep handing
+            # out the previous site's map, and an empty grid would make the
+            # editor frame a 0 m view (mapeditor.js takes width*resolution as
+            # the span). So drop the latch itself: advertise the topic anew.
+            self._grid_cache.invalidate()
+            try:
+                self.map_show_pub.unregister()
+            except Exception as e:  # noqa: BLE001
+                rospy.logwarn("[{}] map_show: dropping the latch failed: {}".format(
+                    rospy.get_caller_id(), e))
+            self.map_show_pub = rospy.Publisher("/web_plan/map_show", OccupancyGrid, latch=True, queue_size=1)
 
     def map_edited_publisher(self):
         if self.map_data is not None and self.np_show is not None:
@@ -530,8 +556,10 @@ class Node:
                 map_msg.info = self.map_data.initial_map.info
                 map_msg.info.width = self.map_data.np_assembled.shape[1]
                 map_msg.info.height = self.map_data.np_assembled.shape[0]
-                np_arr = self.np_show.reshape((self.np_show.size,))
-                map_msg.data = np_arr.tolist()
+                # T39: same cadence as before (navi_man re-feeds its map from
+                # every message), but the 2-million-cell list is rebuilt only
+                # when the grid changed.
+                map_msg.data = self._grid_cache.cells(self.np_show)
                 self.map_edited_pub.publish(map_msg)
             else:
                 map_msg = OccupancyGrid()
@@ -4072,6 +4100,9 @@ class Node:
         # disk (cheap). Used by the web UI to reliably re-fetch the one-shot
         # zone/polygon/program lists over rosbridge.
         if msg.data:
+            # T39: map_show is sent on change only; an explicit re-fetch sends
+            # it once more (next 2 Hz tick) even though the latch has it.
+            self._grid_cache.invalidate()
             self.map_data_publisher()   # not latched: margin / fill / shape
             self.map_poly_list_publisher()
             self.map_zone_list_publisher()
