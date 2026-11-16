@@ -147,6 +147,8 @@ class NodePublishers(unittest.TestCase):
         n.current_navi_map_name = 'LADA'
         n.map_show_pub, n.map_edited_pub = _Pub(), _Pub()
         n._grid_cache = gc.GridCache()
+        n._edited_on_change = False                 # the default
+        n._edited_state = gc.SentState()
         for f in ('map_data_publisher', 'map_poly_list_publisher',
                   'map_zone_list_publisher', 'program_list_publisher'):
             setattr(n, f, lambda: None)
@@ -232,6 +234,106 @@ class NodePublishers(unittest.TestCase):
         n.current_navi_map_name = 'New'
         n.map_edited_publisher()
         self.assertEqual(n.map_edited_pub.msgs[-1].data, [])
+
+    # ---- ~map_edited_on_change=true (T39 batch 3) ----
+    def _on_change(self, refresh_s=0.0, clock=time.monotonic):
+        self.n._edited_on_change = True
+        self.n._edited_state = gc.SentState(refresh_s=refresh_s, clock=clock)
+        return self.n
+
+    def test_default_is_off_and_not_latched(self):
+        src = open(NODE).read()
+        self.assertIn("rospy.get_param('~map_edited_on_change', False)", src)
+        self.assertIn("rospy.get_param('~map_edited_refresh_s', 0.0)", src)
+        self.assertIn('latch=self._edited_on_change', src)
+
+    def test_edited_on_change_sends_once_per_change(self):
+        n = self._on_change()
+        for _ in range(30):
+            n.map_edited_publisher()
+        self.assertEqual(len(n.map_edited_pub.msgs), 1)      # first tick: late navi_man gets it from the latch
+        self.assertEqual(n._grid_cache.builds, 1)
+        m = n.map_edited_pub.msgs[0]
+        self.assertEqual((m.info.width, m.info.height, len(m.data)), (60, 40, 2400))
+        n.np_show[3, 4] = 100                                # a no-go zone drawn in the editor
+        n.map_edited_publisher()                             # the very next 2 s tick
+        self.assertEqual(len(n.map_edited_pub.msgs), 2)
+        self.assertEqual(n.map_edited_pub.msgs[1].data[3 * 60 + 4], 100)
+        for _ in range(10):
+            n.map_edited_publisher()
+        self.assertEqual(len(n.map_edited_pub.msgs), 2)
+        n.np_show = np.full((40, 60), -1, dtype=np.int8)     # another layer / reassembled map
+        n.map_data.np_assembled = n.np_show
+        n.map_edited_publisher(); n.map_edited_publisher()
+        self.assertEqual(len(n.map_edited_pub.msgs), 3)
+
+    def test_edited_on_change_geometry_and_size(self):
+        n = self._on_change()
+        n.map_edited_publisher()
+        n.map_data.initial_map.info.origin.position.x = 7.0  # same cells, moved map
+        n.map_edited_publisher(); n.map_edited_publisher()
+        self.assertEqual(len(n.map_edited_pub.msgs), 2)
+        n.map_data.np_assembled = np.zeros((41, 60), dtype=np.int8)
+        n.map_edited_publisher(); n.map_edited_publisher()
+        self.assertEqual(len(n.map_edited_pub.msgs), 3)
+        self.assertEqual(n.map_edited_pub.msgs[-1].info.height, 41)
+
+    def test_edited_on_change_empty_states_once_each(self):
+        """'New' map and 'no map' put an empty grid on the wire, once per transition
+        (the latch must not keep the previous site's grid)."""
+        n = self._on_change()
+        n.map_edited_publisher()
+        n.current_navi_map_name = 'New'
+        for _ in range(5):
+            n.map_edited_publisher()
+        self.assertEqual(len(n.map_edited_pub.msgs), 2)
+        self.assertEqual(n.map_edited_pub.msgs[-1].data, [])
+        keep, n.map_data = n.map_data, None
+        for _ in range(5):
+            n.map_edited_publisher()
+        self.assertEqual(len(n.map_edited_pub.msgs), 3)      # 'none' differs from 'new'
+        self.assertEqual(n.map_edited_pub.msgs[-1].info.resolution, 0.05)
+        n.map_data, n.current_navi_map_name = keep, 'LADA'   # the same map is back
+        n.map_edited_publisher(); n.map_edited_publisher()
+        self.assertEqual(len(n.map_edited_pub.msgs), 4)
+        self.assertEqual(len(n.map_edited_pub.msgs[-1].data), 2400)
+
+    def test_fresh_node_sends_on_first_tick(self):
+        """A restarted node_planner has nothing in its latch: whatever the state,
+        the first tick publishes (no map yet -> empty grid, then the grid)."""
+        n = self._on_change()
+        keep, n.map_data = n.map_data, None
+        n.map_edited_publisher()
+        self.assertEqual(len(n.map_edited_pub.msgs), 1)
+        n.map_data = keep
+        n.map_edited_publisher()
+        self.assertEqual(len(n.map_edited_pub.msgs), 2)
+
+    def test_edited_refresh_period(self):
+        t = [100.0]
+        n = self._on_change(refresh_s=30.0, clock=lambda: t[0])
+        n.map_edited_publisher()
+        for _ in range(14):                                  # 28 s of 2 s ticks
+            t[0] += 2.0
+            n.map_edited_publisher()
+        self.assertEqual(len(n.map_edited_pub.msgs), 1)
+        t[0] += 2.0
+        n.map_edited_publisher()
+        self.assertEqual(len(n.map_edited_pub.msgs), 2)
+        self.assertEqual(n._grid_cache.builds, 1)            # refresh reuses the list
+
+    def test_idle_tick_cost_on_change(self):
+        n = self._on_change()
+        n.np_show = np.zeros((H, W), dtype=np.int8)
+        n.map_data.np_assembled = n.np_show
+        n.map_edited_publisher()
+        t0 = time.time()
+        for _ in range(10):
+            n.map_edited_publisher()
+        per = (time.time() - t0) / 10
+        self.assertEqual(len(n.map_edited_pub.msgs), 1)
+        self.assertLess(per, 0.02)                           # a checksum of 2 M cells
+        print('idle map_edited tick: %.1f ms' % (per * 1000.0))
 
 
 if __name__ == '__main__':

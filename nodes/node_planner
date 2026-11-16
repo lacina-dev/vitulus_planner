@@ -213,7 +213,19 @@ class Node:
         # for a client that connects later, and only the newest one matters.
         self.marker_program_paths_pub = rospy.Publisher("/web_plan/program_marker", MarkerArray, latch=True, queue_size=1)
         self.program_marker_state_pub = rospy.Publisher("/web_plan/program_marker_state", String, latch=True, queue_size=1)
-        self.map_edited_pub = rospy.Publisher("/web_plan/map_edited", OccupancyGrid, queue_size=1)
+        # T39: ~map_edited_on_change=true sends /web_plan/map_edited (the 2-million-
+        # cell grid navi_man feeds its planner map from) only when it changed and
+        # latches it for late subscribers; ~map_edited_refresh_s > 0 re-sends it
+        # at that period anyway. Default false = every 2 s, not latched, as before.
+        self._edited_on_change = bool(rospy.get_param('~map_edited_on_change', False))
+        self._edited_refresh_s = float(rospy.get_param('~map_edited_refresh_s', 0.0))
+        self._edited_state = grid_cache.SentState(refresh_s=self._edited_refresh_s)
+        self.map_edited_pub = rospy.Publisher("/web_plan/map_edited", OccupancyGrid, queue_size=1,
+                                              latch=self._edited_on_change)
+        if self._edited_on_change:
+            rospy.loginfo("[{}] map_edited_on_change=true - /web_plan/map_edited is sent only "
+                          "when the grid changes (latched, refresh {} s).".format(
+                              rospy.get_caller_id(), self._edited_refresh_s))
         self.program_list_pub = rospy.Publisher("/web_plan/program_list", PlannerProgramList, latch=True, queue_size=10)
         self.program_active_pub = rospy.Publisher("/web_plan/program_active", PlannerProgram, queue_size=1)
         self.program_active_unfinished_pub = rospy.Publisher("/web_plan/program_active_unfinished", PlannerProgram, queue_size=1)
@@ -548,29 +560,40 @@ class Node:
             self.map_show_pub = rospy.Publisher("/web_plan/map_show", OccupancyGrid, latch=True, queue_size=1)
 
     def map_edited_publisher(self):
-        if self.map_data is not None and self.np_show is not None:
+        # Called every 2 s. Three things can be on the wire: the edited grid, the
+        # empty grid of a "New" map, the empty grid of "no map". With
+        # ~map_edited_on_change the message goes out only when that differs from
+        # what the latch already holds (T39); otherwise every call, as before.
+        np_show = self.np_show
+        if self.map_data is not None and np_show is not None:
             if (self.current_navi_map_name != "New"):
+                info = self.map_data.initial_map.info
+                shape = self.map_data.np_assembled.shape
+                state = ('grid', grid_cache.fingerprint(np_show, grid_cache.info_geometry(info)),
+                         shape) if self._edited_on_change else None
+                if self._edited_on_change and not self._edited_state.due(state):
+                    return
                 map_msg = OccupancyGrid()
                 map_msg.header.stamp = rospy.Time.now()
                 map_msg.header.frame_id = "map"
-                map_msg.info = self.map_data.initial_map.info
-                map_msg.info.width = self.map_data.np_assembled.shape[1]
-                map_msg.info.height = self.map_data.np_assembled.shape[0]
-                # T39: same cadence as before (navi_man re-feeds its map from
-                # every message), but the 2-million-cell list is rebuilt only
-                # when the grid changed.
-                map_msg.data = self._grid_cache.cells(self.np_show)
+                map_msg.info = info
+                map_msg.info.width = shape[1]
+                map_msg.info.height = shape[0]
+                # T39: the 2-million-cell list is rebuilt only when the grid changed.
+                map_msg.data = self._grid_cache.cells(np_show)
                 self.map_edited_pub.publish(map_msg)
-            else:
-                map_msg = OccupancyGrid()
-                map_msg.info.resolution = 0.05
-                map_msg.info.origin.orientation.w = 1
-                self.map_edited_pub.publish(map_msg)
+                self._edited_state.sent(state)
+                return
+            state = ('new',)
         else:
-            map_msg = OccupancyGrid()
-            map_msg.info.resolution = 0.05
-            map_msg.info.origin.orientation.w = 1
-            self.map_edited_pub.publish(map_msg)
+            state = ('none',)
+        if self._edited_on_change and not self._edited_state.due(state):
+            return
+        map_msg = OccupancyGrid()
+        map_msg.info.resolution = 0.05
+        map_msg.info.origin.orientation.w = 1
+        self.map_edited_pub.publish(map_msg)
+        self._edited_state.sent(state)
 
 
 

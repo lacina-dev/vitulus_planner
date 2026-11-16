@@ -6,6 +6,10 @@
         <node name="node_planner" pkg="vitulus_planner" type="node_planner" respawn="true" respawn_delay="1" output="log">
 <!--            <param name="prm_name" value="prm_value"/>-->
 <!--            <remap from="/topic" to="/another_topic" />-->
+            <!-- T39: true = /web_plan/map_edited only when the grid changed, latched
+                 (false = every 2 s as before). refresh_s > 0 re-sends it at that period. -->
+            <param name="map_edited_on_change" value="false"/>
+            <param name="map_edited_refresh_s" value="0.0"/>
         </node>
 
         <node name="master_controller" pkg="vitulus_planner" type="master_controller" respawn="true" respawn_delay="5" output="log">

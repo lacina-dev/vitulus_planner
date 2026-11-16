@@ -8,6 +8,7 @@ decides whether anything has to be built.
 
 No ROS in here: the node hands in the numpy array and the map geometry.
 """
+import time
 import zlib
 
 import numpy as np
@@ -68,3 +69,29 @@ class GridCache(object):
         """True while something confirmed by sent() is still considered out
         there (i.e. a latched publisher holds it)."""
         return self._sent_fp is not None
+
+
+class SentState(object):
+    """What a latched publisher last sent, for "publish only on change" (T39).
+
+    due(state)  -> True when `state` differs from the one last confirmed by
+                   sent(), or when refresh_s > 0 and that long has passed.
+    sent(state) -> confirm the publish.
+    """
+
+    def __init__(self, refresh_s=0.0, clock=time.monotonic):
+        self.refresh_s = float(refresh_s or 0.0)
+        self.clock = clock
+        self._state = None
+        self._at = None
+        self.count = 0           # how many publishes were confirmed
+
+    def due(self, state):
+        if self._at is None or state != self._state:
+            return True
+        return self.refresh_s > 0.0 and self.clock() - self._at >= self.refresh_s
+
+    def sent(self, state):
+        self._state = state
+        self._at = self.clock()
+        self.count += 1
